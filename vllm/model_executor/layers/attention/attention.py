@@ -599,6 +599,23 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+        elif self.kv_cache_dtype == "lrosa":
+            # LRoSA combined slot: [ K (head_size) | V (head_size) | proj_K (cs_h) ].
+            # lrosa_slot_size is per-slot bytes (slot_elems * dtype_size).
+            from vllm.utils.torch_utils import get_dtype_size
+            from vllm.v1.attention.backends.lrosa_attn import _cs_h_for
+            from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
+
+            slot_elems = 2 * self.head_size + _cs_h_for(self.head_size)
+            dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
+            return LRoSAFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                lrosa_slot_size=slot_elems * dtype_size,
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,

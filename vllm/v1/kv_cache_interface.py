@@ -334,6 +334,33 @@ class TQFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class LRoSAFullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec for LRoSA combined-slot KV cache.
+
+    Each slot packs [K | V | proj_K] for one (token, kv_head); lrosa_slot_size
+    is the per-slot byte count. Mirrors TQFullAttentionSpec's override pattern
+    so vLLM's memory budgeter sizes the cache correctly.
+    """
+
+    lrosa_slot_size: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.lrosa_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.lrosa_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.lrosa_slot_size == specs[0].lrosa_slot_size for s in specs), (
+            "All LRoSA layers in the same KV cache group must use the same "
+            "lrosa_slot_size."
+        )
+        return replace(merged, lrosa_slot_size=specs[0].lrosa_slot_size)
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None

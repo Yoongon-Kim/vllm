@@ -33,6 +33,22 @@ class AttentionConfig:
     Fixes the split count so grid dimensions are constant across captures,
     and buffers can be pre-allocated to avoid inflating the memory estimate."""
 
+    lrosa_basis_path: str | None = None
+    """Path to LRoSA calibration .pt file. Expected format:
+    ``{'M': {layer_idx: Tensor[H_kv, cs_h, d] fp32}, 'cs_h_max': int, ...}``.
+    Loaded once on first decode step, projected onto each layer's device/dtype."""
+
+    lrosa_n_fac: int = 256
+    """LRoSA top-K token budget per (decode step, kv-head). Sparse decode
+    attends to this many tokens; n_fac >= max_kv_len falls back to dense."""
+
+    lrosa_use_streaming_topk: bool = False
+    """Use the single-stage streaming Triton kernel (Step 4a) instead of the
+    two-pass score + ``torch.topk`` path. Streaming avoids the
+    ``(num_reqs, H_kv, max_kv_len)`` fp32 score buffer; pre-PR profiling
+    showed it pays off at long context (>~16K). Default False until the
+    full benchmark sweep lands."""
+
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
     in flashinfer. If None, auto-detect the attention backend in flashinfer."""
