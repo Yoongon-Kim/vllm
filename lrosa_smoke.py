@@ -50,6 +50,7 @@ def main():
             "backend": "LROSA",
             "lrosa_basis_path": basis,
             "lrosa_n_fac": a.n_fac,
+            "lrosa_cs_h": a.cs_h,
             "lrosa_use_radix_topk": True,
         },
         max_model_len=a.max_model_len,

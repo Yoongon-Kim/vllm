@@ -54,7 +54,8 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         basis = basis or lrosa_basis_path(model, cs_h=cs_h)
         kw["kv_cache_dtype"] = "lrosa"
         kw["attention_config"] = {"backend": "LROSA", "lrosa_basis_path": basis,
-                                  "lrosa_n_fac": n_fac, "lrosa_use_radix_topk": True}
+                                  "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
+                                  "lrosa_use_radix_topk": True}
     elif backend == "quest":
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST", "quest_token_budget": n_fac}

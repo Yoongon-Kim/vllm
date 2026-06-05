@@ -616,7 +616,12 @@ class Attention(nn.Module, AttentionLayerBase):
             from vllm.v1.attention.backends.lrosa_attn import _cs_h_for
             from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
 
-            slot_elems = 2 * self.head_size + _cs_h_for(self.head_size)
+            # cs_h override (e.g. Gemma 4 cs_h=64) must match the Impl.
+            _cs_override = getattr(
+                vllm_config.attention_config, "lrosa_cs_h", None
+            )
+            _cs_h = _cs_override if _cs_override else _cs_h_for(self.head_size)
+            slot_elems = 2 * self.head_size + _cs_h
             dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
             return LRoSAFullAttentionSpec(
                 block_size=block_size,

@@ -46,6 +46,7 @@ from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
     lrosa_project_and_store_layer,
+    lrosa_store,
 )
 from vllm.v1.attention.ops.triton_lrosa_streaming_topk import (
     alloc_candidates_buf,
@@ -107,7 +108,13 @@ class LRoSAAttentionBackend(AttentionBackend):
         # Combined slot: [ K (head_size) | V (head_size) | proj_K (cs_h) ]
         if block_size % 16 != 0:
             raise ValueError("LRoSA: block_size must be a multiple of 16.")
-        slot_size = 2 * head_size + _cs_h_for(head_size)
+        # Honor the lrosa_cs_h override (e.g. Gemma 4 cs_h=64) so the allocated
+        # slot matches get_kv_cache_spec and the Impl; default = head_size//4.
+        cs_override = getattr(
+            get_current_vllm_config().attention_config, "lrosa_cs_h", None
+        )
+        cs_h = cs_override if cs_override else _cs_h_for(head_size)
+        slot_size = 2 * head_size + cs_h
         return (num_blocks, block_size, num_kv_heads, slot_size)
 
     @classmethod
@@ -116,7 +123,18 @@ class LRoSAAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [64, 128]
+        # 64/128: GPT-OSS / Llama-Qwen-Mistral family. 256/512: Gemma 4 26B-A4B
+        # (sliding layers head_dim=256, full-attention layers head_dim=512).
+        return [64, 128, 256, 512]
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # Gemma 4 is multimodal; vLLM flags its full-attention layers with
+        # use_mm_prefix. LRoSA targets TEXT decoding (no image tokens in the
+        # reasoning/long-context evals), where the mm-prefix path reduces to
+        # ordinary combined-slot full attention — so accept it. (Sparse
+        # selection over actual image tokens is out of scope.)
+        return True
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -484,8 +502,6 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
-        self.cs_h = _cs_h_for(head_size)
-        self.slot_size = 2 * head_size + self.cs_h
         self.kv_cache_dtype = kv_cache_dtype
 
         # LRoSA calibration (lazy on-device load via _ensure_on_device).
@@ -493,6 +509,12 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         attn_cfg = vllm_config.attention_config
         self._lrosa_basis_path = attn_cfg.lrosa_basis_path
         self.n_fac = attn_cfg.lrosa_n_fac
+        # cs_h: explicit override (e.g. Gemma 4 cs_h=64 on head_dim=512) or the
+        # head_size//4 convention. Must match get_kv_cache_spec (which reads the
+        # same override) and the calibrated basis.
+        cs_h_override = getattr(attn_cfg, "lrosa_cs_h", None)
+        self.cs_h = cs_h_override if cs_h_override else _cs_h_for(head_size)
+        self.slot_size = 2 * head_size + self.cs_h
         self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         # Per-layer CONCAT: single basis over concatenated per-head K. cs_h
         # (the per-slot proj_K width) stays head_size//4, and cs_h_layer =
@@ -525,6 +547,12 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         cached = getattr(layer, "_lrosa_M", None)
         if cached is not None:
             return cached
+        # Resolved as a dense (no-basis) layer on a previous call — e.g. Gemma 4
+        # sliding-attention layers, which LRoSA does not select over (the basis
+        # is calibrated on full-attention layers only). Return None so forward /
+        # do_kv_cache_update take the dense path.
+        if getattr(layer, "_lrosa_dense", False):
+            return None
 
         if self._lrosa_basis_path is None:
             raise RuntimeError(
@@ -554,11 +582,12 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         layer._lrosa_layer_idx = layer_idx
         M_cpu = self._M_dict_cpu.get(layer_idx)
         if M_cpu is None:
-            raise RuntimeError(
-                f"LRoSA basis is missing layer {layer_idx} "
-                f"(file: {self._lrosa_basis_path}). Available layers: "
-                f"{sorted(self._M_dict_cpu.keys())[:5]}..."
-            )
+            # No basis for this layer → dense-attention layer. For hybrid models
+            # (Gemma 4: 25 sliding head_dim=256 + 5 full head_dim=512) the basis
+            # holds only the full layers; sliding layers run dense (no selection)
+            # with their own sliding window. Mark and return None.
+            layer._lrosa_dense = True
+            return None
 
         if self.per_layer_concat:
             # Per-layer basis: [cs_h_layer, H_kv*head_size] (or
@@ -623,12 +652,48 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         key_cache = kv_cache[..., :head_size]
         value_cache = kv_cache[..., head_size : 2 * head_size]
 
+        # Dense (no-basis) layer — e.g. Gemma 4 sliding-attention layers: no
+        # LRoSA selection, just paged flash-attention over the combined-slot
+        # K/V with this layer's sliding window. One varlen call covers prefill,
+        # mixed, and the CG-captured all-decode path uniformly.
+        M = self._ensure_on_device(layer, query.device, query.dtype)
+        if M is None:
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=list(self.sliding_window),
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+            )
+            return output
+
         # Mixed-batch or all-prefill: dense flash_attn over the full batch.
         # Under ``UNIFORM_SINGLE_TOKEN_DECODE`` CG capture this branch is
         # never reached (capture runs all-decode batches), so the Python
         # branch is safe.
         if num_decodes == 0 or num_decode_tokens < num_actual_tokens:
             if num_decodes == 0:
+                if head_size > 256:
+                    # head_dim>256 (Gemma 4 full layers): FA2 caps at 256 and
+                    # the Triton context kernel blows shared memory at
+                    # BLOCK_DMODEL=512. Reasoning prefills are short, so a
+                    # per-request manual causal GQA attention over the
+                    # freshly-passed contiguous K/V is cheap and head-dim
+                    # agnostic. (Only the 5 full-attention layers hit this;
+                    # sliding layers use the dense FA2 path at head_dim=256.)
+                    self._manual_prefill(
+                        query, key, value, output, attn_metadata, head_size
+                    )
+                    return output
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -847,6 +912,29 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         else:
             cu_seqlens_k = cu_seqlens_q * n_fac_eff
 
+        if head_size > 256:
+            # FlashAttention caps head_dim at 256; Gemma 4 full-attention
+            # layers are head_dim=512. The gathered set is small (n_fac tokens,
+            # q_len=1), so a manual GQA attention is cheap and head-dim-agnostic
+            # (and CUDA-Graph safe — pure matmul + softmax). Selected K is a set
+            # (no causal mask), matching the flash path's causal=False.
+            nd = num_decodes
+            nf = n_fac_eff
+            Hkv = self.num_kv_heads
+            G = self.num_kv_groups
+            d = head_size
+            K = K_sel.view(nd, nf, Hkv, d).permute(0, 2, 1, 3)  # (nd,Hkv,nf,d)
+            V = V_sel.view(nd, nf, Hkv, d).permute(0, 2, 1, 3)
+            q = q_decode.view(nd, Hkv, G, d).to(torch.float32)  # GQA-grouped
+            scores = torch.einsum("nhgd,nhfd->nhgf", q, K.to(torch.float32))
+            scores = scores * self.scale
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.einsum("nhgf,nhfd->nhgd", attn, V.to(torch.float32))
+            output[:num_decode_tokens] = out.reshape(
+                nd, Hkv * G, d
+            ).to(output.dtype)
+            return
+
         flash_attn_varlen_func(
             q=q_decode,
             k=K_sel,
@@ -862,6 +950,50 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             softcap=self.logits_soft_cap,
         )
 
+    def _manual_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: LRoSAMetadata,
+        head_size: int,
+    ) -> None:
+        """Per-request manual causal GQA attention for head_dim>256 full layers
+        (Gemma 4) at all-prefill. Head-dim agnostic — no FA2 256 cap, no Triton
+        shared-memory limit. Short reasoning prefills only (O(L^2) per request);
+        not CUDA-Graph captured (prefill is the Python branch). Operates on the
+        freshly-passed contiguous K/V (full sequence when chunked-prefill is off).
+        """
+        qsl_cpu = attn_metadata.query_start_loc_cpu
+        if qsl_cpu is None:
+            qsl_cpu = attn_metadata.query_start_loc.cpu()
+        n_actual = attn_metadata.num_actual_tokens
+        Hkv, G, d = self.num_kv_heads, self.num_kv_groups, head_size
+        qf = query[:n_actual]
+        kf = key[:n_actual]
+        vf = value[:n_actual]
+        for r in range(qsl_cpu.shape[0] - 1):
+            s = int(qsl_cpu[r])
+            e = int(qsl_cpu[r + 1])
+            L = e - s
+            if L <= 0:
+                continue
+            # (Hkv, G, L, d) / (Hkv, L, d) — GQA-grouped, fp32 for stability.
+            qr = qf[s:e].view(L, Hkv, G, d).permute(1, 2, 0, 3).to(torch.float32)
+            kr = kf[s:e].permute(1, 0, 2).to(torch.float32)
+            vr = vf[s:e].permute(1, 0, 2).to(torch.float32)
+            scores = torch.einsum("hgld,hmd->hglm", qr, kr) * self.scale
+            causal = torch.triu(
+                torch.ones(L, L, device=qf.device, dtype=torch.bool), diagonal=1
+            )
+            scores = scores.masked_fill(causal, float("-inf"))
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.einsum("hglm,hmd->hgld", attn, vr)  # (Hkv, G, L, d)
+            output[s:e] = (
+                out.permute(2, 0, 1, 3).reshape(L, Hkv * G, d).to(output.dtype)
+            )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -873,7 +1005,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # Fused write: K, V, and proj_K = M @ K into the combined slot.
         # M is loaded/materialized on this layer's device lazily on first call.
         M = self._ensure_on_device(layer, key.device, key.dtype)
-        if self.per_layer_concat:
+        if M is None:
+            # Dense (no-basis) layer: write K|V only, leave the proj_K region
+            # untouched (it's never read — dense forward does no selection).
+            lrosa_store(key, value, kv_cache, slot_mapping)
+        elif self.per_layer_concat:
             lrosa_project_and_store_layer(key, value, kv_cache, slot_mapping, M)
         else:
             lrosa_project_and_store(key, value, kv_cache, slot_mapping, M)

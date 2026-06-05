@@ -75,7 +75,8 @@ def main():
     if a.mode == "lrosa":
         kw["kv_cache_dtype"] = "lrosa"
         ac = {"backend": "LROSA", "lrosa_basis_path": a.basis,
-              "lrosa_n_fac": a.n_fac, "lrosa_use_radix_topk": True}
+              "lrosa_n_fac": a.n_fac, "lrosa_cs_h": a.cs_h,
+              "lrosa_use_radix_topk": True}
         if a.per_layer:
             ac["lrosa_per_layer_concat"] = True
         kw["attention_config"] = ac

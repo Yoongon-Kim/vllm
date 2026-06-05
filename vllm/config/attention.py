@@ -42,6 +42,13 @@ class AttentionConfig:
     """LRoSA top-K token budget per (decode step, kv-head). Sparse decode
     attends to this many tokens; n_fac >= max_kv_len falls back to dense."""
 
+    lrosa_cs_h: int | None = None
+    """Override the projected-score width cs_h. Default (None) derives it as
+    ``head_size // 4`` (paper convention: 32 for d=128, 16 for GPT-OSS d=64).
+    Set explicitly when the basis was calibrated at a non-default cs_h — e.g.
+    Gemma 4 26B-A4B uses cs_h=64 on its head_dim=512 full-attention layers
+    (head_size//4 would be 128). Must match the calibrated basis' cs_h."""
+
     lrosa_use_streaming_topk: bool = False
     """Use the single-stage streaming Triton kernel (Step 4a) instead of the
     two-pass score + ``torch.topk`` path. Streaming avoids the
