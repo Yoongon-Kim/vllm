@@ -13,8 +13,10 @@ Run:
 import os, sys, json, argparse
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+from _bench_common import PCA_REPO, lrosa_basis_path, yarn_overrides
+
 # pca repo for prompt template + metric (vendored LongBench-v1 utils)
-sys.path.insert(0, "/home/jiwonsong/pca")
+sys.path.insert(0, PCA_REPO)
 from eval.longbench_v1_utils import (
     TASK_PROMPTS, TASK_MAX_NEW_TOKENS, score_single,
     build_prompt as pca_build_prompt, tokenize_and_truncate,
@@ -24,9 +26,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
-BASIS = ("/home/jiwonsong/pca/bases/llama_3_1_8b_instruct/"
-         "pca_d1_cs32_kv_head_llama_3_1_8b_instruct.pt")
-QASPER = "/home/jiwonsong/pca/data/data/qasper.jsonl"
+QASPER = os.path.join(PCA_REPO, "data", "data", "qasper.jsonl")
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
@@ -41,15 +41,20 @@ def build_token_ids(row, tok, max_input_len):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--num_samples", type=int, default=200)
     ap.add_argument("--mode", choices=["lrosa", "fkv", "quest"], default="lrosa")
     ap.add_argument("--max_input_len", type=int, default=127500)
     ap.add_argument("--n_fac", type=int, default=256)
+    ap.add_argument("--cs_h", type=int, default=32)
     ap.add_argument("--per_layer", action="store_true")
-    ap.add_argument("--basis", default=BASIS)
+    ap.add_argument("--basis", default=None,
+                    help="LRoSA basis .pt; default = pca bases/<tag>/pca_d1_cs<N>_kv_head.")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--gpu_mem", type=float, default=0.90)
     a = ap.parse_args()
+    if a.basis is None:
+        a.basis = lrosa_basis_path(a.model, cs_h=a.cs_h)
 
     rows = []
     with open(QASPER) as f:
@@ -58,11 +63,15 @@ def main():
             if len(rows) >= a.num_samples:
                 break
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(a.model)
     token_ids = [build_token_ids(r, tok, a.max_input_len) for r in rows]
 
-    kw = dict(model=MODEL, max_model_len=a.max_input_len + 256,
+    kw = dict(model=a.model, max_model_len=a.max_input_len + 256,
               gpu_memory_utilization=a.gpu_mem, enforce_eager=a.eager)
+    # Qwen3: enable YaRN so served rope matches the basis's calibration rope.
+    ov = yarn_overrides(a.model)
+    if ov:
+        kw["hf_overrides"] = ov
     if a.mode == "lrosa":
         kw["kv_cache_dtype"] = "lrosa"
         ac = {"backend": "LROSA", "lrosa_basis_path": a.basis,
@@ -86,9 +95,10 @@ def main():
         s = score_single(pred, row["answers"], "qasper", row.get("all_classes"))
         scores.append(s)
     f1 = sum(scores) / len(scores)
-    print(f"[QASPER-F1] mode={a.mode} n={len(scores)} n_fac={a.n_fac} "
-          f"max_input_len={a.max_input_len} F1={f1:.4f}")
-    print(f"  (pca monkey_patch reference: per-kv-head cs_h=32 = 0.4483)")
+    print(f"[QASPER-F1] model={a.model} mode={a.mode} n={len(scores)} "
+          f"n_fac={a.n_fac} max_input_len={a.max_input_len} F1={f1:.4f}")
+    if "llama-3.1-8b" in a.model.lower():
+        print(f"  (pca monkey_patch reference, Llama-3.1-8B per-kv-head cs_h=32 = 0.4483)")
 
 
 if __name__ == "__main__":
