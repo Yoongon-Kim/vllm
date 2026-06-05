@@ -42,6 +42,14 @@ class AttentionConfig:
     """LRoSA top-K token budget per (decode step, kv-head). Sparse decode
     attends to this many tokens; n_fac >= max_kv_len falls back to dense."""
 
+    lrosa_n_tip: int = 16
+    """FASA-fc only (kv_cache_dtype="fasa"): number of dominant frequency
+    components (RoPE pairs) per kv-head selected at calibration. The per-step
+    score reads ``2*n_tip`` raw channels {2*fc, 2*fc+1} from full K. Paper
+    default 16 for d=128 (iso-byte with LRoSA cs_h=32). The basis file
+    (``lrosa_basis_path``) is the fasa_idom_*.pt {'idom': {layer: [H_kv,
+    n_tip_max]}} dict; the first ``n_tip`` columns are used."""
+
     lrosa_cs_h: int | None = None
     """Override the projected-score width cs_h. Default (None) derives it as
     ``head_size // 4`` (paper convention: 32 for d=128, 16 for GPT-OSS d=64).

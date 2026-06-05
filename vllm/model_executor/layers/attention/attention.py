@@ -578,6 +578,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # a shrunken cache.
         if self.sliding_window is not None and self.kv_cache_dtype not in (
             "lrosa",
+            "fasa",
             "quest",
         ):
             assert not vllm_config.model_config.use_mla, (
@@ -622,6 +623,24 @@ class Attention(nn.Module, AttentionLayerBase):
             )
             _cs_h = _cs_override if _cs_override else _cs_h_for(self.head_size)
             slot_elems = 2 * self.head_size + _cs_h
+            dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
+            return LRoSAFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                lrosa_slot_size=slot_elems * dtype_size,
+            )
+        elif self.kv_cache_dtype == "fasa":
+            # FASA-fc: combined slot is just [ K | V ] = 2 * head_size (no
+            # proj_K). The paper-faithful path reads the I_dom channels from
+            # full K each step, so nothing extra is cached. Reuse
+            # LRoSAFullAttentionSpec (only per-slot bytes matter).
+            from vllm.utils.torch_utils import get_dtype_size
+            from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
+
+            slot_elems = 2 * self.head_size
             dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
             return LRoSAFullAttentionSpec(
                 block_size=block_size,

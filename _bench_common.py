@@ -39,6 +39,18 @@ def lrosa_basis_path(model: str, cs_h: int = 32, variant: str = "d1") -> str:
     )
 
 
+def fasa_idom_path(model: str) -> str:
+    """Default pca FASA I_dom path for ``model``:
+        <PCA_REPO>/bases/<tag>/fasa_idom_kv_head_<tag>.pt
+    ({'idom': {layer: [H_kv, n_tip_max]}, ...}). Used by the paper-faithful
+    fasa_fc backend mode (kv_cache_dtype="fasa").
+    """
+    tag = model_tag(model)
+    return os.path.join(
+        PCA_REPO, "bases", tag, f"fasa_idom_kv_head_{tag}.pt"
+    )
+
+
 def yarn_overrides(model: str) -> dict:
     """vLLM ``hf_overrides`` that enable YaRN rope for Qwen3 (factor=4 ->
     ~131K effective context), exactly mirroring fasa/calibrate.py's

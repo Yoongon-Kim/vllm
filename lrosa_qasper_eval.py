@@ -13,7 +13,7 @@ Run:
 import os, sys, json, argparse
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-from _bench_common import PCA_REPO, lrosa_basis_path, yarn_overrides
+from _bench_common import PCA_REPO, lrosa_basis_path, fasa_idom_path, yarn_overrides
 
 # pca repo for prompt template + metric (vendored LongBench-v1 utils)
 sys.path.insert(0, PCA_REPO)
@@ -43,17 +43,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--num_samples", type=int, default=200)
-    ap.add_argument("--mode", choices=["lrosa", "fkv", "quest"], default="lrosa")
+    ap.add_argument("--mode", choices=["lrosa", "fkv", "quest", "fasa"], default="lrosa")
     ap.add_argument("--max_input_len", type=int, default=127500)
     ap.add_argument("--n_fac", type=int, default=256)
     ap.add_argument("--cs_h", type=int, default=32)
+    ap.add_argument("--n_tip", type=int, default=16,
+                    help="FASA-fc only: # dominant FCs per kv-head (2*n_tip channels).")
     ap.add_argument("--per_layer", action="store_true")
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis .pt; default = pca bases/<tag>/pca_d1_cs<N>_kv_head.")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--gpu_mem", type=float, default=0.90)
     a = ap.parse_args()
-    if a.basis is None:
+    if a.basis is None and a.mode == "lrosa":
         a.basis = lrosa_basis_path(a.model, cs_h=a.cs_h)
 
     rows = []
@@ -84,6 +86,14 @@ def main():
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST",
                                   "quest_token_budget": a.n_fac}
+    elif a.mode == "fasa":
+        # Paper-faithful FASA-fc: [K|V] slot, I_dom FC channels read from full K
+        # each step (no proj_K). basis = fasa_idom_*.pt.
+        idom = a.basis if a.basis else fasa_idom_path(a.model)
+        kw["kv_cache_dtype"] = "fasa"
+        kw["attention_config"] = {"backend": "LROSA", "lrosa_basis_path": idom,
+                                  "lrosa_n_fac": a.n_fac, "lrosa_n_tip": a.n_tip,
+                                  "lrosa_use_radix_topk": True}
     llm = LLM(**kw)
 
     sp = SamplingParams(temperature=0.0, max_tokens=TASK_MAX_NEW_TOKENS["qasper"])

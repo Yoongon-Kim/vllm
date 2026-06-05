@@ -79,7 +79,7 @@ def _sparse_decode_buffer_reservation(vllm_config) -> int:
     KV blocks, whereas under-reserving OOMs at decode).
     """
     dt = vllm_config.cache_config.cache_dtype
-    if dt not in ("lrosa", "quest"):
+    if dt not in ("lrosa", "fasa", "quest"):
         return 0
     mc = vllm_config.model_config
     pc = vllm_config.parallel_config
@@ -93,7 +93,8 @@ def _sparse_decode_buffer_reservation(vllm_config) -> int:
     def _align(x, a):
         return ((x + a - 1) // a) * a
 
-    if dt == "lrosa":
+    if dt in ("lrosa", "fasa"):
+        # FASA-fc reuses the same gather buffers (K_sel/V_sel/scores/top-K).
         n_fac = int(getattr(ac, "lrosa_n_fac", 256))
         # K_sel + V_sel (bf16) — the dominant term at large n_fac.
         ksel = 2 * mns * n_fac * H_kv * d * 2

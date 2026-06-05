@@ -29,6 +29,7 @@ CacheDType = Literal[
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
     "lrosa",
+    "fasa",
     "quest",
     "int8_per_token_head",
     "fp8_per_token_head",

@@ -43,6 +43,7 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.triton_lrosa_gather import lrosa_gather
 from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
+from vllm.v1.attention.ops.triton_fasa_score_topk import fasa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
     lrosa_project_and_store_layer,
@@ -62,6 +63,21 @@ def _cs_h_for(head_size: int) -> int:
     return head_size // 4
 
 
+def _resolve_slot_cs_h(head_size: int) -> int:
+    """Width of the proj_K region in the combined slot for this run.
+
+    - FASA-fc (``kv_cache_dtype == "fasa"``): 0 — the slot is just [K|V]; the
+      paper-faithful path re-reads the I_dom channels from full K each step,
+      so nothing extra is cached.
+    - LRoSA: the ``lrosa_cs_h`` override (e.g. Gemma 4 cs_h=64) or head_size//4.
+    """
+    cfg = get_current_vllm_config()
+    if cfg.cache_config.cache_dtype == "fasa":
+        return 0
+    cs_override = getattr(cfg.attention_config, "lrosa_cs_h", None)
+    return cs_override if cs_override else _cs_h_for(head_size)
+
+
 class LRoSAAttentionBackend(AttentionBackend):
     """LRoSA backend.
 
@@ -74,12 +90,16 @@ class LRoSAAttentionBackend(AttentionBackend):
     # LRoSA owns its combined-slot cache layout. The "lrosa" tag routes through
     # TQFullAttentionSpec (see attention.py) so memory budgeting uses our
     # slot_size = 2*head_size + cs_h rather than the standard 2*head_size.
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["lrosa"]
+    # "fasa" is the paper-faithful FASA-fc mode (no proj_K cache; reads the
+    # I_dom channels from full K each step). Shares this backend's gather /
+    # attend / metadata infra; only the slot width (no proj_K) and the score
+    # kernel differ.
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["lrosa", "fasa"]
     forward_includes_kv_cache_update: bool = False
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
-        return kv_cache_dtype == "lrosa"
+        return kv_cache_dtype in ("lrosa", "fasa")
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -108,13 +128,10 @@ class LRoSAAttentionBackend(AttentionBackend):
         # Combined slot: [ K (head_size) | V (head_size) | proj_K (cs_h) ]
         if block_size % 16 != 0:
             raise ValueError("LRoSA: block_size must be a multiple of 16.")
-        # Honor the lrosa_cs_h override (e.g. Gemma 4 cs_h=64) so the allocated
-        # slot matches get_kv_cache_spec and the Impl; default = head_size//4.
-        cs_override = getattr(
-            get_current_vllm_config().attention_config, "lrosa_cs_h", None
-        )
-        cs_h = cs_override if cs_override else _cs_h_for(head_size)
-        slot_size = 2 * head_size + cs_h
+        # Honor fasa (cs_h=0, [K|V] slot) and the lrosa_cs_h override (e.g.
+        # Gemma 4 cs_h=64) so the allocated slot matches get_kv_cache_spec and
+        # the Impl. Default = head_size//4.
+        slot_size = 2 * head_size + _resolve_slot_cs_h(head_size)
         return (num_blocks, block_size, num_kv_heads, slot_size)
 
     @classmethod
@@ -509,11 +526,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         attn_cfg = vllm_config.attention_config
         self._lrosa_basis_path = attn_cfg.lrosa_basis_path
         self.n_fac = attn_cfg.lrosa_n_fac
-        # cs_h: explicit override (e.g. Gemma 4 cs_h=64 on head_dim=512) or the
-        # head_size//4 convention. Must match get_kv_cache_spec (which reads the
-        # same override) and the calibrated basis.
-        cs_h_override = getattr(attn_cfg, "lrosa_cs_h", None)
-        self.cs_h = cs_h_override if cs_h_override else _cs_h_for(head_size)
+        # FASA-fc mode (kv_cache_dtype="fasa"): [K|V] slot, score by reading the
+        # I_dom channels from full K each step (no proj_K). n_tip = #FC pairs.
+        self.is_fasa = kv_cache_dtype == "fasa"
+        self.n_tip = getattr(attn_cfg, "lrosa_n_tip", 16)
+        # cs_h: 0 for fasa ([K|V] only); else the lrosa_cs_h override (e.g.
+        # Gemma 4 cs_h=64) or head_size//4. Matches get_kv_cache_spec/_shape.
+        self.cs_h = _resolve_slot_cs_h(head_size)
         self.slot_size = 2 * head_size + self.cs_h
         self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         # Per-layer CONCAT: single basis over concatenated per-head K. cs_h
@@ -567,13 +586,16 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 map_location="cpu",
                 weights_only=False,
             )
+            # FASA reads the I_dom FC-index dict (fasa_idom_*.pt key 'idom');
+            # LRoSA reads the rotation-matrix dict (key 'M').
+            key = "idom" if self.is_fasa else "M"
             self._M_dict_cpu = (
-                ckpt["M"] if isinstance(ckpt, dict) and "M" in ckpt else ckpt
+                ckpt[key] if isinstance(ckpt, dict) and key in ckpt else ckpt
             )
             if not isinstance(self._M_dict_cpu, dict):
                 raise RuntimeError(
                     f"LRoSA basis at {self._lrosa_basis_path} did not "
-                    "contain a {layer_idx: tensor} dict at key 'M'."
+                    f"contain a {{layer_idx: tensor}} dict at key '{key}'."
                 )
 
         from vllm.model_executor.models.utils import extract_layer_index
@@ -588,6 +610,22 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             # with their own sliding window. Mark and return None.
             layer._lrosa_dense = True
             return None
+
+        if self.is_fasa:
+            # idom_layer: [H_kv, n_tip_max] FC (RoPE-pair) indices. Take the top
+            # n_tip and expand each pair fc -> raw channels {2*fc, 2*fc+1}, so
+            # the score reads 2*n_tip channels from full K. Cached as the
+            # layer's "M" (an int32 [H_kv, 2*n_tip] channel-offset tensor).
+            fcs = M_cpu[:, : self.n_tip].to(torch.int64)  # [H_kv, n_tip]
+            ch = (
+                torch.stack([fcs * 2, fcs * 2 + 1], dim=-1)
+                .reshape(self.num_kv_heads, 2 * self.n_tip)
+                .to(device=device, dtype=torch.int32)
+                .contiguous()
+            )
+            torch._dynamo.mark_static_address(ch)
+            layer._lrosa_M = ch
+            return ch
 
         if self.per_layer_concat:
             # Per-layer basis: [cs_h_layer, H_kv*head_size] (or
@@ -840,55 +878,76 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             )
             return
 
-        proj_q = torch.einsum("rhd,hcd->rhc", q_kv, M)  # (num_decodes, H_kv, cs_h)
-
-        if attn_metadata.use_streaming_topk:
-            # Step 4a: V2 chunk-parallel streaming kernel — no full
-            # scores buffer; tiny candidates buffer per (req, kv-head, chunk).
-            top_idx = lrosa_streaming_topk(
-                proj_q,
+        if self.is_fasa:
+            # FASA-fc (paper-faithful): gather the I_dom channels of the
+            # group-mean query, then score by reading those same channels from
+            # full K each step — no proj_K cache. ``M`` here is the int32
+            # [H_kv, 2*n_tip] channel-offset tensor built in _ensure_on_device.
+            ch = M
+            idx = ch.to(torch.int64).unsqueeze(0).expand(num_decodes, -1, -1)
+            q_sub = torch.gather(q_kv, 2, idx)  # (num_decodes, H_kv, 2*n_tip)
+            top_idx, _ = fasa_score_topk(
+                q_sub,
                 kv_cache,
                 block_table_dec,
                 seq_lens_dec,
+                ch,
                 n_fac=self.n_fac,
-                head_size=head_size,
-                cs_h=self.cs_h,
-                candidates_buf=attn_metadata.candidates_buf,
-                chunk_size=attn_metadata.chunk_size,
-                top_idx_out=attn_metadata.top_idx_buf,
-            )  # (num_decodes, H_kv, n_fac) int32
-        elif self.use_radix_topk:
-            # DSA radix top-K: O(seq) selection, int32 output. The builder
-            # routed the int32 buffer into top_idx_buf for this path, so the
-            # gather kernel (int32/int64 agnostic) is unaffected.
-            top_idx, _ = lrosa_score_topk(
-                proj_q,
-                kv_cache,
-                block_table_dec,
-                seq_lens_dec,
-                n_fac=self.n_fac,
-                head_size=head_size,
-                cs_h=self.cs_h,
                 scores_out=attn_metadata.scores_buf,
                 top_idx_out=attn_metadata.top_idx_buf,
                 top_scores_out=attn_metadata.top_scores_buf,
-                use_radix=True,
+                use_radix=self.use_radix_topk,
                 window=window,
-            )  # (num_decodes, H_kv, n_fac_eff) int32
+            )
         else:
-            top_idx, _ = lrosa_score_topk(
-                proj_q,
-                kv_cache,
-                block_table_dec,
-                seq_lens_dec,
-                n_fac=self.n_fac,
-                head_size=head_size,
-                cs_h=self.cs_h,
-                scores_out=attn_metadata.scores_buf,
-                top_idx_out=attn_metadata.top_idx_buf,
-                top_scores_out=attn_metadata.top_scores_buf,
-                window=window,
-            )  # (num_decodes, H_kv, n_fac_eff) int64 when CG path; int32 fallback
+            proj_q = torch.einsum("rhd,hcd->rhc", q_kv, M)  # (nd, H_kv, cs_h)
+            if attn_metadata.use_streaming_topk:
+                # Step 4a: V2 chunk-parallel streaming kernel — no full
+                # scores buffer; tiny candidates buffer per (req, kv-head, chunk).
+                top_idx = lrosa_streaming_topk(
+                    proj_q,
+                    kv_cache,
+                    block_table_dec,
+                    seq_lens_dec,
+                    n_fac=self.n_fac,
+                    head_size=head_size,
+                    cs_h=self.cs_h,
+                    candidates_buf=attn_metadata.candidates_buf,
+                    chunk_size=attn_metadata.chunk_size,
+                    top_idx_out=attn_metadata.top_idx_buf,
+                )  # (num_decodes, H_kv, n_fac) int32
+            elif self.use_radix_topk:
+                # DSA radix top-K: O(seq) selection, int32 output. The builder
+                # routed the int32 buffer into top_idx_buf for this path, so the
+                # gather kernel (int32/int64 agnostic) is unaffected.
+                top_idx, _ = lrosa_score_topk(
+                    proj_q,
+                    kv_cache,
+                    block_table_dec,
+                    seq_lens_dec,
+                    n_fac=self.n_fac,
+                    head_size=head_size,
+                    cs_h=self.cs_h,
+                    scores_out=attn_metadata.scores_buf,
+                    top_idx_out=attn_metadata.top_idx_buf,
+                    top_scores_out=attn_metadata.top_scores_buf,
+                    use_radix=True,
+                    window=window,
+                )  # (num_decodes, H_kv, n_fac_eff) int32
+            else:
+                top_idx, _ = lrosa_score_topk(
+                    proj_q,
+                    kv_cache,
+                    block_table_dec,
+                    seq_lens_dec,
+                    n_fac=self.n_fac,
+                    head_size=head_size,
+                    cs_h=self.cs_h,
+                    scores_out=attn_metadata.scores_buf,
+                    top_idx_out=attn_metadata.top_idx_buf,
+                    top_scores_out=attn_metadata.top_scores_buf,
+                    window=window,
+                )  # (nd, H_kv, n_fac_eff) int64 CG path; int32 fallback
 
         K_sel, V_sel = lrosa_gather(
             kv_cache,
@@ -1005,9 +1064,10 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # Fused write: K, V, and proj_K = M @ K into the combined slot.
         # M is loaded/materialized on this layer's device lazily on first call.
         M = self._ensure_on_device(layer, key.device, key.dtype)
-        if M is None:
-            # Dense (no-basis) layer: write K|V only, leave the proj_K region
-            # untouched (it's never read — dense forward does no selection).
+        if M is None or self.is_fasa:
+            # Write K|V only, leave any proj_K region untouched. M is None for
+            # dense (no-basis) layers; FASA-fc never stores proj_K (it re-reads
+            # I_dom channels from full K each step) so its [K|V] slot is K|V.
             lrosa_store(key, value, kv_cache, slot_mapping)
         elif self.per_layer_concat:
             lrosa_project_and_store_layer(key, value, kv_cache, slot_mapping, M)
