@@ -233,14 +233,24 @@ def _radix_topk(
         logits2d.stride(1),
         k,
     )
-    # When seq_len < k the radix kernel pads unfilled slots with -1. Those
-    # slots correspond to non-existent tokens (the row had fewer than k
-    # valid positions). torch.topk would instead return real-but-low-score
-    # indices in [0, seq_len). Downstream the index feeds both a score
-    # gather and the block-table gather; a -1 there is an OOB access. Clamp
-    # -1 → 0: token 0 is always valid, already attended, and its duplicate
-    # selection is harmless (its true score is unchanged in the SDPA).
-    topk_idx.clamp_(min=0)
+    # When seq_len < k the radix kernel pads unfilled slots with -1. A -1 is
+    # an OOB access downstream (score gather + block-table gather). DSA's MLA
+    # sparse kernel treats -1 as a skip marker, but our flash_attn has no
+    # skip semantics, so we must hand it valid indices. Replace each -1 with
+    # a DISTINCT in-range index >= seq_len (so it never duplicates a real
+    # selected token and never aliases a valid position): fill = seq_len +
+    # slot_offset, clamped to max_kv-1. These padding positions have ~-inf
+    # score so they contribute ~0 to the softmax; being distinct avoids the
+    # duplicate-token blow-up that a constant clamp (e.g. ->0) would cause.
+    #
+    # All tensor ops — no host sync — so this is CUDA-Graph safe (the
+    # previous seq_lens.min() Python gate broke graph capture with
+    # cudaErrorStreamCaptureInvalidated).
+    slot_off = torch.arange(k, device=scores.device, dtype=torch.int32)  # [k]
+    fill = (seq_lens_rows.view(rows, 1) + slot_off.view(1, k)).clamp_(
+        max=max_kv - 1
+    )  # [rows, k], >= seq_len, in-range
+    topk_idx = torch.where(topk_idx < 0, fill, topk_idx)
     topk_idx = topk_idx.view(num_reqs, H_kv, k)
     if idx_out is not None:
         idx_out[:num_reqs, :, :k].copy_(topk_idx)
@@ -286,20 +296,10 @@ def lrosa_score_topk(
     # torch.topk. Radix returns int32 indices, unsorted by score — the
     # downstream gather only needs the index set, not the order.
     #
-    # CRITICAL: radix pads under-filled rows (seq_len < k) with -1, which we
-    # clamp to 0. Unlike DSA's MLA sparse kernel (which treats -1 as a skip
-    # marker), our downstream flash_attn_varlen has no skip semantics, so a
-    # clamped-0 duplicate is attended (n_fac - seq_len) times and corrupts
-    # the softmax. torch.topk instead returns distinct in-range padding
-    # indices. So: only take the radix path when EVERY row has at least k
-    # valid positions (seq_lens.min() >= k); otherwise torch.topk. radix's
-    # speed win is in the long-context regime anyway, exactly where this
-    # condition holds.
-    use_radix_eff = (
-        use_radix
-        and _radix_topk_available()
-        and int(seq_lens.min()) >= k
-    )
+    # _radix_topk handles the seq_len < k under-fill internally with distinct
+    # in-range padding indices (no host sync), so the radix path is always
+    # safe — including for short sequences and under CUDA-Graph capture.
+    use_radix_eff = use_radix and _radix_topk_available()
 
     if top_idx_out is not None and top_scores_out is not None:
         num_reqs, H_kv, _ = scores.shape
