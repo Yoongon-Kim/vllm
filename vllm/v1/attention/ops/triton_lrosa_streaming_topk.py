@@ -130,11 +130,13 @@ def _stage1_local_topk_kernel(
 
         block_idx = t_offs // block_size
         pos_in_block = t_offs % block_size
+        # int64: physical block ids overflow int32 cache-offset arithmetic once
+        # the KV cache fills large memory -> intermittent OOB at long context.
         block_id = tl.load(
             block_table_ptr + pid_r * bt_stride_r + block_idx,
             mask=in_seq,
             other=0,
-        )
+        ).to(tl.int64)
 
         proj_K_base = (
             block_id * cache_stride_block

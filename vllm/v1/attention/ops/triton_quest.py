@@ -69,7 +69,7 @@ def _quest_minmax_update_kernel(
     last = seq_len - 1                      # 0-based position of the new token
     logical_block = last // page_size
     pos = last % page_size
-    phys_block = tl.load(block_table_ptr + r * bt_stride_r + logical_block)
+    phys_block = tl.load(block_table_ptr + r * bt_stride_r + logical_block).to(tl.int64)
 
     d = tl.arange(0, BLOCK_D)
     dmask = d < head_size
@@ -134,7 +134,7 @@ def _quest_scatter_minmax_kernel(
 ):
     p = tl.program_id(0)
     h = tl.program_id(1)
-    phys_block = tl.load(page_block_ptr + p)
+    phys_block = tl.load(page_block_ptr + p).to(tl.int64)
     d = tl.arange(0, BLOCK_D)
     dmask = d < head_size
 
@@ -275,7 +275,7 @@ def _quest_page_score_kernel(
         tl.store(scores_ptr + out_off, float("-inf"))
         return
 
-    phys_block = tl.load(block_table_ptr + r * bt_stride_r + p)
+    phys_block = tl.load(block_table_ptr + r * bt_stride_r + p).to(tl.int64)
     d = tl.arange(0, BLOCK_D)
     dmask = d < head_size
     q = tl.load(q_ptr + r * q_stride_r + h * q_stride_h + d, mask=dmask,
@@ -449,7 +449,7 @@ def _quest_blocksparse_attn_kernel(
     # The trailing page always has >= 1 valid token (trailing_len in [1, ps]).
     trail_start = num_full * page_size
     trailing_len = seq_len - trail_start                          # in [1, page_size]
-    phys_t = tl.load(block_table_ptr + r * bt_stride_r + num_full)
+    phys_t = tl.load(block_table_ptr + r * bt_stride_r + num_full).to(tl.int64)
     kv_base_t = (phys_t * cache_stride_block
                  + p_off[:, None] * cache_stride_pos
                  + h * cache_stride_head)
@@ -472,7 +472,7 @@ def _quest_blocksparse_attn_kernel(
         valid = (page_col >= 0) & (page_col < num_full)
         # block-table read clamped so an invalid (skipped) column never reads OOB
         page_col_safe = tl.where(valid, page_col, 0)
-        phys = tl.load(block_table_ptr + r * bt_stride_r + page_col_safe)
+        phys = tl.load(block_table_ptr + r * bt_stride_r + page_col_safe).to(tl.int64)
         kv_base = (phys * cache_stride_block
                    + p_off[:, None] * cache_stride_pos
                    + h * cache_stride_head)
@@ -562,7 +562,7 @@ def _quest_blocksparse_partial_kernel(
         trail_ok = active & is_trail
         block_col = tl.where(is_trail, num_full, page_col)
         block_col = tl.where(active, block_col, 0)
-        phys = tl.load(block_table_ptr + r * bt_stride_r + block_col)
+        phys = tl.load(block_table_ptr + r * bt_stride_r + block_col).to(tl.int64)
         tok_ok = tl.where(is_trail, p_off < trailing_len, p_off < page_size)
         valid = tok_ok & (sel_ok | trail_ok)            # (BLOCK_P,)
 
@@ -742,7 +742,7 @@ def _quest_gather_kernel(
     t = tl.load(token_idx_ptr + pid_r * ti_stride_r + pid_h * ti_stride_h + pid_i)
     block_idx_in_table = t // block_size
     pos_in_block = t % block_size
-    block_id = tl.load(block_table_ptr + pid_r * bt_stride_r + block_idx_in_table)
+    block_id = tl.load(block_table_ptr + pid_r * bt_stride_r + block_idx_in_table).to(tl.int64)
 
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size

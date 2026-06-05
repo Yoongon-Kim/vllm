@@ -72,7 +72,11 @@ def _lrosa_score_kernel(
     block_idx = t_offs // block_size
     pos_in_block = t_offs % block_size
     bt_offset = pid_r * bt_stride_r + block_idx
-    block_id = tl.load(block_table_ptr + bt_offset, mask=in_seq, other=0)
+    # int64: physical block ids can exceed 2^31 / cache_stride_block (~58k for
+    # an lrosa slot) once the KV cache fills B200-class memory, overflowing
+    # int32 address arithmetic into an OOB read (data-dependent on which blocks
+    # the allocator hands out → intermittent illegal-access at long context).
+    block_id = tl.load(block_table_ptr + bt_offset, mask=in_seq, other=0).to(tl.int64)
 
     # Slot base for proj_K region: skip K (head_size) + V (head_size).
     proj_K_base = (
@@ -127,7 +131,7 @@ def _lrosa_score_layer_kernel(
     block_idx = t_offs // block_size
     pos_in_block = t_offs % block_size
     block_id = tl.load(block_table_ptr + pid_r * bt_stride_r + block_idx,
-                       mask=in_seq, other=0)
+                       mask=in_seq, other=0).to(tl.int64)  # int64: avoid OOB overflow
 
     # score[t] = sum over heads of (proj_K_slot[h] · proj_q_layer[h-chunk]).
     # proj_q_layer is split the same way proj_K was scattered at store time:
@@ -404,8 +408,21 @@ def _radix_topk(
     torch.clamp(seq_lens_rows.view(rows, 1), min=1, out=sl)
     fill = _radix_scratch("fill", (rows, k), torch.int32, dev)
     torch.remainder(slot_off.view(1, k).expand(rows, k), sl, out=fill)  # [rows,k]
+    # Treat an index as invalid if it is negative (the radix -1 pad) OR >=
+    # seq_len. The latter guards a heisenbug: the DSA radix kernel intermittently
+    # emits a stale out-of-range *positive* index (only when kernels run async —
+    # CUDA_LAUNCH_BLOCKING=1 serializes and hides it). The old code rewrote only
+    # negatives, so a too-large index slipped through into the downstream K/V and
+    # block-table gather as a real OOB read; whether it faulted depended on the
+    # caching allocator's page layout (timing-dependent → looked intermittent,
+    # worse under profiler/concurrent memory pressure). Cycling every invalid
+    # slot through a real token [0, seq_len) makes the gather OOB-proof regardless
+    # of what radix returns. All scratch + out= → CUDA-graph safe.
     neg = _radix_scratch("neg", (rows, k), torch.bool, dev)
     torch.lt(topk_idx, 0, out=neg)
+    oob = _radix_scratch("oob", (rows, k), torch.bool, dev)
+    torch.ge(topk_idx, seq_lens_rows.view(rows, 1), out=oob)
+    torch.logical_or(neg, oob, out=neg)
     res = _radix_scratch("res", (rows, k), torch.int32, dev)
     torch.where(neg, fill, topk_idx, out=res)
     out3d = res.view(num_reqs, H_kv, k)

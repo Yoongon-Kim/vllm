@@ -62,7 +62,11 @@ def _lrosa_gather_kernel(
     t = tl.load(top_idx_ptr + pid_r * top_stride_r + pid_h * top_stride_h + pid_i)
     block_idx_in_table = t // block_size
     pos_in_block = t % block_size
-    block_id = tl.load(block_table_ptr + pid_r * bt_stride_r + block_idx_in_table)
+    # int64: physical block ids overflow int32 cache-offset arithmetic once the
+    # KV cache fills large memory -> intermittent OOB gather at long context.
+    block_id = tl.load(
+        block_table_ptr + pid_r * bt_stride_r + block_idx_in_table
+    ).to(tl.int64)
 
     # Load K, V from slot
     d_offs = tl.arange(0, BLOCK_D)
