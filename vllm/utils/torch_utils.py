@@ -48,6 +48,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
     "lrosa": torch.bfloat16,
+    "quest": torch.bfloat16,
     "nvfp4": torch.uint8,
 }
 

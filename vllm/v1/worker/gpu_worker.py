@@ -66,6 +66,59 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def _sparse_decode_buffer_reservation(vllm_config) -> int:
+    """Bytes the LRoSA / Quest metadata builder will allocate for per-step
+    decode buffers, sized by ``max_num_seqs``. These are allocated when the
+    builder is constructed (in ``initialize_kv_cache``), which runs AFTER
+    memory profiling, so they are invisible to the profiler and must be
+    reserved here or they overflow the KV-cache budget at large
+    n_fac × max_num_seqs. Returns 0 for all non-LRoSA/Quest backends.
+
+    Conservative upper bound (slightly over-reserves; that only costs a few
+    KV blocks, whereas under-reserving OOMs at decode).
+    """
+    dt = vllm_config.cache_config.cache_dtype
+    if dt not in ("lrosa", "quest"):
+        return 0
+    mc = vllm_config.model_config
+    pc = vllm_config.parallel_config
+    ac = vllm_config.attention_config
+    mns = vllm_config.scheduler_config.max_num_seqs
+    H_kv = mc.get_num_kv_heads(pc)
+    H_q = mc.get_num_attention_heads(pc)
+    d = mc.get_head_size()
+    L = mc.max_model_len
+
+    def _align(x, a):
+        return ((x + a - 1) // a) * a
+
+    if dt == "lrosa":
+        n_fac = int(getattr(ac, "lrosa_n_fac", 256))
+        # K_sel + V_sel (bf16) — the dominant term at large n_fac.
+        ksel = 2 * mns * n_fac * H_kv * d * 2
+        # score scratch (fp32, aligned to 128 over max_model_len).
+        scores = mns * H_kv * _align(L, 128) * 4
+        # top-K index/score buffers (i64 + i32 + fp32).
+        topk = mns * H_kv * n_fac * (8 + 4 + 4)
+        return ksel + scores + topk
+
+    # quest: block-sparse → no gather buffers, only page-score + page-idx +
+    # split-KV partials. Tiny, but reserve for correctness at large concurrency.
+    budget = int(getattr(ac, "quest_token_budget", 256))
+    page_size = int(getattr(ac, "quest_page_size", 16))
+    page_budget = max(budget // page_size - 1, 1)
+    max_pages = _align((L + page_size - 1) // page_size, 64)
+    scores = mns * H_kv * max_pages * 4
+    page_idx = mns * H_kv * page_budget * (4 + 8)
+    total_items = page_budget + 1
+    num_splits = (total_items + 15) // 16
+    partials = 0
+    if num_splits > 1:
+        partials = mns * H_q * num_splits * (d * 4 + 4 + 4)
+    return scores + page_idx + partials
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -445,6 +498,25 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+
+        # LRoSA / Quest sparse-attention backends allocate per-step decode
+        # buffers (top-K indices, score scratch, gather K_sel/V_sel,
+        # split-KV partials) sized by max_num_seqs in their metadata builder,
+        # which runs AFTER this profiling — so they are NOT in the profiled
+        # peak and would otherwise overflow the KV budget at large
+        # n_fac × max_num_seqs (e.g. LRoSA n_fac=2048). Reserve them here so
+        # any max_num_seqs works in online serving. Quest's reservation is
+        # tiny (block-sparse → no gather buffers); LRoSA's gather buffers
+        # dominate. No-op for every other backend.
+        aux = _sparse_decode_buffer_reservation(self.vllm_config)
+        if aux > 0:
+            logger.info_once(
+                "Reserving %s GiB for %s decode buffers (max_num_seqs=%d).",
+                format_gib(aux),
+                self.cache_config.cache_dtype,
+                self.vllm_config.scheduler_config.max_num_seqs,
+            )
+            self.available_kv_cache_memory_bytes -= aux
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(

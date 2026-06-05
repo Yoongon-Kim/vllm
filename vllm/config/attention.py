@@ -72,6 +72,18 @@ class AttentionConfig:
     block-table lookups + lower metadata at iso-quality (pca: -0.53 F1 on
     16-task LongBench at cs_h_layer=256 vs per-head cs_h=32)."""
 
+    quest_token_budget: int = 256
+    """Quest backend: total per-(decode step, kv-head) token budget. The
+    page budget is ``quest_token_budget // page_size`` selected full pages;
+    one additional page is always-attended for the trailing partial page
+    (which holds the current decode token). Iso-budget with LRoSA's
+    ``lrosa_n_fac`` when set equal."""
+
+    quest_page_size: int = 16
+    """Quest backend: page size in tokens. Quest pages map 1:1 onto paged-
+    cache blocks, so the engine block_size is forced to this value. Default
+    16 matches the Quest paper and pca's ``quest/quest.py`` reference."""
+
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
     in flashinfer. If None, auto-detect the attention backend in flashinfer."""

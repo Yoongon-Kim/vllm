@@ -616,6 +616,23 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 lrosa_slot_size=slot_elems * dtype_size,
             )
+        elif self.kv_cache_dtype == "quest":
+            # Quest combined slot: [ K | V | K_min | K_max ] = 4 * head_size.
+            # Reuse LRoSAFullAttentionSpec (the spec only needs per-slot bytes;
+            # the [K|V|min|max] interpretation lives in the Quest backend).
+            from vllm.utils.torch_utils import get_dtype_size
+            from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
+
+            slot_elems = 4 * self.head_size
+            dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
+            return LRoSAFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                lrosa_slot_size=slot_elems * dtype_size,
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,

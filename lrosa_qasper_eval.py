@@ -42,12 +42,13 @@ def build_token_ids(row, tok, max_input_len):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num_samples", type=int, default=200)
-    ap.add_argument("--mode", choices=["lrosa", "fkv"], default="lrosa")
+    ap.add_argument("--mode", choices=["lrosa", "fkv", "quest"], default="lrosa")
     ap.add_argument("--max_input_len", type=int, default=127500)
     ap.add_argument("--n_fac", type=int, default=256)
     ap.add_argument("--per_layer", action="store_true")
     ap.add_argument("--basis", default=BASIS)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--gpu_mem", type=float, default=0.90)
     a = ap.parse_args()
 
     rows = []
@@ -61,7 +62,7 @@ def main():
     token_ids = [build_token_ids(r, tok, a.max_input_len) for r in rows]
 
     kw = dict(model=MODEL, max_model_len=a.max_input_len + 256,
-              gpu_memory_utilization=0.90, enforce_eager=a.eager)
+              gpu_memory_utilization=a.gpu_mem, enforce_eager=a.eager)
     if a.mode == "lrosa":
         kw["kv_cache_dtype"] = "lrosa"
         ac = {"backend": "LROSA", "lrosa_basis_path": a.basis,
@@ -69,6 +70,10 @@ def main():
         if a.per_layer:
             ac["lrosa_per_layer_concat"] = True
         kw["attention_config"] = ac
+    elif a.mode == "quest":
+        kw["kv_cache_dtype"] = "quest"
+        kw["attention_config"] = {"backend": "QUEST",
+                                  "quest_token_budget": a.n_fac}
     llm = LLM(**kw)
 
     sp = SamplingParams(temperature=0.0, max_tokens=TASK_MAX_NEW_TOKENS["qasper"])
