@@ -354,16 +354,27 @@ def _radix_topk(
     )
     topk_idx = _radix_scratch("topk", (rows, k), torch.int32, dev)
     next_n = 1  # LRoSA decode: one query token per step (no spec-decode)
-    torch.ops._C.top_k_per_row_decode(
-        logits2d,
-        next_n,
-        seq_lens_rows,
-        topk_idx,
-        rows,
-        logits2d.stride(0),
-        logits2d.stride(1),
-        k,
-    )
+    # top_k_per_row_decode picks its kernel by row count: num_rows > 32 (with
+    # >=128KB smem, i.e. Blackwell) takes FilteredTopKRaggedTransform, which has
+    # an intermittent illegal-memory-access bug at large row counts; num_rows<=32
+    # takes the (correct, CUDA-graph-safe) cooperative persistent_topk path.
+    # bsz=1 has rows = H_kv (<=32) so it always hit the good path; bsz>=4 with
+    # H_kv=8 (rows>=32) fell into the buggy one. Chunk the rows to <=32 so every
+    # call uses the persistent path. The chunk count is fixed per captured batch
+    # size, so the Python loop is CUDA-graph capturable.
+    _RADIX_ROW_CHUNK = 32
+    if rows <= _RADIX_ROW_CHUNK:
+        torch.ops._C.top_k_per_row_decode(
+            logits2d, next_n, seq_lens_rows, topk_idx, rows,
+            logits2d.stride(0), logits2d.stride(1), k,
+        )
+    else:
+        for r0 in range(0, rows, _RADIX_ROW_CHUNK):
+            r1 = min(r0 + _RADIX_ROW_CHUNK, rows)
+            torch.ops._C.top_k_per_row_decode(
+                logits2d[r0:r1], next_n, seq_lens_rows[r0:r1], topk_idx[r0:r1],
+                r1 - r0, logits2d.stride(0), logits2d.stride(1), k,
+            )
     # When seq_len < k the radix kernel pads unfilled slots with -1. A -1 is
     # an OOB access downstream (score gather + block-table gather). DSA's MLA
     # sparse kernel treats -1 as a skip marker, but our flash_attn has no skip

@@ -63,6 +63,25 @@ def _cs_h_for(head_size: int) -> int:
     return head_size // 4
 
 
+_DECODE_SCRATCH: dict = {}
+
+
+def _decode_scratch(name, shape, dtype, device):
+    """Per-shape persistent scratch for sparse-decode intermediates (q_kv,
+    proj_q, ...). Fresh torch ops inside the decode path allocate from the
+    CUDA-graph memory pool; at bsz>1 (esp. v1 continuous-batching mixed
+    prefill+decode steps) those allocations alias captured-graph memory and the
+    score/gather kernels read a corrupted address -> illegal memory access
+    (bsz=1 never produces a mixed batch, so it was never exposed). Reusing a
+    stable per-shape buffer + out=/copy_ keeps the decode path allocation-free."""
+    key = (name, tuple(shape), dtype, device)
+    t = _DECODE_SCRATCH.get(key)
+    if t is None:
+        t = torch.empty(shape, dtype=dtype, device=device)
+        _DECODE_SCRATCH[key] = t
+    return t
+
+
 def _resolve_slot_cs_h(head_size: int) -> int:
     """Width of the proj_K region in the combined slot for this run.
 
@@ -819,9 +838,19 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
 
         q_decode = query[:num_decode_tokens]  # (num_decodes, H_q, head_size)
         # GQA group-mean: H_q → H_kv. View groups Q heads by their parent kv-head.
-        q_kv = q_decode.view(
-            num_decodes, self.num_kv_heads, self.num_kv_groups, head_size
-        ).mean(dim=2)  # (num_decodes, H_kv, head_size)
+        # Written into persistent scratch (no allocation → CUDA-graph safe at
+        # bsz>1 / mixed batches).
+        q_kv = _decode_scratch(
+            "qkv", (num_decodes, self.num_kv_heads, head_size),
+            q_decode.dtype, q_decode.device,
+        )
+        torch.mean(
+            q_decode.view(
+                num_decodes, self.num_kv_heads, self.num_kv_groups, head_size
+            ),
+            dim=2,
+            out=q_kv,
+        )
 
         block_table_dec = attn_metadata.block_table[:num_decodes]
         seq_lens_dec = attn_metadata.seq_lens[:num_decodes]
@@ -883,9 +912,20 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             # group-mean query, then score by reading those same channels from
             # full K each step — no proj_K cache. ``M`` here is the int32
             # [H_kv, 2*n_tip] channel-offset tensor built in _ensure_on_device.
-            ch = M
-            idx = ch.to(torch.int64).unsqueeze(0).expand(num_decodes, -1, -1)
-            q_sub = torch.gather(q_kv, 2, idx)  # (num_decodes, H_kv, 2*n_tip)
+            ch = M  # int32 [H_kv, 2*n_tip] channel offsets
+            n_ch = ch.shape[1]
+            # Gather the I_dom channels of q_kv into persistent scratch
+            # (allocation-free → CUDA-graph safe at bsz>1 / mixed batches).
+            idx64 = _decode_scratch(
+                "fasa_idx", (num_decodes, self.num_kv_heads, n_ch),
+                torch.int64, q_kv.device,
+            )
+            idx64.copy_(ch.unsqueeze(0).expand(num_decodes, -1, -1))  # i32->i64
+            q_sub = _decode_scratch(
+                "qsub", (num_decodes, self.num_kv_heads, n_ch),
+                q_kv.dtype, q_kv.device,
+            )
+            torch.gather(q_kv, 2, idx64, out=q_sub)  # (num_decodes, H_kv, 2*n_tip)
             top_idx, _ = fasa_score_topk(
                 q_sub,
                 kv_cache,
@@ -900,7 +940,18 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 window=window,
             )
         else:
-            proj_q = torch.einsum("rhd,hcd->rhc", q_kv, M)  # (nd, H_kv, cs_h)
+            # proj_q[r,h,c] = Σ_d q_kv[r,h,d]·M[h,c,d]  — per-kv-head bmm into
+            # persistent scratch (allocation-free). M is [H_kv, cs_h, d].
+            projq_hrc = _decode_scratch(
+                "projq", (self.num_kv_heads, num_decodes, self.cs_h),
+                q_kv.dtype, q_kv.device,
+            )
+            torch.bmm(
+                q_kv.transpose(0, 1),          # (H_kv, nd, d)
+                M.transpose(1, 2),             # (H_kv, d, cs_h)
+                out=projq_hrc,
+            )
+            proj_q = projq_hrc.transpose(0, 1)  # (nd, H_kv, cs_h) view
             if attn_metadata.use_streaming_topk:
                 # Step 4a: V2 chunk-parallel streaming kernel — no full
                 # scores buffer; tiny candidates buffer per (req, kv-head, chunk).

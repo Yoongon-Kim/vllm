@@ -30,13 +30,14 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
-from _bench_common import lrosa_basis_path, yarn_overrides
+from _bench_common import lrosa_basis_path, fasa_idom_path, yarn_overrides
 
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
 def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
-              max_num_seqs=0, model=MODEL, basis=None, cs_h=32):
+              max_num_seqs=0, model=MODEL, basis=None, cs_h=32, n_tip=16,
+              use_radix=True):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
     # serving concurrency (stresses the buffers; Quest's are tiny, LRoSA's
@@ -44,7 +45,11 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
     mns = max_num_seqs if max_num_seqs > 0 else max(batch_size, 1)
     kw = dict(model=model, max_model_len=prefill_len + decode_len + 16,
               gpu_memory_utilization=gpu_mem, enforce_eager=False,
-              enable_prefix_caching=False, max_num_seqs=mns)
+              enable_prefix_caching=False, max_num_seqs=mns,
+              # Steady-state decode latency: keep prefill and decode in
+              # separate batches (no chunked-prefill mixed batches). Also avoids
+              # the sparse backends' mixed-batch score-kernel bug at bsz>1.
+              enable_chunked_prefill=False)
     # Qwen3: enable YaRN so served rope matches the basis's calibration rope
     # (also lets prefill_len exceed the 32K native window).
     ov = yarn_overrides(model)
@@ -55,7 +60,13 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         kw["kv_cache_dtype"] = "lrosa"
         kw["attention_config"] = {"backend": "LROSA", "lrosa_basis_path": basis,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
-                                  "lrosa_use_radix_topk": True}
+                                  "lrosa_use_radix_topk": use_radix}
+    elif backend == "fasa":
+        idom = basis or fasa_idom_path(model)
+        kw["kv_cache_dtype"] = "fasa"
+        kw["attention_config"] = {"backend": "LROSA", "lrosa_basis_path": idom,
+                                  "lrosa_n_fac": n_fac, "lrosa_n_tip": n_tip,
+                                  "lrosa_use_radix_topk": use_radix}
     elif backend == "quest":
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST", "quest_token_budget": n_fac}
@@ -80,11 +91,15 @@ def time_generate(llm, prompts, max_tokens, reps=2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest"], required=True)
+    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa"], required=True)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--basis", default=None,
-                    help="LRoSA basis .pt; default = pca bases/<tag>/pca_d1_cs<N>_kv_head.")
+                    help="LRoSA basis / FASA idom .pt; default = pca bases/<tag>/...")
     ap.add_argument("--cs_h", type=int, default=32)
+    ap.add_argument("--n_tip", type=int, default=16,
+                    help="FASA-fc only: # dominant FCs per kv-head.")
+    ap.add_argument("--no_radix", action="store_true",
+                    help="Disable DSA radix top-K (use torch.topk); needed at bsz>1 + long ctx.")
     ap.add_argument("--prefill_len", type=int, default=65536)
     ap.add_argument("--decode_len", type=int, default=128)
     ap.add_argument("--n_fac", type=int, default=256)
@@ -103,7 +118,7 @@ def main():
 
     llm = build_llm(a.backend, a.prefill_len, a.decode_len, a.n_fac, a.gpu_mem,
                     a.batch_size, a.max_num_seqs, model=a.model, basis=a.basis,
-                    cs_h=a.cs_h)
+                    cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix)
 
     t_prefill = time_generate(llm, prompts, 1)
     t_full = time_generate(llm, prompts, 1 + a.decode_len)
