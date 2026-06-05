@@ -61,6 +61,17 @@ class AttentionConfig:
     automatically if the binding is absent. Only applies when
     ``lrosa_use_streaming_topk`` is False."""
 
+    lrosa_per_layer_concat: bool = False
+    """Use the per-layer CONCAT LRoSA variant: a single basis M_layer
+    [cs_h_layer, H_kv*head_size] projects the CONCATENATED per-head K (not a
+    per-kv-head basis), and one shared top-K selection per layer feeds all
+    kv-heads. cs_h_layer is spread across the H_kv slots' proj_K regions
+    (cs_h_slot = cs_h_layer // H_kv), reusing the combined-slot layout. The
+    basis .pt must hold M as [1, cs_h_layer, H_kv*head_size] (or
+    [cs_h_layer, H_kv*head_size]). Trades a per-head selection for H_kv× fewer
+    block-table lookups + lower metadata at iso-quality (pca: -0.53 F1 on
+    16-task LongBench at cs_h_layer=256 vs per-head cs_h=32)."""
+
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
     in flashinfer. If None, auto-detect the attention backend in flashinfer."""

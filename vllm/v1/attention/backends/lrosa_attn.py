@@ -45,6 +45,7 @@ from vllm.v1.attention.ops.triton_lrosa_gather import lrosa_gather
 from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
+    lrosa_project_and_store_layer,
 )
 from vllm.v1.attention.ops.triton_lrosa_streaming_topk import (
     alloc_candidates_buf,
@@ -493,6 +494,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self._lrosa_basis_path = attn_cfg.lrosa_basis_path
         self.n_fac = attn_cfg.lrosa_n_fac
         self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
+        # Per-layer CONCAT: single basis over concatenated per-head K. cs_h
+        # (the per-slot proj_K width) stays head_size//4, and cs_h_layer =
+        # cs_h * H_kv is spread across the H_kv slots — so slot_size is
+        # unchanged and the same combined-slot cache is reused.
+        self.per_layer_concat = getattr(attn_cfg, "lrosa_per_layer_concat", False)
+        self.cs_h_slot = self.cs_h
+        self.cs_h_layer = self.cs_h_slot * self.num_kv_heads
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -552,13 +560,27 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 f"{sorted(self._M_dict_cpu.keys())[:5]}..."
             )
 
-        expected_shape = (self.num_kv_heads, self.cs_h, self.head_size)
-        if tuple(M_cpu.shape) != expected_shape:
-            raise RuntimeError(
-                f"LRoSA basis M[{layer_idx}] shape {tuple(M_cpu.shape)} != "
-                f"expected {expected_shape} (H_kv={self.num_kv_heads}, "
-                f"cs_h={self.cs_h}, d={self.head_size})."
-            )
+        if self.per_layer_concat:
+            # Per-layer basis: [cs_h_layer, H_kv*head_size] (or
+            # [1, cs_h_layer, H_kv*head_size] from pca's per-layer dict).
+            if M_cpu.dim() == 3 and M_cpu.shape[0] == 1:
+                M_cpu = M_cpu[0]
+            expected_shape = (self.cs_h_layer, self.num_kv_heads * self.head_size)
+            if tuple(M_cpu.shape) != expected_shape:
+                raise RuntimeError(
+                    f"LRoSA per-layer basis M[{layer_idx}] shape "
+                    f"{tuple(M_cpu.shape)} != expected {expected_shape} "
+                    f"(cs_h_layer={self.cs_h_layer}, "
+                    f"H_kv*d={self.num_kv_heads * self.head_size})."
+                )
+        else:
+            expected_shape = (self.num_kv_heads, self.cs_h, self.head_size)
+            if tuple(M_cpu.shape) != expected_shape:
+                raise RuntimeError(
+                    f"LRoSA basis M[{layer_idx}] shape {tuple(M_cpu.shape)} != "
+                    f"expected {expected_shape} (H_kv={self.num_kv_heads}, "
+                    f"cs_h={self.cs_h}, d={self.head_size})."
+                )
 
         M = M_cpu.to(device=device, dtype=dtype).contiguous()
         # Calibration M is layer-static, so its address never moves once
@@ -697,10 +719,53 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         q_kv = q_decode.view(
             num_decodes, self.num_kv_heads, self.num_kv_groups, head_size
         ).mean(dim=2)  # (num_decodes, H_kv, head_size)
-        proj_q = torch.einsum("rhd,hcd->rhc", q_kv, M)  # (num_decodes, H_kv, cs_h)
 
         block_table_dec = attn_metadata.block_table[:num_decodes]
         seq_lens_dec = attn_metadata.seq_lens[:num_decodes]
+
+        if self.per_layer_concat:
+            # Per-layer CONCAT: one projection over concatenated per-head Q,
+            # one score row per request, one shared top-K broadcast to all
+            # kv-heads. M is [cs_h_layer, H_kv*head_size].
+            from vllm.v1.attention.ops.triton_lrosa_score_topk import (
+                lrosa_score_layer, _radix_topk_available,
+            )
+            q_concat = q_kv.reshape(num_decodes, self.num_kv_heads * head_size)
+            proj_q_layer = (q_concat.to(torch.float32) @ M.to(torch.float32).T)
+            scores = lrosa_score_layer(
+                proj_q_layer, kv_cache, block_table_dec, seq_lens_dec,
+                head_size=head_size, cs_h_slot=self.cs_h_slot,
+                H_kv=self.num_kv_heads,
+            )  # (num_decodes, max_kv_len) fp32
+            k = min(self.n_fac, scores.shape[-1])
+            if _radix_topk_available():
+                # reuse radix via (num_reqs, 1, max_kv) shaping
+                from vllm.v1.attention.ops.triton_lrosa_score_topk import _radix_topk
+                ti = _radix_topk(scores.unsqueeze(1), seq_lens_dec, k)  # (nd,1,k) i32
+            else:
+                ti = scores.topk(k, dim=-1).indices.to(torch.int32).unsqueeze(1)
+            # broadcast the single selection to all kv-heads for the gather
+            top_idx = ti.expand(num_decodes, self.num_kv_heads, k).contiguous()
+            K_sel, V_sel = lrosa_gather(
+                kv_cache, block_table_dec, top_idx, head_size=head_size,
+                dtype=q_decode.dtype, K_sel_out=attn_metadata.K_sel_buf,
+                V_sel_out=attn_metadata.V_sel_buf,
+            )
+            n_fac_eff = top_idx.shape[-1]
+            cu_seqlens_q = attn_metadata.cu_seqlens_q_dec
+            cu_seqlens_k = (attn_metadata.cu_seqlens_k_dec
+                            if n_fac_eff == self.n_fac
+                            else cu_seqlens_q * n_fac_eff)
+            flash_attn_varlen_func(
+                q=q_decode, k=K_sel, v=V_sel, out=output[:num_decode_tokens],
+                cu_seqlens_q=cu_seqlens_q, max_seqlen_q=1,
+                cu_seqlens_k=cu_seqlens_k, max_seqlen_k=n_fac_eff,
+                softmax_scale=self.scale, causal=False,
+                alibi_slopes=self.alibi_slopes, softcap=self.logits_soft_cap,
+            )
+            return
+
+        proj_q = torch.einsum("rhd,hcd->rhc", q_kv, M)  # (num_decodes, H_kv, cs_h)
 
         if attn_metadata.use_streaming_topk:
             # Step 4a: V2 chunk-parallel streaming kernel — no full
@@ -796,4 +861,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # Fused write: K, V, and proj_K = M @ K into the combined slot.
         # M is loaded/materialized on this layer's device lazily on first call.
         M = self._ensure_on_device(layer, key.device, key.dtype)
-        lrosa_project_and_store(key, value, kv_cache, slot_mapping, M)
+        if self.per_layer_concat:
+            lrosa_project_and_store_layer(key, value, kv_cache, slot_mapping, M)
+        else:
+            lrosa_project_and_store(key, value, kv_cache, slot_mapping, M)

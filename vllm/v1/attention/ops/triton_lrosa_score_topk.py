@@ -90,6 +90,91 @@ def _lrosa_score_kernel(
     tl.store(scores_ptr + out_off, score, mask=in_range)
 
 
+@triton.jit
+def _lrosa_score_layer_kernel(
+    proj_q_ptr,      # [num_reqs, cs_h_layer]  single per-layer query proj
+    kv_cache_ptr,    # [num_blocks, block_size, H_kv, slot_size]
+    block_table_ptr, # [num_reqs, max_blocks]
+    seq_lens_ptr,    # [num_reqs]
+    scores_ptr,      # [num_reqs, max_kv_len]  fp32 (single head dim)
+    max_kv_len,
+    head_size,
+    cs_h_slot,       # cs_h_layer // H_kv
+    block_size,
+    proj_q_stride_r,
+    cache_stride_block, cache_stride_pos, cache_stride_head,
+    bt_stride_r,
+    scores_stride_r,
+    H_KV: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,   # >= cs_h_slot
+):
+    pid_r = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    seq_len = tl.load(seq_lens_ptr + pid_r)
+    in_seq = t_offs < seq_len
+    in_range = t_offs < max_kv_len
+
+    c_offs = tl.arange(0, BLOCK_C)
+    c_mask = c_offs < cs_h_slot
+
+    block_idx = t_offs // block_size
+    pos_in_block = t_offs % block_size
+    block_id = tl.load(block_table_ptr + pid_r * bt_stride_r + block_idx,
+                       mask=in_seq, other=0)
+
+    # score[t] = sum over heads of (proj_K_slot[h] · proj_q_layer[h-chunk]).
+    # proj_q_layer is split the same way proj_K was scattered at store time:
+    # head h owns proj_q_layer[h*cs_h_slot : (h+1)*cs_h_slot].
+    score = tl.zeros([BLOCK_T], dtype=tl.float32)
+    for h in range(H_KV):
+        proj_K_base = (block_id * cache_stride_block
+                       + pos_in_block * cache_stride_pos
+                       + h * cache_stride_head + 2 * head_size)
+        pK = tl.load(kv_cache_ptr + proj_K_base[:, None] + c_offs[None, :],
+                     mask=in_seq[:, None] & c_mask[None, :], other=0.0).to(tl.float32)
+        pq_h = tl.load(proj_q_ptr + pid_r * proj_q_stride_r + h * cs_h_slot + c_offs,
+                       mask=c_mask, other=0.0).to(tl.float32)
+        score += tl.sum(pK * pq_h[None, :], axis=1)
+    score = tl.where(in_seq, score, float("-inf"))
+    tl.store(scores_ptr + pid_r * scores_stride_r + t_offs, score, mask=in_range)
+
+
+def lrosa_score_layer(
+    proj_q_layer: torch.Tensor,  # (num_reqs, cs_h_layer)
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    head_size: int,
+    cs_h_slot: int,
+    H_kv: int,
+    scores_out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-layer CONCAT score: single score row per request (head-shared)."""
+    num_reqs = proj_q_layer.shape[0]
+    max_blocks = block_table.shape[1]
+    max_kv_len = max_blocks * kv_cache.shape[1]
+    if scores_out is not None:
+        scores = scores_out[:num_reqs]
+        assert scores.shape[-1] >= max_kv_len
+    else:
+        scores = torch.empty(num_reqs, max_kv_len, dtype=torch.float32,
+                             device=proj_q_layer.device)
+    BLOCK_T = 128
+    BLOCK_C = triton.next_power_of_2(cs_h_slot)
+    grid = (num_reqs, triton.cdiv(max_kv_len, BLOCK_T))
+    _lrosa_score_layer_kernel[grid](
+        proj_q_layer, kv_cache, block_table, seq_lens, scores,
+        max_kv_len, head_size, cs_h_slot, kv_cache.shape[1],
+        proj_q_layer.stride(0),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        block_table.stride(0), scores.stride(0),
+        H_KV=H_kv, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C,
+    )
+    return scores
+
+
 def _launch_score_kernel(
     proj_q: torch.Tensor,
     kv_cache: torch.Tensor,

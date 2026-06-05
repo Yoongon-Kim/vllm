@@ -43,7 +43,7 @@ llm = LLM(
     },
     max_model_len=8192,
     gpu_memory_utilization=0.85,
-    enforce_eager=True,
+    enforce_eager=False,
 )
 
 outs = llm.generate(prompts, sampling)

@@ -188,6 +188,92 @@ def _lrosa_project_store_kernel(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-layer CONCAT store: single basis over concatenated per-head K.
+#   proj_K_layer = M_layer @ concat_h(K[h]),  M_layer [cs_h_layer, H_kv*d]
+# cs_h_layer is spread across the H_kv slots' proj_K regions
+# (cs_h_slot = cs_h_layer // H_kv each), reusing the combined-slot layout
+# unchanged. We do the projection in PyTorch (small GEMM: num_tokens ×
+# H_kv*d → cs_h_layer) and reuse the per-head K/V store kernel plus a tiny
+# proj-scatter kernel — far simpler and safer than an in-register Triton
+# concat/scatter.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _lrosa_store_proj_kernel(
+    proj_ptr,        # [num_tokens, H_kv, cs_h_slot]  (already split per head)
+    kv_cache_ptr,    # [num_blocks, block_size, H_kv, slot_size]
+    slot_mapping_ptr,
+    num_tokens,
+    head_size,
+    cs_h_slot,
+    block_size,
+    proj_stride_t, proj_stride_h,
+    cache_stride_block, cache_stride_pos, cache_stride_head,
+    BLOCK_C: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    if token_id >= num_tokens:
+        return
+    slot = tl.load(slot_mapping_ptr + token_id)
+    if slot < 0:
+        return
+    block_id = slot // block_size
+    pos = slot % block_size
+    c_offs = tl.arange(0, BLOCK_C)
+    c_mask = c_offs < cs_h_slot
+    p_off = token_id * proj_stride_t + head_id * proj_stride_h
+    p = tl.load(proj_ptr + p_off + c_offs, mask=c_mask, other=0.0)
+    cache_off = (block_id * cache_stride_block + pos * cache_stride_pos
+                 + head_id * cache_stride_head + 2 * head_size)
+    tl.store(kv_cache_ptr + cache_off + c_offs,
+             p.to(kv_cache_ptr.dtype.element_ty), mask=c_mask)
+
+
+def lrosa_project_and_store_layer(
+    key: torch.Tensor,    # (num_tokens, H_kv, head_size)
+    value: torch.Tensor,  # (num_tokens, H_kv, head_size)
+    kv_cache: torch.Tensor,  # (num_blocks, block_size, H_kv, slot_size)
+    slot_mapping: torch.Tensor,
+    M_layer: torch.Tensor,   # (cs_h_layer, H_kv*head_size)  single per-layer basis
+) -> None:
+    """Per-layer CONCAT store: K, V (per head) + proj_K_layer scattered across
+    the H_kv slots' proj_K regions."""
+    num_tokens, H_kv, head_size = key.shape
+    if num_tokens == 0:
+        return
+    cs_h_layer = M_layer.shape[0]
+    assert M_layer.shape[1] == H_kv * head_size, (
+        f"M_layer {tuple(M_layer.shape)} expected (cs_h_layer, {H_kv*head_size})"
+    )
+    assert cs_h_layer % H_kv == 0, (
+        f"cs_h_layer {cs_h_layer} must be divisible by H_kv {H_kv}"
+    )
+    cs_h_slot = cs_h_layer // H_kv
+    assert kv_cache.shape[-1] >= 2 * head_size + cs_h_slot
+
+    # 1) Store K + V per head (proj region untouched) via the existing kernel.
+    lrosa_store(key, value, kv_cache, slot_mapping)
+
+    # 2) proj_K_layer = M_layer @ concat_h(K[h]). Small GEMM in fp32.
+    K_concat = key.reshape(num_tokens, H_kv * head_size).to(torch.float32)
+    proj_layer = K_concat @ M_layer.to(torch.float32).T       # [T, cs_h_layer]
+    # split into per-head slot chunks: [T, H_kv, cs_h_slot]
+    proj_split = proj_layer.reshape(num_tokens, H_kv, cs_h_slot).contiguous()
+
+    # 3) Scatter into proj_K regions.
+    BLOCK_C = triton.next_power_of_2(cs_h_slot)
+    _lrosa_store_proj_kernel[(num_tokens, H_kv)](
+        proj_split, kv_cache, slot_mapping,
+        num_tokens, head_size, cs_h_slot, kv_cache.shape[1],
+        proj_split.stride(0), proj_split.stride(1),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        BLOCK_C=BLOCK_C,
+    )
+
+
 def lrosa_project_and_store(
     key: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
     value: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
