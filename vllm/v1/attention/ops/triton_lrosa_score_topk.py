@@ -209,16 +209,19 @@ def _radix_topk(
     """
     num_reqs, H_kv, max_kv = scores.shape
     rows = num_reqs * H_kv
-    logits2d = scores.reshape(rows, max_kv)                 # view, contiguous
+    logits2d = scores.reshape(rows, max_kv).contiguous()    # kernel needs row-major
     # seq_lens per row: each request's length repeated for its H_kv heads.
     seq_lens_rows = (
         seq_lens.to(torch.int32).view(num_reqs, 1)
         .expand(num_reqs, H_kv).reshape(rows).contiguous()
     )
-    if idx_out is not None:
-        topk_idx = idx_out.reshape(rows, -1)[:, :k]
-    else:
-        topk_idx = torch.empty(rows, k, dtype=torch.int32, device=scores.device)
+    # The radix kernel writes a dense (rows, k) int32 output. Always use a
+    # fresh contiguous buffer here — writing through a non-contiguous view
+    # of a caller buffer (e.g. a [:num_decodes] slice whose last dim is
+    # n_fac != k) silently lands in a temporary copy and never reaches the
+    # caller's buffer, producing stale indices downstream. We copy into
+    # idx_out (if given) after reshaping back to (num_reqs, H_kv, k).
+    topk_idx = torch.empty(rows, k, dtype=torch.int32, device=scores.device)
     next_n = 1  # LRoSA decode: one query token per step (no spec-decode)
     torch.ops._C.top_k_per_row_decode(
         logits2d,
@@ -230,7 +233,19 @@ def _radix_topk(
         logits2d.stride(1),
         k,
     )
-    return topk_idx.view(num_reqs, H_kv, k)
+    # When seq_len < k the radix kernel pads unfilled slots with -1. Those
+    # slots correspond to non-existent tokens (the row had fewer than k
+    # valid positions). torch.topk would instead return real-but-low-score
+    # indices in [0, seq_len). Downstream the index feeds both a score
+    # gather and the block-table gather; a -1 there is an OOB access. Clamp
+    # -1 → 0: token 0 is always valid, already attended, and its duplicate
+    # selection is harmless (its true score is unchanged in the SDPA).
+    topk_idx.clamp_(min=0)
+    topk_idx = topk_idx.view(num_reqs, H_kv, k)
+    if idx_out is not None:
+        idx_out[:num_reqs, :, :k].copy_(topk_idx)
+        return idx_out[:num_reqs, :, :k]
+    return topk_idx
 
 
 def lrosa_score_topk(
@@ -270,7 +285,21 @@ def lrosa_score_topk(
     # the binding is compiled in; otherwise transparently falls back to
     # torch.topk. Radix returns int32 indices, unsorted by score — the
     # downstream gather only needs the index set, not the order.
-    use_radix_eff = use_radix and _radix_topk_available()
+    #
+    # CRITICAL: radix pads under-filled rows (seq_len < k) with -1, which we
+    # clamp to 0. Unlike DSA's MLA sparse kernel (which treats -1 as a skip
+    # marker), our downstream flash_attn_varlen has no skip semantics, so a
+    # clamped-0 duplicate is attended (n_fac - seq_len) times and corrupts
+    # the softmax. torch.topk instead returns distinct in-range padding
+    # indices. So: only take the radix path when EVERY row has at least k
+    # valid positions (seq_lens.min() >= k); otherwise torch.topk. radix's
+    # speed win is in the long-context regime anyway, exactly where this
+    # condition holds.
+    use_radix_eff = (
+        use_radix
+        and _radix_topk_available()
+        and int(seq_lens.min()) >= k
+    )
 
     if top_idx_out is not None and top_scores_out is not None:
         num_reqs, H_kv, _ = scores.shape
@@ -288,6 +317,18 @@ def lrosa_score_topk(
             # Gather the corresponding scores for callers that consume them.
             score_view = top_scores_out[:num_reqs, :, :k]
             torch.gather(scores, -1, idx_view.to(torch.int64), out=score_view)
+            return idx_view, score_view
+        if top_idx_out.dtype == torch.int32:
+            # i32 buffer (radix was requested) but the radix gate declined
+            # (e.g. seq_len < k → would need -1 padding our flash_attn can't
+            # skip). Fall back to torch.topk, which returns distinct in-range
+            # padding indices, but torch.topk(out=) requires int64 — so call
+            # it without out= and copy into the i32 buffer.
+            ts, ti = torch.topk(scores, k=k, dim=-1)
+            idx_view = top_idx_out[:num_reqs, :, :k]
+            score_view = top_scores_out[:num_reqs, :, :k]
+            idx_view.copy_(ti.to(torch.int32))
+            score_view.copy_(ts)
             return idx_view, score_view
         assert top_idx_out.dtype == torch.int64, (
             "top_idx_out must be int64 (torch.topk constraint)"
