@@ -231,6 +231,7 @@ class LRoSAMetadataBuilder(AttentionMetadataBuilder[LRoSAMetadata]):
         attn_cfg = vllm_config.attention_config
         self.n_fac = attn_cfg.lrosa_n_fac
         self.use_streaming_topk = attn_cfg.lrosa_use_streaming_topk
+        self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         max_model_len = vllm_config.model_config.max_model_len
 
         # ``torch.topk(out=)`` requires int64 indices for the 2-pass path; the
@@ -395,6 +396,12 @@ class LRoSAMetadataBuilder(AttentionMetadataBuilder[LRoSAMetadata]):
             if self.use_streaming_topk:
                 scores_buf = None
                 top_idx_buf = self._top_idx_buf_i32[:num_decodes]
+            elif self.use_radix_topk:
+                # Radix path still needs the scores buffer (2-pass score
+                # kernel), but writes int32 indices.
+                full_scores = self._ensure_scores_buf(runtime_max_kv_len)
+                scores_buf = full_scores[:num_decodes]
+                top_idx_buf = self._top_idx_buf_i32[:num_decodes]
             else:
                 full_scores = self._ensure_scores_buf(runtime_max_kv_len)
                 scores_buf = full_scores[:num_decodes]
@@ -485,6 +492,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         attn_cfg = vllm_config.attention_config
         self._lrosa_basis_path = attn_cfg.lrosa_basis_path
         self.n_fac = attn_cfg.lrosa_n_fac
+        self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -709,6 +717,23 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 chunk_size=attn_metadata.chunk_size,
                 top_idx_out=attn_metadata.top_idx_buf,
             )  # (num_decodes, H_kv, n_fac) int32
+        elif self.use_radix_topk:
+            # DSA radix top-K: O(seq) selection, int32 output. The builder
+            # routed the int32 buffer into top_idx_buf for this path, so the
+            # gather kernel (int32/int64 agnostic) is unaffected.
+            top_idx, _ = lrosa_score_topk(
+                proj_q,
+                kv_cache,
+                block_table_dec,
+                seq_lens_dec,
+                n_fac=self.n_fac,
+                head_size=head_size,
+                cs_h=self.cs_h,
+                scores_out=attn_metadata.scores_buf,
+                top_idx_out=attn_metadata.top_idx_buf,
+                top_scores_out=attn_metadata.top_scores_buf,
+                use_radix=True,
+            )  # (num_decodes, H_kv, n_fac_eff) int32
         else:
             top_idx, _ = lrosa_score_topk(
                 proj_q,

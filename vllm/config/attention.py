@@ -47,7 +47,19 @@ class AttentionConfig:
     two-pass score + ``torch.topk`` path. Streaming avoids the
     ``(num_reqs, H_kv, max_kv_len)`` fp32 score buffer; pre-PR profiling
     showed it pays off at long context (>~16K). Default False until the
-    full benchmark sweep lands."""
+    full benchmark sweep lands.
+
+    NOTE (2026-06): on Blackwell sm_120 the streaming kernel is actually
+    *slower* than the 2-pass + radix path at every measured context length
+    (8K/32K/128K). Prefer ``lrosa_use_radix_topk`` over streaming."""
+
+    lrosa_use_radix_topk: bool = True
+    """Use DSA's CTA-persistent radix top-K (csrc/topk.cu,
+    ``torch.ops._C.top_k_per_row_decode``) for the 2-pass selection instead
+    of ``torch.topk`` (full sort). O(seq) vs O(seq log seq); measured 2-3x
+    faster top-K and 100%% identical selection set. Falls back to torch.topk
+    automatically if the binding is absent. Only applies when
+    ``lrosa_use_streaming_topk`` is False."""
 
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
