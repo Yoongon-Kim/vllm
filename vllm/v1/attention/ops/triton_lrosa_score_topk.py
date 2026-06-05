@@ -305,6 +305,25 @@ def _radix_topk_available() -> bool:
     return hasattr(torch.ops._C, "top_k_per_row_decode")
 
 
+# Shape-keyed persistent scratch for the radix path. Fresh torch.empty /
+# .contiguous() / arange / where ALLOCATIONS inside the CUDA-graph-captured
+# decode path corrupt at bsz>1 (each captured batch size allocates from the
+# graph memory pool; addresses get reused/overlap → illegal memory access,
+# observed only at bsz>=2 long-context where the graph is replayed). Reusing a
+# per-shape persistent buffer gives a stable address that stays valid across
+# capture+replay. Keyed by shape so distinct capture batch sizes never alias.
+_RADIX_SCRATCH: dict = {}
+
+
+def _radix_scratch(name, shape, dtype, device):
+    key = (name, tuple(shape), dtype, device)
+    t = _RADIX_SCRATCH.get(key)
+    if t is None:
+        t = torch.empty(shape, dtype=dtype, device=device)
+        _RADIX_SCRATCH[key] = t
+    return t
+
+
 def _radix_topk(
     scores: torch.Tensor,       # (num_reqs, H_kv, max_kv_len) fp32
     seq_lens: torch.Tensor,     # (num_reqs,) int32 — valid kv_len per request
@@ -317,22 +336,23 @@ def _radix_topk(
     seq_lens per kv-head, runs the radix kernel, reshapes back. Returns
     int32 indices (num_reqs, H_kv, k). Indices are NOT guaranteed sorted
     by score (radix select) — fine for gather since order is irrelevant.
+
+    All scratch comes from the per-shape persistent cache (no allocation in
+    the captured decode path) so it is CUDA-graph safe at any batch size.
     """
     num_reqs, H_kv, max_kv = scores.shape
     rows = num_reqs * H_kv
-    logits2d = scores.reshape(rows, max_kv).contiguous()    # kernel needs row-major
+    dev = scores.device
+    # Row-major logits copy into a persistent buffer (scores may be a strided
+    # slice of the static scores_buf; copy_ handles the strides).
+    logits2d = _radix_scratch("logits", (rows, max_kv), torch.float32, dev)
+    logits2d.view(num_reqs, H_kv, max_kv).copy_(scores)
     # seq_lens per row: each request's length repeated for its H_kv heads.
-    seq_lens_rows = (
-        seq_lens.to(torch.int32).view(num_reqs, 1)
-        .expand(num_reqs, H_kv).reshape(rows).contiguous()
+    seq_lens_rows = _radix_scratch("seqrows", (rows,), torch.int32, dev)
+    seq_lens_rows.view(num_reqs, H_kv).copy_(
+        seq_lens.to(torch.int32).view(num_reqs, 1).expand(num_reqs, H_kv)
     )
-    # The radix kernel writes a dense (rows, k) int32 output. Always use a
-    # fresh contiguous buffer here — writing through a non-contiguous view
-    # of a caller buffer (e.g. a [:num_decodes] slice whose last dim is
-    # n_fac != k) silently lands in a temporary copy and never reaches the
-    # caller's buffer, producing stale indices downstream. We copy into
-    # idx_out (if given) after reshaping back to (num_reqs, H_kv, k).
-    topk_idx = torch.empty(rows, k, dtype=torch.int32, device=scores.device)
+    topk_idx = _radix_scratch("topk", (rows, k), torch.int32, dev)
     next_n = 1  # LRoSA decode: one query token per step (no spec-decode)
     torch.ops._C.top_k_per_row_decode(
         logits2d,
@@ -366,15 +386,22 @@ def _radix_topk(
     # over all real tokens — no garbage rows. All tensor ops, no host sync, so
     # CUDA-Graph safe (the previous seq_lens.min() Python gate broke capture
     # with cudaErrorStreamCaptureInvalidated).
-    slot_off = torch.arange(k, device=scores.device, dtype=torch.int32)  # [k]
-    sl = seq_lens_rows.view(rows, 1).clamp(min=1)  # avoid modulo-by-zero
-    fill = slot_off.view(1, k) % sl  # [rows, k], in [0, seq_len) — real tokens
-    topk_idx = torch.where(topk_idx < 0, fill, topk_idx)
-    topk_idx = topk_idx.view(num_reqs, H_kv, k)
+    # All persistent-scratch + out= ops (no allocation → CUDA-graph safe).
+    slot_off = _radix_scratch("slotoff", (k,), torch.int32, dev)
+    torch.arange(k, out=slot_off)
+    sl = _radix_scratch("sl", (rows, 1), torch.int32, dev)  # avoid modulo-by-zero
+    torch.clamp(seq_lens_rows.view(rows, 1), min=1, out=sl)
+    fill = _radix_scratch("fill", (rows, k), torch.int32, dev)
+    torch.remainder(slot_off.view(1, k).expand(rows, k), sl, out=fill)  # [rows,k]
+    neg = _radix_scratch("neg", (rows, k), torch.bool, dev)
+    torch.lt(topk_idx, 0, out=neg)
+    res = _radix_scratch("res", (rows, k), torch.int32, dev)
+    torch.where(neg, fill, topk_idx, out=res)
+    out3d = res.view(num_reqs, H_kv, k)
     if idx_out is not None:
-        idx_out[:num_reqs, :, :k].copy_(topk_idx)
+        idx_out[:num_reqs, :, :k].copy_(out3d)
         return idx_out[:num_reqs, :, :k]
-    return topk_idx
+    return out3d
 
 
 def lrosa_score_topk(
