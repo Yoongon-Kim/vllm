@@ -569,7 +569,17 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
-        if self.sliding_window is not None:
+        # LRoSA / Quest use a combined-slot cache (same per-slot bytes for every
+        # layer). For hybrid-attention models (Ministral, Gemma 4) the sliding
+        # layers must use that SAME combined-slot spec — otherwise their page
+        # size differs from the full layers and kv-cache unification fails. So
+        # route lrosa/quest sliding layers to the combined-slot branch below;
+        # the sliding window is applied at decode time in the backend, not via
+        # a shrunken cache.
+        if self.sliding_window is not None and self.kv_cache_dtype not in (
+            "lrosa",
+            "quest",
+        ):
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )

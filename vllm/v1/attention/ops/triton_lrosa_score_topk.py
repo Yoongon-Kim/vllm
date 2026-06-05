@@ -42,6 +42,7 @@ def _lrosa_score_kernel(
     bt_stride_r,
     scores_stride_r,
     scores_stride_h,
+    window,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -51,7 +52,11 @@ def _lrosa_score_kernel(
 
     t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     seq_len = tl.load(seq_lens_ptr + pid_r)
-    in_seq = t_offs < seq_len
+    # Sliding-window restriction: only positions in [seq_len - window, seq_len)
+    # are eligible (older ones masked to -inf so they're never selected). The
+    # caller passes a window >= max context for full-attention layers, making
+    # ``seq_len - window`` <= 0 so the lower bound is a no-op.
+    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window)
     in_range = t_offs < max_kv_len
 
     c_offs = tl.arange(0, BLOCK_C)
@@ -198,6 +203,7 @@ def _launch_score_kernel(
     head_size: int,
     cs_h: int,
     block_t: int,
+    window: int = 0,
 ) -> None:
     num_reqs, H_kv, _ = proj_q.shape
     block_size = kv_cache.shape[1]
@@ -206,6 +212,9 @@ def _launch_score_kernel(
     BLOCK_C = triton.next_power_of_2(cs_h)
     BLOCK_T = block_t
     grid = (num_reqs, H_kv, triton.cdiv(max_kv_len, BLOCK_T))
+    # window<=0 means full attention: a sentinel > any seq_len makes the
+    # ``t_offs >= seq_len - window`` lower bound always true (no restriction).
+    win_eff = window if window > 0 else (max_kv_len + 1)
 
     _lrosa_score_kernel[grid](
         proj_q,
@@ -225,6 +234,7 @@ def _launch_score_kernel(
         block_table.stride(0),
         scores.stride(0),
         scores.stride(1),
+        win_eff,
         BLOCK_T=BLOCK_T,
         BLOCK_C=BLOCK_C,
     )
@@ -239,6 +249,7 @@ def lrosa_score(
     cs_h: int,
     block_t: int = 64,
     scores_out: torch.Tensor | None = None,
+    window: int = 0,
 ) -> torch.Tensor:
     """Compute scores for every cached KV position.
 
@@ -273,6 +284,7 @@ def lrosa_score(
         head_size,
         cs_h,
         block_t,
+        window=window,
     )
     return scores
 
@@ -334,21 +346,29 @@ def _radix_topk(
     )
     # When seq_len < k the radix kernel pads unfilled slots with -1. A -1 is
     # an OOB access downstream (score gather + block-table gather). DSA's MLA
-    # sparse kernel treats -1 as a skip marker, but our flash_attn has no
-    # skip semantics, so we must hand it valid indices. Replace each -1 with
-    # a DISTINCT in-range index >= seq_len (so it never duplicates a real
-    # selected token and never aliases a valid position): fill = seq_len +
-    # slot_offset, clamped to max_kv-1. These padding positions have ~-inf
-    # score so they contribute ~0 to the softmax; being distinct avoids the
-    # duplicate-token blow-up that a constant clamp (e.g. ->0) would cause.
+    # sparse kernel treats -1 as a skip marker, but our flash_attn has no skip
+    # semantics, so we must hand it valid indices.
     #
-    # All tensor ops — no host sync — so this is CUDA-Graph safe (the
-    # previous seq_lens.min() Python gate broke graph capture with
-    # cudaErrorStreamCaptureInvalidated).
+    # The earlier scheme filled with ``seq_len + offset`` (distinct, in-range)
+    # on the assumption those positions score ~-inf and contribute ~0 to the
+    # softmax. That holds for the *selection* score but NOT for the gathered
+    # attention: flash_attn recomputes q·K on the gathered K/V, and seq_len +
+    # offset points past seq_len into UNWRITTEN cache slots — whatever stale
+    # bytes live there become real (non-masked) attention logits, corrupting
+    # the decode output whenever the slot isn't zero (observed as degenerate
+    # short-prompt decode on Ministral; Llama/Qwen3 only survived because their
+    # unwritten slots happened to be zero).
+    #
+    # Instead cycle the padding through the REAL written tokens [0, seq_len):
+    # every cached token is duplicated ~uniformly, and equal multiplicity
+    # cancels in the softmax normalizer (exact when k % seq_len == 0, near-exact
+    # otherwise), so kv_len < n_fac decode reduces to honest dense attention
+    # over all real tokens — no garbage rows. All tensor ops, no host sync, so
+    # CUDA-Graph safe (the previous seq_lens.min() Python gate broke capture
+    # with cudaErrorStreamCaptureInvalidated).
     slot_off = torch.arange(k, device=scores.device, dtype=torch.int32)  # [k]
-    fill = (seq_lens_rows.view(rows, 1) + slot_off.view(1, k)).clamp_(
-        max=max_kv - 1
-    )  # [rows, k], >= seq_len, in-range
+    sl = seq_lens_rows.view(rows, 1).clamp(min=1)  # avoid modulo-by-zero
+    fill = slot_off.view(1, k) % sl  # [rows, k], in [0, seq_len) — real tokens
     topk_idx = torch.where(topk_idx < 0, fill, topk_idx)
     topk_idx = topk_idx.view(num_reqs, H_kv, k)
     if idx_out is not None:
@@ -369,8 +389,10 @@ def lrosa_score_topk(
     top_idx_out: torch.Tensor | None = None,
     top_scores_out: torch.Tensor | None = None,
     use_radix: bool = False,
+    window: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score → top-K.
+    """Score → top-K. ``window`` > 0 restricts selection to the last
+    ``window`` positions (sliding-window layers); 0 = full attention.
 
     Returns ``(top_idx, top_scores)`` each shaped ``(num_reqs, H_kv, k)``
     where ``k = min(n_fac, max_kv_len)``. ``top_idx`` is int64 when written
@@ -386,6 +408,7 @@ def lrosa_score_topk(
         head_size,
         cs_h,
         scores_out=scores_out,
+        window=window,
     )
     k = min(n_fac, scores.shape[-1])
 

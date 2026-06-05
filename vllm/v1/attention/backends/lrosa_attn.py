@@ -723,6 +723,16 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         block_table_dec = attn_metadata.block_table[:num_decodes]
         seq_lens_dec = attn_metadata.seq_lens[:num_decodes]
 
+        # Sliding-window layers (hybrid models, e.g. Ministral): restrict the
+        # LRoSA candidate set to the last ``window`` tokens before top-K, so a
+        # decode at a position past the window matches the model's trained
+        # sliding attention. self.sliding_window is (window-1, 0) for sliding
+        # layers and (-1, -1) for full attention. window=0 → no restriction.
+        # When window <= n_fac the masked region has <= n_fac valid tokens, so
+        # the top-K selects them all → exact dense-windowed attention.
+        win_left = self.sliding_window[0]
+        window = (win_left + 1) if win_left >= 0 else 0
+
         if self.per_layer_concat:
             # Per-layer CONCAT: one projection over concatenated per-head Q,
             # one score row per request, one shared top-K broadcast to all
@@ -798,6 +808,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 top_idx_out=attn_metadata.top_idx_buf,
                 top_scores_out=attn_metadata.top_scores_buf,
                 use_radix=True,
+                window=window,
             )  # (num_decodes, H_kv, n_fac_eff) int32
         else:
             top_idx, _ = lrosa_score_topk(
@@ -811,6 +822,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 scores_out=attn_metadata.scores_buf,
                 top_idx_out=attn_metadata.top_idx_buf,
                 top_scores_out=attn_metadata.top_scores_buf,
+                window=window,
             )  # (num_decodes, H_kv, n_fac_eff) int64 when CG path; int32 fallback
 
         K_sel, V_sel = lrosa_gather(
