@@ -33,7 +33,7 @@ from vllm.v1.attention.ops.triton_lrosa_score_topk import (
 
 @triton.jit
 def _fasa_score_kernel(
-    q_sub_ptr,  # [num_reqs, H_kv, n_ch]  group-mean q gathered at I_dom channels
+    q_kv_ptr,  # [num_reqs, H_kv, head_size]  group-mean (per-kv-head) query
     kv_cache_ptr,  # [num_blocks, block_size, H_kv, slot_size]  ([K|V])
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens_ptr,  # [num_reqs]
@@ -42,8 +42,8 @@ def _fasa_score_kernel(
     max_kv_len,
     n_ch,
     block_size,
-    q_sub_stride_r,
-    q_sub_stride_h,
+    q_kv_stride_r,
+    q_kv_stride_h,
     cache_stride_block,
     cache_stride_pos,
     cache_stride_head,
@@ -69,10 +69,12 @@ def _fasa_score_kernel(
     c_offs = tl.arange(0, BLOCK_C)
     c_mask = c_offs < n_ch
 
-    # I_dom channel offsets for this kv-head, and the matching q_sub vector.
+    # I_dom channel offsets for this kv-head. Gather BOTH q and K at these
+    # scattered channels (reading q directly from the group-mean query avoids a
+    # separate pre-gather + int64 index buffer, which was CUDA-graph-unsafe).
     ch = tl.load(ch_ptr + pid_h * ch_stride_h + c_offs, mask=c_mask, other=0)
     qs = tl.load(
-        q_sub_ptr + pid_r * q_sub_stride_r + pid_h * q_sub_stride_h + c_offs,
+        q_kv_ptr + pid_r * q_kv_stride_r + pid_h * q_kv_stride_h + ch,
         mask=c_mask,
         other=0.0,
     ).to(tl.float32)
@@ -102,7 +104,7 @@ def _fasa_score_kernel(
 
 
 def fasa_score(
-    q_sub: torch.Tensor,  # (num_reqs, H_kv, n_ch)  fp32/bf16
+    q_kv: torch.Tensor,  # (num_reqs, H_kv, head_size)  group-mean query
     kv_cache: torch.Tensor,  # (num_blocks, block_size, H_kv, slot_size)
     block_table: torch.Tensor,  # (num_reqs, max_blocks) int32
     seq_lens: torch.Tensor,  # (num_reqs,) int32
@@ -113,14 +115,15 @@ def fasa_score(
 ) -> torch.Tensor:
     """Score every cached position via the I_dom channel-gathered dot.
     ``window`` > 0 restricts to the last ``window`` positions; 0 = full."""
-    num_reqs, H_kv, n_ch = q_sub.shape
+    num_reqs, H_kv, _ = q_kv.shape
+    n_ch = ch.shape[1]
     block_size = kv_cache.shape[1]
     max_blocks = block_table.shape[1]
     max_kv_len = max_blocks * block_size
 
     if scores_out is None:
         scores = torch.empty(
-            (num_reqs, H_kv, max_kv_len), dtype=torch.float32, device=q_sub.device
+            (num_reqs, H_kv, max_kv_len), dtype=torch.float32, device=q_kv.device
         )
     else:
         scores = scores_out[:num_reqs, :, :max_kv_len]
@@ -131,7 +134,7 @@ def fasa_score(
     win_eff = window if window > 0 else (max_kv_len + 1)
 
     _fasa_score_kernel[grid](
-        q_sub,
+        q_kv,
         kv_cache,
         block_table,
         seq_lens,
@@ -140,8 +143,8 @@ def fasa_score(
         max_kv_len,
         n_ch,
         block_size,
-        q_sub.stride(0),
-        q_sub.stride(1),
+        q_kv.stride(0),
+        q_kv.stride(1),
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
@@ -157,7 +160,7 @@ def fasa_score(
 
 
 def fasa_score_topk(
-    q_sub: torch.Tensor,  # (num_reqs, H_kv, n_ch)
+    q_kv: torch.Tensor,  # (num_reqs, H_kv, head_size)  group-mean query
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -172,7 +175,7 @@ def fasa_score_topk(
     """FASA-fc score -> top-K. Returns (top_idx, top_scores) shaped
     (num_reqs, H_kv, k), k = min(n_fac, max_kv_len). Mirrors lrosa_score_topk."""
     scores = fasa_score(
-        q_sub, kv_cache, block_table, seq_lens, ch,
+        q_kv, kv_cache, block_table, seq_lens, ch,
         scores_out=scores_out, window=window,
     )
     k = min(n_fac, scores.shape[-1])

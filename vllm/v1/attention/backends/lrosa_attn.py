@@ -912,22 +912,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             # group-mean query, then score by reading those same channels from
             # full K each step — no proj_K cache. ``M`` here is the int32
             # [H_kv, 2*n_tip] channel-offset tensor built in _ensure_on_device.
-            ch = M  # int32 [H_kv, 2*n_tip] channel offsets
-            n_ch = ch.shape[1]
-            # Gather the I_dom channels of q_kv into persistent scratch
-            # (allocation-free → CUDA-graph safe at bsz>1 / mixed batches).
-            idx64 = _decode_scratch(
-                "fasa_idx", (num_decodes, self.num_kv_heads, n_ch),
-                torch.int64, q_kv.device,
-            )
-            idx64.copy_(ch.unsqueeze(0).expand(num_decodes, -1, -1))  # i32->i64
-            q_sub = _decode_scratch(
-                "qsub", (num_decodes, self.num_kv_heads, n_ch),
-                q_kv.dtype, q_kv.device,
-            )
-            torch.gather(q_kv, 2, idx64, out=q_sub)  # (num_decodes, H_kv, 2*n_tip)
+            # The FASA score kernel gathers q (and K) directly at the I_dom
+            # channel offsets ``ch`` (= M, the [H_kv, 2*n_tip] int32 tensor), so
+            # no separate pre-gather / int64 index buffer is needed — that keeps
+            # the decode path allocation-free and CUDA-graph safe at bsz>1.
+            ch = M
             top_idx, _ = fasa_score_topk(
-                q_sub,
+                q_kv,
                 kv_cache,
                 block_table_dec,
                 seq_lens_dec,
