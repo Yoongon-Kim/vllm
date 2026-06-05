@@ -178,6 +178,61 @@ def lrosa_score(
     return scores
 
 
+def _radix_topk_available() -> bool:
+    """True iff the DSA radix top-K C++ binding is compiled into this build.
+
+    Borrowed from DeepSeek Sparse Attention (csrc/topk.cu): a CTA-persistent
+    radix-select that is O(seq) vs torch.topk's O(seq log seq) full sort.
+    MLA-independent — operates on a plain (rows, seq) fp32 logits tensor."""
+    if not hasattr(torch.ops._C, "top_k_per_row_decode"):
+        # The op may not be registered yet (lazy). Importing _custom_ops
+        # triggers the torch.library registrations from the compiled _C ext.
+        try:
+            import vllm._custom_ops  # noqa: F401
+        except Exception:
+            return False
+    return hasattr(torch.ops._C, "top_k_per_row_decode")
+
+
+def _radix_topk(
+    scores: torch.Tensor,       # (num_reqs, H_kv, max_kv_len) fp32
+    seq_lens: torch.Tensor,     # (num_reqs,) int32 — valid kv_len per request
+    k: int,
+    idx_out: torch.Tensor | None = None,  # (num_reqs, H_kv, k) int32
+) -> torch.Tensor:
+    """Radix top-K over the last dim via DSA's top_k_per_row_decode.
+
+    Flattens (num_reqs, H_kv, seq) → (num_reqs*H_kv, seq) rows, repeats
+    seq_lens per kv-head, runs the radix kernel, reshapes back. Returns
+    int32 indices (num_reqs, H_kv, k). Indices are NOT guaranteed sorted
+    by score (radix select) — fine for gather since order is irrelevant.
+    """
+    num_reqs, H_kv, max_kv = scores.shape
+    rows = num_reqs * H_kv
+    logits2d = scores.reshape(rows, max_kv)                 # view, contiguous
+    # seq_lens per row: each request's length repeated for its H_kv heads.
+    seq_lens_rows = (
+        seq_lens.to(torch.int32).view(num_reqs, 1)
+        .expand(num_reqs, H_kv).reshape(rows).contiguous()
+    )
+    if idx_out is not None:
+        topk_idx = idx_out.reshape(rows, -1)[:, :k]
+    else:
+        topk_idx = torch.empty(rows, k, dtype=torch.int32, device=scores.device)
+    next_n = 1  # LRoSA decode: one query token per step (no spec-decode)
+    torch.ops._C.top_k_per_row_decode(
+        logits2d,
+        next_n,
+        seq_lens_rows,
+        topk_idx,
+        rows,
+        logits2d.stride(0),
+        logits2d.stride(1),
+        k,
+    )
+    return topk_idx.view(num_reqs, H_kv, k)
+
+
 def lrosa_score_topk(
     proj_q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -189,6 +244,7 @@ def lrosa_score_topk(
     scores_out: torch.Tensor | None = None,
     top_idx_out: torch.Tensor | None = None,
     top_scores_out: torch.Tensor | None = None,
+    use_radix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score → top-K.
 
@@ -209,11 +265,15 @@ def lrosa_score_topk(
     )
     k = min(n_fac, scores.shape[-1])
 
+    # Radix top-K path (borrowed from DSA csrc/topk.cu). O(seq) vs
+    # torch.topk O(seq log seq). Only used when explicitly requested AND
+    # the binding is compiled in; otherwise transparently falls back to
+    # torch.topk. Radix returns int32 indices, unsorted by score — the
+    # downstream gather only needs the index set, not the order.
+    use_radix_eff = use_radix and _radix_topk_available()
+
     if top_idx_out is not None and top_scores_out is not None:
         num_reqs, H_kv, _ = scores.shape
-        assert top_idx_out.dtype == torch.int64, (
-            "top_idx_out must be int64 (torch.topk constraint)"
-        )
         assert top_scores_out.dtype == torch.float32
         assert (
             top_idx_out.shape[0] >= num_reqs
@@ -223,10 +283,24 @@ def lrosa_score_topk(
             f"top_idx_out shape {tuple(top_idx_out.shape)} too small for "
             f"({num_reqs}, {H_kv}, {k})"
         )
+        if use_radix_eff and top_idx_out.dtype == torch.int32:
+            idx_view = _radix_topk(scores, seq_lens, k, idx_out=top_idx_out)
+            # Gather the corresponding scores for callers that consume them.
+            score_view = top_scores_out[:num_reqs, :, :k]
+            torch.gather(scores, -1, idx_view.to(torch.int64), out=score_view)
+            return idx_view, score_view
+        assert top_idx_out.dtype == torch.int64, (
+            "top_idx_out must be int64 (torch.topk constraint)"
+        )
         idx_view = top_idx_out[:num_reqs, :, :k]
         score_view = top_scores_out[:num_reqs, :, :k]
         torch.topk(scores, k=k, dim=-1, out=(score_view, idx_view))
         return idx_view, score_view
+
+    if use_radix_eff:
+        top_idx = _radix_topk(scores, seq_lens, k)              # int32
+        top_scores = torch.gather(scores, -1, top_idx.to(torch.int64))
+        return top_idx, top_scores
 
     top_scores, top_idx = torch.topk(scores, k=k, dim=-1)
     return top_idx.to(torch.int32), top_scores
