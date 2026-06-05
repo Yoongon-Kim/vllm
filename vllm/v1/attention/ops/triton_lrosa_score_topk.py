@@ -150,28 +150,42 @@ def lrosa_score_layer(
     cs_h_slot: int,
     H_kv: int,
     scores_out: torch.Tensor | None = None,
+    partial_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-layer CONCAT score: single score row per request (head-shared)."""
+    """Per-layer CONCAT score → single score row per request (head-shared).
+
+    Reuses the per-kv-head score kernel for H_kv-parallel throughput: the
+    per-layer query projection splits the same way proj_K was scattered at
+    store time, so reshaping proj_q_layer to (num_reqs, H_kv, cs_h_slot)
+    makes it a drop-in for the per-head kernel. That produces a per-head
+    partial[r, h, t] = proj_q[r,h] · proj_K_slot[r,h,t]; summing over h
+    recovers the full per-layer score Σ_c proj_q_layer·proj_K_layer.
+
+    The dedicated _lrosa_score_layer_kernel (single program loops over
+    H_kv) is left in place as a reference but no longer the default — it
+    launched H_kv× fewer programs and was ~2.4% slower at 32K.
+    """
     num_reqs = proj_q_layer.shape[0]
     max_blocks = block_table.shape[1]
     max_kv_len = max_blocks * kv_cache.shape[1]
-    if scores_out is not None:
-        scores = scores_out[:num_reqs]
-        assert scores.shape[-1] >= max_kv_len
+    # (num_reqs, H_kv, cs_h_slot) view — head h owns the c-slice of proj_q.
+    proj_q_heads = proj_q_layer.view(num_reqs, H_kv, cs_h_slot).contiguous()
+    if partial_out is not None:
+        partial = partial_out[:num_reqs]
     else:
-        scores = torch.empty(num_reqs, max_kv_len, dtype=torch.float32,
-                             device=proj_q_layer.device)
-    BLOCK_T = 128
-    BLOCK_C = triton.next_power_of_2(cs_h_slot)
-    grid = (num_reqs, triton.cdiv(max_kv_len, BLOCK_T))
-    _lrosa_score_layer_kernel[grid](
-        proj_q_layer, kv_cache, block_table, seq_lens, scores,
-        max_kv_len, head_size, cs_h_slot, kv_cache.shape[1],
-        proj_q_layer.stride(0),
-        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
-        block_table.stride(0), scores.stride(0),
-        H_KV=H_kv, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C,
+        partial = torch.empty(num_reqs, H_kv, max_kv_len, dtype=torch.float32,
+                              device=proj_q_layer.device)
+    # Per-head partial scores via the existing H_kv-parallel kernel.
+    _launch_score_kernel(
+        proj_q_heads, kv_cache, block_table, seq_lens, partial,
+        head_size, cs_h_slot, block_t=128,
     )
+    # Sum over heads → per-layer score. Out-of-seq positions are -inf in
+    # every head, so their sum stays -inf (no +inf, so no NaN).
+    scores = partial.sum(dim=1)  # (num_reqs, max_kv_len)
+    if scores_out is not None:
+        scores_out[:num_reqs].copy_(scores)
+        return scores_out[:num_reqs]
     return scores
 
 
