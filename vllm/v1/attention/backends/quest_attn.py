@@ -64,6 +64,9 @@ from vllm.v1.attention.ops.triton_lrosa_score_topk import (
     _radix_topk_available,
 )
 from vllm.v1.attention.ops.triton_lrosa_store import lrosa_store
+# vLLM Triton flash for head_dim>256 (Gemma 4 full layers) prefill — FA2 caps
+# at 256; unified_attention is head-dim agnostic and O(L) memory.
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.triton_quest import (
     quest_blocksparse_attn,
     quest_build_page_minmax_prefill,
@@ -134,7 +137,18 @@ class QuestAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [64, 128]
+        # 256/512: Gemma 4 (sliding head_dim=256 + full head_dim=512). The
+        # head>256 prefill routes through vLLM's unified_attention (FA2 caps at
+        # 256); decode uses the page path (head-dim agnostic kernels).
+        return [64, 128, 256, 512]
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # Gemma 4 is multimodal; its full-attention layers are flagged with
+        # use_mm_prefix. Quest targets TEXT decoding (the mm-prefix path reduces
+        # to ordinary full attention there), so accept it. (Sparse page
+        # selection over actual image tokens is out of scope.)
+        return True
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -422,36 +436,41 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
                 key, kv_cache, attn_metadata, head_size, page_size,
                 num_decodes, num_decode_tokens)
 
-            # Dense flash over the prefill rows.
+            # Dense flash over the prefill rows. head_dim>256 (Gemma 4 full
+            # layers) can't use FA2 → vLLM's head-agnostic Triton flash.
             if num_decodes == 0:
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens], k=key_cache, v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=attn_metadata.query_start_loc,
-                    max_seqlen_q=attn_metadata.max_query_len,
-                    seqused_k=attn_metadata.seq_lens,
-                    max_seqlen_k=attn_metadata.max_seq_len,
-                    softmax_scale=self.scale, causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=list(self.sliding_window),
-                    block_table=attn_metadata.block_table,
+                q_pf = query[:num_actual_tokens]
+                out_pf = output[:num_actual_tokens]
+                qsl_pf = attn_metadata.query_start_loc
+                seqk_pf = attn_metadata.seq_lens
+                bt_pf = attn_metadata.block_table
+            else:
+                q_pf = query[num_decode_tokens:num_actual_tokens]
+                out_pf = output[num_decode_tokens:num_actual_tokens]
+                qsl_pf = (attn_metadata.query_start_loc[num_decodes:]
+                          - num_decode_tokens)
+                seqk_pf = attn_metadata.seq_lens[num_decodes:]
+                bt_pf = attn_metadata.block_table[num_decodes:]
+            if head_size > 256:
+                unified_attention(
+                    q=q_pf, k=key_cache, v=value_cache, out=out_pf,
+                    cu_seqlens_q=qsl_pf, max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=seqk_pf, max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True,
+                    window_size=self.sliding_window, block_table=bt_pf,
                     softcap=self.logits_soft_cap,
+                    q_descale=None, k_descale=None, v_descale=None,
+                    alibi_slopes=self.alibi_slopes,
                 )
             else:
-                prefill_qsl = (attn_metadata.query_start_loc[num_decodes:]
-                               - num_decode_tokens)
                 flash_attn_varlen_func(
-                    q=query[num_decode_tokens:num_actual_tokens],
-                    k=key_cache, v=value_cache,
-                    out=output[num_decode_tokens:num_actual_tokens],
-                    cu_seqlens_q=prefill_qsl,
-                    max_seqlen_q=attn_metadata.max_query_len,
-                    seqused_k=attn_metadata.seq_lens[num_decodes:],
-                    max_seqlen_k=attn_metadata.max_seq_len,
+                    q=q_pf, k=key_cache, v=value_cache, out=out_pf,
+                    cu_seqlens_q=qsl_pf, max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=seqk_pf, max_seqlen_k=attn_metadata.max_seq_len,
                     softmax_scale=self.scale, causal=attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=list(self.sliding_window),
-                    block_table=attn_metadata.block_table[num_decodes:],
+                    block_table=bt_pf,
                     softcap=self.logits_soft_cap,
                 )
             return output
