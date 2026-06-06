@@ -61,6 +61,12 @@ def build_llm(a):
         enforce_eager=a.eager,
         enable_prefix_caching=False,
     )
+    # LRoSA/FASA decode scratch (score + radix) is sized by max_num_seqs *
+    # max_kv. The vLLM default max_num_seqs=1024 makes that explode at 127500
+    # ctx (both in CUDA-graph capture and at inference) even though only ~5
+    # seqs fit. Cap it so graphs capture and decode fits. F1 is unaffected.
+    if a.max_num_seqs:
+        kw["max_num_seqs"] = a.max_num_seqs
     ov = yarn_overrides(a.model)
     if ov:
         kw["hf_overrides"] = ov
@@ -143,6 +149,9 @@ def main():
     ap.add_argument("--contig_projk", action="store_true")
     ap.add_argument("--fp8_projk", action="store_true")
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--max_num_seqs", type=int, default=0,
+                    help="cap concurrent seqs (0=vllm default 1024). Bounds the "
+                         "LRoSA/FASA max_kv-sized decode scratch at long context.")
     ap.add_argument("--gpu_mem", type=float, default=0.90)
     ap.add_argument("--output", default=None, help="optional results .json path")
     a = ap.parse_args()
