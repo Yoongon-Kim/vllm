@@ -206,6 +206,7 @@ def main():
     # per-problem: list of bool over runs (for pass@k + avg accuracy).
     n = len(rows)
     solved_count = [0] * n   # per-problem: # of the num_runs attempts that were correct
+    gen_lens = [[] for _ in range(n)]  # per-problem: generation token-lengths over runs
     run_accs = []
     recs = []
     for run_id in range(a.num_runs):
@@ -219,11 +220,15 @@ def main():
         correct = 0
         for idx, (o, gold) in enumerate(zip(outs, golds)):
             resp = o.outputs[0].text
+            glen = len(o.outputs[0].token_ids)
             ok = grade(a.eval, resp, gold)
             correct += int(ok)
             solved_count[idx] += int(ok)
+            gen_lens[idx].append(glen)
+            # per-SAMPLE record: one row per (problem, attempt).
             recs.append({"run": run_id, "idx": idx, "gold": gold,
-                         "pred_len": len(o.outputs[0].token_ids), "correct": ok})
+                         "gen_len": glen, "correct": ok,
+                         "truncated": glen >= a.max_new_tokens})
         acc = correct / n
         run_accs.append(acc)
         print(f"[REASON] {a.eval} {a.mode} run{run_id} acc={acc:.4f} ({correct}/{n})",
@@ -236,11 +241,27 @@ def main():
     total_attempts = n * a.num_runs
     pass_at_1 = sum(solved_count) / total_attempts
     pass_at_k = sum(1 for c in solved_count if c > 0) / n
+    # Generation-length stats: per-sample lengths live in predictions.jsonl;
+    # here we aggregate per-problem (mean over runs) + overall.
+    all_lens = [l for sub in gen_lens for l in sub]
+    mean_gen_len = sum(all_lens) / len(all_lens) if all_lens else 0.0
+    max_gen_len = max(all_lens) if all_lens else 0
+    frac_truncated = (sum(1 for l in all_lens if l >= a.max_new_tokens)
+                      / len(all_lens) if all_lens else 0.0)
+    per_problem = [
+        {"idx": i, "solved_count": solved_count[i], "n_runs": len(gen_lens[i]),
+         "pass_at_1": (solved_count[i] / len(gen_lens[i]) if gen_lens[i] else 0.0),
+         "gen_lens": gen_lens[i],
+         "mean_gen_len": (sum(gen_lens[i]) / len(gen_lens[i]) if gen_lens[i] else 0.0)}
+        for i in range(n)
+    ]
     print(f"\n=== {a.eval} mode={a.mode} model={a.model} cs_h={a.cs_h} n_fac={a.n_fac} "
           f"runs={a.num_runs} fp8={bool(a.fp8_projk)} ===")
     print(f"  pass@1 = {pass_at_1:.4f}  (avg over {a.num_runs} attempts/problem, n={n})")
     print(f"  pass@{a.num_runs} = {pass_at_k:.4f}  (solved by >=1 attempt)")
     print(f"  per-run acc: {['%.3f' % x for x in run_accs]}")
+    print(f"  gen_len: mean={mean_gen_len:.0f} max={max_gen_len} "
+          f"truncated@{a.max_new_tokens}={frac_truncated:.3f}")
 
     if run_dir:
         with open(os.path.join(run_dir, "predictions.jsonl"), "w") as f:
@@ -256,6 +277,8 @@ def main():
             "run_accuracies": run_accs, "pass_at_1": pass_at_1,
             "pass_at_k": pass_at_k, "avg_accuracy": pass_at_1,
             "solved_count": solved_count,
+            "mean_gen_len": mean_gen_len, "max_gen_len": max_gen_len,
+            "frac_truncated": frac_truncated, "per_problem": per_problem,
         }
         with open(os.path.join(run_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
