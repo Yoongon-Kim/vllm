@@ -31,10 +31,12 @@ CS_H=${CS_H:-32}            # 64 for Gemma 4 (head_dim=512 full layers)
 NFAC=${NFAC:-256}           # LongBench budget (paper default)
 NSAMP=${NSAMP:-200}         # samples per task (0 = all)
 MAXLEN=${MAXLEN:-127500}    # paper-faithful truncation cap
-GPUMEM=${GPUMEM:-0.9}
+GPUMEM=${GPUMEM:-0.80}      # 0.9 OOMs lrosa/fasa: the radix top-k scratch
+                            # (rows x max_kv f32, ~1.3GB at 127500) needs headroom
+                            # beyond vLLM's KV pool. 0.80 leaves ~36GB free.
 TASKS=${TASKS:-all}         # or e.g. qasper,hotpotqa,gov_report
-read -r -a GPUS <<< "${GPUS:-0 1 2 3}"   # one GPU per backend
-MODES=(fkv lrosa fasa quest)
+read -r -a GPUS <<< "${GPUS:-0 1 2 3}"        # one GPU per backend
+read -r -a MODES <<< "${MODES:-fkv lrosa fasa quest}"   # override to re-run a subset
 
 # Fail fast if the interpreter is missing eval deps (don't launch 4 engines to crash).
 if ! "$PY" -c "import vllm, fuzzywuzzy, rouge, transformers" 2>/tmp/_lbt_dep.$$.err; then
@@ -79,7 +81,7 @@ done
 wait
 echo "=== all backends done $(date +%H:%M:%S) ==="
 
-"$PY" - "$OUT" <<'PYEOF'
+"$PY" - "$OUT" <<'PYEOF' | tee "$OUT/table.txt"
 import glob, json, math, sys
 d = sys.argv[1]
 res = {}
