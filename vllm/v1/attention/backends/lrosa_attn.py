@@ -131,6 +131,18 @@ def _resolve_slot_cs_h(head_size: int) -> int:
     return _resolve_proj_cs_h(head_size)
 
 
+def _align_slot_elems(slot_elems: int) -> int:
+    """Pad the combined slot to a 16-byte boundary (8 elems for fp16/bf16).
+
+    flash_attn_varlen_func reads K/V from the combined slot with row-stride =
+    slot_size and requires each row to be 16-byte aligned. cs_h=4 gives
+    2*head_size + 4 = 260 elems (520 B, not 16-B aligned) -> CUDA "misaligned
+    address" in varlen_fwd. cs_h in {8,16,32} already land on 16-B boundaries;
+    padding the trailing (unused) bytes fixes cs_h=4 without moving the
+    K / V / proj_K offsets (proj_K still starts at 2*head_size)."""
+    return ((slot_elems + 7) // 8) * 8
+
+
 class LRoSAAttentionBackend(AttentionBackend):
     """LRoSA backend.
 
@@ -184,7 +196,7 @@ class LRoSAAttentionBackend(AttentionBackend):
         # Honor fasa (cs_h=0, [K|V] slot) and the lrosa_cs_h override (e.g.
         # Gemma 4 cs_h=64) so the allocated slot matches get_kv_cache_spec and
         # the Impl. Default = head_size//4.
-        slot_size = 2 * head_size + _resolve_slot_cs_h(head_size)
+        slot_size = _align_slot_elems(2 * head_size + _resolve_slot_cs_h(head_size))
         return (num_blocks, block_size, num_kv_heads, slot_size)
 
     @classmethod
@@ -587,7 +599,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # proj_K is stored. slot_cs_h is the proj_K width IN the slot — 0 when
         # contig (proj_K is in a separate cache) so the slot is just [K|V].
         self.cs_h = _resolve_proj_cs_h(head_size)
-        self.slot_size = 2 * head_size + _resolve_slot_cs_h(head_size)
+        self.slot_size = _align_slot_elems(2 * head_size + _resolve_slot_cs_h(head_size))
         self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         # Per-layer CONCAT: single basis over concatenated per-head K. cs_h
         # (the per-slot proj_K width) stays head_size//4, and cs_h_layer =

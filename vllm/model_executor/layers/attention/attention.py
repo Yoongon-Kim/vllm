@@ -618,7 +618,10 @@ class Attention(nn.Module, AttentionLayerBase):
             # helpers). proj_K region is 0-width in contiguous-proj_K mode (proj_K
             # lives in a separate cache) — must match the Impl's slot_size.
             from vllm.utils.torch_utils import get_dtype_size
-            from vllm.v1.attention.backends.lrosa_attn import _cs_h_for
+            from vllm.v1.attention.backends.lrosa_attn import (
+                _align_slot_elems,
+                _cs_h_for,
+            )
             from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
 
             _ac = vllm_config.attention_config
@@ -633,7 +636,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 and not getattr(_ac, "lrosa_per_layer_concat", False)
                 and not getattr(_ac, "lrosa_use_streaming_topk", False)
             )
-            slot_elems = 2 * self.head_size + (0 if _contig else _proj_cs_h)
+            slot_elems = _align_slot_elems(
+                2 * self.head_size + (0 if _contig else _proj_cs_h)
+            )
             dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
             return LRoSAFullAttentionSpec(
                 block_size=block_size,
