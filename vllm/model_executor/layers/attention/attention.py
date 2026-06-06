@@ -625,7 +625,10 @@ class Attention(nn.Module, AttentionLayerBase):
             _cs_override = getattr(_ac, "lrosa_cs_h", None)
             _proj_cs_h = _cs_override if _cs_override else _cs_h_for(self.head_size)
             _contig = (
-                getattr(_ac, "lrosa_contig_projk", False)
+                (
+                    getattr(_ac, "lrosa_contig_projk", False)
+                    or getattr(_ac, "lrosa_fp8_projk", False)
+                )
                 and not getattr(_ac, "lrosa_per_layer_concat", False)
                 and not getattr(_ac, "lrosa_use_streaming_topk", False)
             )

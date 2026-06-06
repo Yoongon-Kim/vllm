@@ -100,6 +100,16 @@ class AttentionConfig:
     streaming / per_layer_concat keep the interleaved slot. Numerically
     identical selection (Qasper F1 within radix-tie-break noise)."""
 
+    lrosa_fp8_projk: bool = False
+    """Store proj_K as FP8 (e4m3) in the contiguous proj_K cache (implies
+    lrosa_contig_projk). Halves the proj_K read bandwidth of the score scan and
+    halves the proj_K cache footprint. A per-(head,channel) scale (the row-norm
+    of the basis M) is folded into proj_q so the score dot recovers
+    proj_q·proj_K up to fp8 rounding — quantization affects only top-k SELECTION,
+    not the attention output (K/V stay bf16), so it is near-lossless (LRoSA's
+    proj_K quantizes far better than FASA's K_sel; see paper). Mirrors DSA's fp8
+    index logits. ~1.16x on the score kernel alone."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

@@ -37,7 +37,7 @@ MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               max_num_seqs=0, model=MODEL, basis=None, cs_h=32, n_tip=16,
-              use_radix=True, streaming=False, contig_projk=False):
+              use_radix=True, streaming=False, contig_projk=False, fp8_projk=False):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
     # serving concurrency (stresses the buffers; Quest's are tiny, LRoSA's
@@ -62,7 +62,8 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
                                   "lrosa_use_radix_topk": use_radix,
                                   "lrosa_use_streaming_topk": streaming,
-                                  "lrosa_contig_projk": contig_projk}
+                                  "lrosa_contig_projk": contig_projk,
+                                  "lrosa_fp8_projk": fp8_projk}
     elif backend == "fasa":
         idom = basis or fasa_idom_path(model)
         kw["kv_cache_dtype"] = "fasa"
@@ -108,6 +109,8 @@ def main():
     ap.add_argument("--contig_projk", action="store_true",
                     help="LRoSA: store proj_K in a separate contiguous cache for a "
                          "coalesced score scan (faster at long ctx).")
+    ap.add_argument("--fp8_projk", action="store_true",
+                    help="LRoSA: store proj_K as FP8 e4m3 (implies contig); halves score read.")
     ap.add_argument("--prefill_len", type=int, default=65536)
     ap.add_argument("--decode_len", type=int, default=128)
     ap.add_argument("--n_fac", type=int, default=256)
@@ -127,7 +130,7 @@ def main():
     llm = build_llm(a.backend, a.prefill_len, a.decode_len, a.n_fac, a.gpu_mem,
                     a.batch_size, a.max_num_seqs, model=a.model, basis=a.basis,
                     cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix,
-                    streaming=a.streaming, contig_projk=a.contig_projk)
+                    streaming=a.streaming, contig_projk=a.contig_projk, fp8_projk=a.fp8_projk)
 
     t_prefill = time_generate(llm, prompts, 1)
     t_full = time_generate(llm, prompts, 1 + a.decode_len)

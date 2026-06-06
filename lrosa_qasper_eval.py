@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--per_layer", action="store_true")
     ap.add_argument("--contig_projk", action="store_true",
                     help="LRoSA: separate contiguous proj_K cache (coalesced score scan).")
+    ap.add_argument("--fp8_projk", action="store_true",
+                    help="LRoSA: FP8 e4m3 proj_K cache (implies contig).")
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis .pt; default = pca bases/<tag>/pca_d1_cs<N>_kv_head.")
     ap.add_argument("--eager", action="store_true")
@@ -85,6 +87,8 @@ def main():
             ac["lrosa_per_layer_concat"] = True
         if a.contig_projk:
             ac["lrosa_contig_projk"] = True
+        if a.fp8_projk:
+            ac["lrosa_fp8_projk"] = True
         kw["attention_config"] = ac
     elif a.mode == "quest":
         kw["kv_cache_dtype"] = "quest"

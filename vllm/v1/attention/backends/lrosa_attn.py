@@ -47,6 +47,7 @@ from vllm.v1.attention.ops.triton_fasa_score_topk import fasa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
     lrosa_project_and_store_contig,
+    lrosa_project_and_store_contig_fp8,
     lrosa_project_and_store_layer,
     lrosa_store,
 )
@@ -92,7 +93,10 @@ def _contig_projk_effective() -> bool:
         return False
     ac = cfg.attention_config
     return (
-        getattr(ac, "lrosa_contig_projk", False)
+        (
+            getattr(ac, "lrosa_contig_projk", False)
+            or getattr(ac, "lrosa_fp8_projk", False)
+        )
         and not getattr(ac, "lrosa_per_layer_concat", False)
         and not getattr(ac, "lrosa_use_streaming_topk", False)
     )
@@ -592,13 +596,21 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # H_kv, cs_h] cache for a coalesced score scan (vs the strided read of
         # the interleaved [K|V|proj_K] slot). Only the per-kv-head radix/topk
         # path uses it; streaming / per_layer_concat keep the in-slot layout.
-        self.contig_projk = (
+        # FP8 proj_K (e4m3) implies the contiguous separate cache.
+        self.fp8_projk = (
+            getattr(attn_cfg, "lrosa_fp8_projk", False)
+            and not self.is_fasa
+            and not self.per_layer_concat
+            and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)
+        )
+        self.contig_projk = self.fp8_projk or (
             getattr(attn_cfg, "lrosa_contig_projk", False)
             and not self.is_fasa
             and not self.per_layer_concat
             and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)
         )
         self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
+        self._projk_scale: torch.Tensor | None = None  # [H_kv, cs_h] fp8 scale
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -712,6 +724,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # decode graph.
         torch._dynamo.mark_static_address(M)
         layer._lrosa_M = M
+        if self.fp8_projk and self._projk_scale is None:
+            # Per-(head,channel) fp8 scale = row-norm of M, so proj_K/scale =
+            # (M[h,c]·K)/‖M[h,c]‖ lands in fp8 e4m3's well-conditioned range.
+            # Folded into proj_q at decode → ranking-correct up to fp8 round.
+            scale = M.float().norm(dim=2).clamp_min(1e-6).to(dtype).contiguous()
+            torch._dynamo.mark_static_address(scale)
+            self._projk_scale = scale  # [H_kv, cs_h]
         return M
 
     def forward(
@@ -980,6 +999,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 M.transpose(1, 2),             # (H_kv, d, cs_h)
                 out=projq_hrc,
             )
+            if self.fp8_projk:
+                # Fold the per-(head,channel) fp8 scale into proj_q so the score
+                # dot recovers proj_q·proj_K from the scaled fp8 proj_K. In-place
+                # on the persistent scratch (allocation-free, CUDA-graph safe).
+                projq_hrc.mul_(self._projk_scale.unsqueeze(1))  # [H_kv,1,cs_h]
             proj_q = projq_hrc.transpose(0, 1)  # (nd, H_kv, cs_h) view
             if attn_metadata.use_streaming_topk:
                 # Step 4a: V2 chunk-parallel streaming kernel — no full
@@ -1144,9 +1168,10 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         captured decode graphs see a fixed address."""
         if self._projk_cache is None:
             num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+            pk_dtype = torch.float8_e4m3fn if self.fp8_projk else dtype
             self._projk_cache = torch.zeros(
                 num_blocks, block_size, self.num_kv_heads, self.cs_h,
-                dtype=dtype, device=device,
+                dtype=pk_dtype, device=device,
             )
             try:
                 torch._dynamo.mark_static_address(self._projk_cache)
@@ -1172,6 +1197,12 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             lrosa_store(key, value, kv_cache, slot_mapping)
         elif self.per_layer_concat:
             lrosa_project_and_store_layer(key, value, kv_cache, slot_mapping, M)
+        elif self.fp8_projk:
+            # K|V into the slot; proj_K = (M@K)/scale into the FP8 contig cache.
+            pk = self._ensure_projk_cache(kv_cache, key.dtype, key.device)
+            lrosa_project_and_store_contig_fp8(
+                key, value, kv_cache, pk, self._projk_scale, slot_mapping, M
+            )
         elif self.contig_projk:
             # K|V into the slot; proj_K into the separate contiguous cache.
             pk = self._ensure_projk_cache(kv_cache, key.dtype, key.device)
