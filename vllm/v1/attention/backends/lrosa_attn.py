@@ -838,6 +838,25 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 head_size=head_size,
             )
 
+            if head_size > 256:
+                # head_dim>256 (Gemma 4 full layers): FA2 can't do the trailing
+                # prefill rows either. Continuous batching produces these mixed
+                # batches (a long prefill scheduled alongside other requests'
+                # decode steps). Prefix caching is off so the prefill request's
+                # full K/V is the freshly-passed contiguous slice → reuse the
+                # manual chunked attention. (sliding layers head_dim=256 keep FA2.)
+                qsl_cpu = attn_metadata.query_start_loc_cpu
+                if qsl_cpu is None:
+                    qsl_cpu = attn_metadata.query_start_loc.cpu()
+                prefill_qsl_cpu = qsl_cpu[num_decodes:] - num_decode_tokens
+                self._manual_attn_varlen(
+                    query[num_decode_tokens:num_actual_tokens],
+                    key[num_decode_tokens:num_actual_tokens],
+                    value[num_decode_tokens:num_actual_tokens],
+                    output[num_decode_tokens:num_actual_tokens],
+                    prefill_qsl_cpu, head_size,
+                )
+                return output
             prefill_qsl = (
                 attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
             )
@@ -1115,6 +1134,45 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             softcap=self.logits_soft_cap,
         )
 
+    def _manual_attn_varlen(
+        self,
+        qf: torch.Tensor,   # (T, H_q, d) contiguous
+        kf: torch.Tensor,   # (T, H_kv, d) contiguous (fresh prefill K)
+        vf: torch.Tensor,   # (T, H_kv, d)
+        output: torch.Tensor,  # (T, H_q, d) write target
+        qsl_cpu: torch.Tensor,  # per-request start locs into [0, T], len R+1
+        head_size: int,
+    ) -> None:
+        """Per-request manual causal GQA attention over contiguous K/V — used for
+        head_dim>256 full layers (Gemma 4) where FA2 caps at 256. Query-chunked
+        (BQ rows) so peak memory is [Hkv,G,BQ,L] not the full [Hkv,G,L,L] (which
+        OOMs at long context). Reused by both the all-prefill and the mixed-batch
+        trailing-prefill paths."""
+        Hkv, G, d = self.num_kv_heads, self.num_kv_groups, head_size
+        BQ = 2048
+        for r in range(qsl_cpu.shape[0] - 1):
+            s = int(qsl_cpu[r])
+            e = int(qsl_cpu[r + 1])
+            L = e - s
+            if L <= 0:
+                continue
+            qr = qf[s:e].view(L, Hkv, G, d).permute(1, 2, 0, 3).to(torch.float32)
+            kr = kf[s:e].permute(1, 0, 2).to(torch.float32)
+            vr = vf[s:e].permute(1, 0, 2).to(torch.float32)
+            for qs in range(0, L, BQ):
+                qe = min(qs + BQ, L)
+                sc = torch.einsum(
+                    "hgld,hmd->hglm", qr[:, :, qs:qe, :], kr[:, :qe, :]
+                ) * self.scale
+                rows = torch.arange(qs, qe, device=qf.device)[:, None]
+                cols = torch.arange(qe, device=qf.device)[None, :]
+                sc = sc.masked_fill(cols > rows, float("-inf"))
+                aw = torch.softmax(sc, dim=-1)
+                ob = torch.einsum("hglm,hmd->hgld", aw, vr[:, :qe, :])
+                output[s + qs : s + qe] = (
+                    ob.permute(2, 0, 1, 3).reshape(qe - qs, Hkv * G, d).to(output.dtype)
+                )
+
     def _manual_prefill(
         self,
         query: torch.Tensor,
@@ -1124,40 +1182,16 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         attn_metadata: LRoSAMetadata,
         head_size: int,
     ) -> None:
-        """Per-request manual causal GQA attention for head_dim>256 full layers
-        (Gemma 4) at all-prefill. Head-dim agnostic — no FA2 256 cap, no Triton
-        shared-memory limit. Short reasoning prefills only (O(L^2) per request);
-        not CUDA-Graph captured (prefill is the Python branch). Operates on the
-        freshly-passed contiguous K/V (full sequence when chunked-prefill is off).
-        """
+        """All-prefill manual causal GQA attention for head_dim>256 (Gemma 4).
+        Delegates to _manual_attn_varlen over the freshly-passed contiguous K/V."""
         qsl_cpu = attn_metadata.query_start_loc_cpu
         if qsl_cpu is None:
             qsl_cpu = attn_metadata.query_start_loc.cpu()
         n_actual = attn_metadata.num_actual_tokens
-        Hkv, G, d = self.num_kv_heads, self.num_kv_groups, head_size
-        qf = query[:n_actual]
-        kf = key[:n_actual]
-        vf = value[:n_actual]
-        for r in range(qsl_cpu.shape[0] - 1):
-            s = int(qsl_cpu[r])
-            e = int(qsl_cpu[r + 1])
-            L = e - s
-            if L <= 0:
-                continue
-            # (Hkv, G, L, d) / (Hkv, L, d) — GQA-grouped, fp32 for stability.
-            qr = qf[s:e].view(L, Hkv, G, d).permute(1, 2, 0, 3).to(torch.float32)
-            kr = kf[s:e].permute(1, 0, 2).to(torch.float32)
-            vr = vf[s:e].permute(1, 0, 2).to(torch.float32)
-            scores = torch.einsum("hgld,hmd->hglm", qr, kr) * self.scale
-            causal = torch.triu(
-                torch.ones(L, L, device=qf.device, dtype=torch.bool), diagonal=1
-            )
-            scores = scores.masked_fill(causal, float("-inf"))
-            attn = torch.softmax(scores, dim=-1)
-            out = torch.einsum("hglm,hmd->hgld", attn, vr)  # (Hkv, G, L, d)
-            output[s:e] = (
-                out.permute(2, 0, 1, 3).reshape(L, Hkv * G, d).to(output.dtype)
-            )
+        self._manual_attn_varlen(
+            query[:n_actual], key[:n_actual], value[:n_actual],
+            output[:n_actual], qsl_cpu, head_size,
+        )
 
     def _ensure_projk_cache(
         self, kv_cache: torch.Tensor, dtype: torch.dtype, device: torch.device
