@@ -83,19 +83,44 @@ def _decode_scratch(name, shape, dtype, device):
     return t
 
 
-def _resolve_slot_cs_h(head_size: int) -> int:
-    """Width of the proj_K region in the combined slot for this run.
+def _contig_projk_effective() -> bool:
+    """True iff proj_K is stored in a SEPARATE contiguous cache (not in the
+    combined slot). Active only for the per-kv-head radix/topk decode path;
+    fasa / per_layer_concat / streaming keep proj_K in-slot."""
+    cfg = get_current_vllm_config()
+    if cfg.cache_config.cache_dtype == "fasa":
+        return False
+    ac = cfg.attention_config
+    return (
+        getattr(ac, "lrosa_contig_projk", False)
+        and not getattr(ac, "lrosa_per_layer_concat", False)
+        and not getattr(ac, "lrosa_use_streaming_topk", False)
+    )
 
-    - FASA-fc (``kv_cache_dtype == "fasa"``): 0 — the slot is just [K|V]; the
-      paper-faithful path re-reads the I_dom channels from full K each step,
-      so nothing extra is cached.
-    - LRoSA: the ``lrosa_cs_h`` override (e.g. Gemma 4 cs_h=64) or head_size//4.
-    """
+
+def _resolve_proj_cs_h(head_size: int) -> int:
+    """The proj_K projection dim (rank of M). 0 for FASA-fc (no projection);
+    else the ``lrosa_cs_h`` override (e.g. Gemma 4 cs_h=64) or head_size//4.
+    Independent of WHERE proj_K is stored (slot vs separate contig cache)."""
     cfg = get_current_vllm_config()
     if cfg.cache_config.cache_dtype == "fasa":
         return 0
     cs_override = getattr(cfg.attention_config, "lrosa_cs_h", None)
     return cs_override if cs_override else _cs_h_for(head_size)
+
+
+def _resolve_slot_cs_h(head_size: int) -> int:
+    """Width of the proj_K region IN the combined slot for this run.
+
+    0 when proj_K is not in the slot — FASA-fc ([K|V] only, re-reads I_dom from
+    full K) or contiguous-proj_K mode (proj_K lives in a separate cache). Else
+    the projection dim (``lrosa_cs_h`` override or head_size//4)."""
+    cfg = get_current_vllm_config()
+    if cfg.cache_config.cache_dtype == "fasa":
+        return 0
+    if _contig_projk_effective():
+        return 0  # proj_K stored in the separate contiguous cache
+    return _resolve_proj_cs_h(head_size)
 
 
 class LRoSAAttentionBackend(AttentionBackend):
@@ -550,10 +575,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # I_dom channels from full K each step (no proj_K). n_tip = #FC pairs.
         self.is_fasa = kv_cache_dtype == "fasa"
         self.n_tip = getattr(attn_cfg, "lrosa_n_tip", 16)
-        # cs_h: 0 for fasa ([K|V] only); else the lrosa_cs_h override (e.g.
-        # Gemma 4 cs_h=64) or head_size//4. Matches get_kv_cache_spec/_shape.
-        self.cs_h = _resolve_slot_cs_h(head_size)
-        self.slot_size = 2 * head_size + self.cs_h
+        # cs_h: the proj_K projection dim (0 for fasa). Independent of where
+        # proj_K is stored. slot_cs_h is the proj_K width IN the slot — 0 when
+        # contig (proj_K is in a separate cache) so the slot is just [K|V].
+        self.cs_h = _resolve_proj_cs_h(head_size)
+        self.slot_size = 2 * head_size + _resolve_slot_cs_h(head_size)
         self.use_radix_topk = getattr(attn_cfg, "lrosa_use_radix_topk", True)
         # Per-layer CONCAT: single basis over concatenated per-head K. cs_h
         # (the per-slot proj_K width) stays head_size//4, and cs_h_layer =

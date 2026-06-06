@@ -91,9 +91,14 @@ class AttentionConfig:
     """Store proj_K in a SEPARATE contiguous cache [num_blocks, block_size,
     H_kv, cs_h] instead of interleaved in the [K|V|proj_K] slot. The score
     kernel then scans proj_K coalesced (no strided cache-line waste), ~1.4x
-    faster at long context on high-bandwidth GPUs (B200). Only the default
-    per-kv-head radix path honors this; streaming / per_layer_concat fall back
-    to the interleaved slot. Numerically identical selection."""
+    faster at long context on high-bandwidth GPUs (B200). When on, the combined
+    slot shrinks to [K|V]; the separate proj_K cache is an extra (~cs_h/2*head ≈
+    11%) allocation NOT tracked by vLLM's memory profiler, so lower
+    ``gpu_memory_utilization`` by ~that fraction to avoid OOM (true memory
+    neutrality would need proj_K registered as a second KV cache group).
+    OFF by default for that reason. Only the per-kv-head radix path honors it;
+    streaming / per_layer_concat keep the interleaved slot. Numerically
+    identical selection (Qasper F1 within radix-tie-break noise)."""
 
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The

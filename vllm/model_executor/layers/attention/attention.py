@@ -613,16 +613,23 @@ class Attention(nn.Module, AttentionLayerBase):
         elif self.kv_cache_dtype == "lrosa":
             # LRoSA combined slot: [ K (head_size) | V (head_size) | proj_K (cs_h) ].
             # lrosa_slot_size is per-slot bytes (slot_elems * dtype_size).
+            # NOTE: spec is built outside a set_current_vllm_config() context, so
+            # read from the passed vllm_config (not the backend's get_current_*
+            # helpers). proj_K region is 0-width in contiguous-proj_K mode (proj_K
+            # lives in a separate cache) — must match the Impl's slot_size.
             from vllm.utils.torch_utils import get_dtype_size
             from vllm.v1.attention.backends.lrosa_attn import _cs_h_for
             from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
 
-            # cs_h override (e.g. Gemma 4 cs_h=64) must match the Impl.
-            _cs_override = getattr(
-                vllm_config.attention_config, "lrosa_cs_h", None
+            _ac = vllm_config.attention_config
+            _cs_override = getattr(_ac, "lrosa_cs_h", None)
+            _proj_cs_h = _cs_override if _cs_override else _cs_h_for(self.head_size)
+            _contig = (
+                getattr(_ac, "lrosa_contig_projk", False)
+                and not getattr(_ac, "lrosa_per_layer_concat", False)
+                and not getattr(_ac, "lrosa_use_streaming_topk", False)
             )
-            _cs_h = _cs_override if _cs_override else _cs_h_for(self.head_size)
-            slot_elems = 2 * self.head_size + _cs_h
+            slot_elems = 2 * self.head_size + (0 if _contig else _proj_cs_h)
             dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
             return LRoSAFullAttentionSpec(
                 block_size=block_size,
