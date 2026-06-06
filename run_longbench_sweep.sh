@@ -54,15 +54,24 @@ for m in fkv quest; do
   fi
 done
 
-# Job list: "label|mode|cs_h|n_tip"
-jobs=()
+# Job list: "label|mode|cs_h|n_tip". LRoSA(D1) + Loki(PCA-only) + FASA per cs_h,
+# plus single FKV + Quest. Jobs whose json already exists are SKIPPED, so
+# re-running the sweep only fills what's missing (e.g. adding Loki later).
+all_jobs=()
 for cs in "${CS_LIST[@]}"; do
-  jobs+=("lrosa_cs${cs}|lrosa|${cs}|0")
-  jobs+=("fasa_nt$((cs / 2))|fasa|0|$((cs / 2))")
+  all_jobs+=("lrosa_cs${cs}|lrosa|${cs}|0")
+  all_jobs+=("loki_cs${cs}|loki|${cs}|0")
+  all_jobs+=("fasa_nt$((cs / 2))|fasa|0|$((cs / 2))")
 done
-[ -f "$OUT/fkv.json" ]   || jobs+=("fkv|fkv|0|0")
-[ -f "$OUT/quest.json" ] || jobs+=("quest|quest|0|0")
-echo "=== ${#jobs[@]} jobs across ${#GPUS[@]} GPUs ==="
+all_jobs+=("fkv|fkv|0|0")
+all_jobs+=("quest|quest|0|0")
+jobs=()
+for spec in "${all_jobs[@]}"; do
+  label="${spec%%|*}"
+  if [ -f "$OUT/$label.json" ]; then echo "  skip $label (json exists)"; else jobs+=("$spec"); fi
+done
+echo "=== ${#jobs[@]} jobs (of ${#all_jobs[@]}) across ${#GPUS[@]} GPUs ==="
+[ "${#jobs[@]}" -eq 0 ] && { echo "nothing to run; aggregating existing."; }
 
 run_one() {  # label mode cs nt gpu
   local label=$1 mode=$2 cs=$3 nt=$4 g=$5 extra=""
@@ -110,19 +119,20 @@ def ov(j): return j["overall"] if j else float("nan")
 fkv, quest = load("fkv"), load("quest")
 base = ov(fkv)
 print("\n=== LongBench v1 memory-vs-F1 (OVERALL F1) ===")
-print("%-12s %10s %10s %10s %10s" % ("budget", "FKV", "FASA", "LRoSA", "Quest"))
+print("%-12s %9s %9s %9s %9s %9s" % ("budget", "FKV", "FASA", "Loki", "LRoSA", "Quest"))
 for cs in cs_list:
     nt = cs // 2
-    lr, fa = load("lrosa_cs%d" % cs), load("fasa_nt%d" % nt)
-    print("%-12s %10.2f %10.2f %10.2f %10.2f" % (
-        "cs%d/nt%d" % (cs, nt), ov(fkv), ov(fa), ov(lr), ov(quest)))
+    lr, fa, lo = load("lrosa_cs%d" % cs), load("fasa_nt%d" % nt), load("loki_cs%d" % cs)
+    print("%-12s %9.2f %9.2f %9.2f %9.2f %9.2f" % (
+        "cs%d/nt%d" % (cs, nt), ov(fkv), ov(fa), ov(lo), ov(lr), ov(quest)))
 if base == base:  # not NaN
     print("\n=== as pct of FKV ===")
     for cs in cs_list:
         nt = cs // 2
-        lr, fa = load("lrosa_cs%d" % cs), load("fasa_nt%d" % nt)
+        lr, fa, lo = load("lrosa_cs%d" % cs), load("fasa_nt%d" % nt), load("loki_cs%d" % cs)
         pf = lambda j: (100 * ov(j) / base) if j else float("nan")
-        print("  cs%-2d/nt%-2d   FASA %6.1f   LRoSA %6.1f" % (cs, nt, pf(fa), pf(lr)))
+        print("  cs%-2d/nt%-2d   FASA %6.1f   Loki %6.1f   LRoSA %6.1f" % (
+            cs, nt, pf(fa), pf(lo), pf(lr)))
     print("  FKV 100.0   Quest %.1f  (budget-independent refs)" % (
         100 * ov(quest) / base if quest else float("nan")))
 PYEOF
