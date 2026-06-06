@@ -182,7 +182,10 @@ def main():
     ap.add_argument("--basis", default=None)
     ap.add_argument("--per_layer", action="store_true")
     ap.add_argument("--contig_projk", action="store_true")
-    ap.add_argument("--fp8_projk", action="store_true")
+    # FP8 score is the DEFAULT for LRoSA/Loki (essentially lossless vs bf16,
+    # and the deployment-relevant config). --no-fp8_projk for bf16. Ignored
+    # for fkv/fasa/quest and auto-gated off for head_size>256 (e.g. Gemma 4).
+    ap.add_argument("--fp8_projk", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--max_num_seqs", type=int, default=0,
                     help="cap concurrent seqs (0=vllm default 1024). Bounds the "
