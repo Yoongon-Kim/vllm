@@ -49,42 +49,59 @@ def _lrosa_gather_kernel(
     ksel_stride_h,
     vsel_stride_t,
     vsel_stride_h,
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    # One program copies a TILE of BLOCK_N selected tokens for one (req, kv-head)
+    # as a 2D [BLOCK_N, BLOCK_D] load/store. The old kernel launched one program
+    # per (req, head, token) — n_fac× more tiny blocks — and was launch/occupancy
+    # bound (a contiguous-index gather ran at the same speed as a scattered one,
+    # i.e. the access pattern wasn't the limiter, the block count was). Tiling
+    # cuts the grid by BLOCK_N× and vectorizes the copy.
     pid_r = tl.program_id(0)
     pid_h = tl.program_id(1)
-    pid_i = tl.program_id(2)  # which of n_fac
+    pid_n = tl.program_id(2)  # tile of BLOCK_N tokens within n_fac
 
-    if pid_i >= n_fac:
-        return
+    i_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    i_mask = i_offs < n_fac
 
-    # Position in paged cache
-    t = tl.load(top_idx_ptr + pid_r * top_stride_r + pid_h * top_stride_h + pid_i)
+    t = tl.load(
+        top_idx_ptr + pid_r * top_stride_r + pid_h * top_stride_h + i_offs,
+        mask=i_mask, other=0,
+    )
     block_idx_in_table = t // block_size
     pos_in_block = t % block_size
     # int64: physical block ids overflow int32 cache-offset arithmetic once the
     # KV cache fills large memory -> intermittent OOB gather at long context.
     block_id = tl.load(
-        block_table_ptr + pid_r * bt_stride_r + block_idx_in_table
+        block_table_ptr + pid_r * bt_stride_r + block_idx_in_table,
+        mask=i_mask, other=0,
     ).to(tl.int64)
 
-    # Load K, V from slot
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < head_size
+    m = i_mask[:, None] & d_mask[None, :]
+    # Per-token slot base (K region); V is +head_size within the same slot.
     src_base = (
         block_id * cache_stride_block
         + pos_in_block * cache_stride_pos
         + pid_h * cache_stride_head
-    )
-    K = tl.load(kv_cache_ptr + src_base + d_offs, mask=d_mask, other=0.0)
-    V = tl.load(kv_cache_ptr + src_base + head_size + d_offs, mask=d_mask, other=0.0)
+    )  # [BLOCK_N]
+    src = kv_cache_ptr + src_base[:, None] + d_offs[None, :]  # [BLOCK_N, BLOCK_D]
+    K = tl.load(src, mask=m, other=0.0)
+    V = tl.load(src + head_size, mask=m, other=0.0)
 
-    # Store into varlen-flat K_sel/V_sel
-    out_row = pid_r * n_fac + pid_i
-    dst_K = K_sel_ptr + out_row * ksel_stride_t + pid_h * ksel_stride_h
-    dst_V = V_sel_ptr + out_row * vsel_stride_t + pid_h * vsel_stride_h
-    tl.store(dst_K + d_offs, K, mask=d_mask)
-    tl.store(dst_V + d_offs, V, mask=d_mask)
+    out_row = pid_r * n_fac + i_offs  # [BLOCK_N]
+    dst_K = (
+        K_sel_ptr + out_row[:, None] * ksel_stride_t
+        + pid_h * ksel_stride_h + d_offs[None, :]
+    )
+    dst_V = (
+        V_sel_ptr + out_row[:, None] * vsel_stride_t
+        + pid_h * vsel_stride_h + d_offs[None, :]
+    )
+    tl.store(dst_K, K, mask=m)
+    tl.store(dst_V, V, mask=m)
 
 
 def lrosa_gather(
@@ -134,8 +151,9 @@ def lrosa_gather(
         V_sel = torch.empty(shape, dtype=dtype, device=device)
 
     BLOCK_D = triton.next_power_of_2(head_size)
+    BLOCK_N = 16  # tokens copied per program (grid shrinks by this factor)
     block_size = kv_cache.shape[1]
-    grid = (num_reqs, H_kv, n_fac)
+    grid = (num_reqs, H_kv, triton.cdiv(n_fac, BLOCK_N))
 
     _lrosa_gather_kernel[grid](
         kv_cache,
@@ -156,6 +174,7 @@ def lrosa_gather(
         K_sel.stride(1),
         V_sel.stride(0),
         V_sel.stride(1),
+        BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
     )
     return K_sel, V_sel
