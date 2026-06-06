@@ -101,18 +101,29 @@ def grade(ev, response, gold):
 
 
 def build_llm(a):
+    want_len = a.max_input_len + a.max_new_tokens + 16
     kw = dict(
         model=a.model,
-        max_model_len=a.max_input_len + a.max_new_tokens + 16,
         gpu_memory_utilization=a.gpu_mem,
         enforce_eager=a.eager,
         enable_prefix_caching=False,
     )
     if a.max_num_seqs:
         kw["max_num_seqs"] = a.max_num_seqs
-    ov = yarn_overrides(a.model)
-    if ov:
-        kw["hf_overrides"] = ov
+    # Rope: reasoning fits Qwen3's NATIVE context (40960 >= 38912 gen + short
+    # prompt), so DON'T apply YaRN by default — YaRN's static 4x rescale
+    # degrades in-window behavior (longer/rambly traces). Matches eval/aime25.py
+    # (native). --yarn only for genuinely >native generation.
+    if a.yarn:
+        ov = yarn_overrides(a.model)
+        if ov:
+            kw["hf_overrides"] = ov
+        kw["max_model_len"] = want_len
+    else:
+        from transformers import AutoConfig
+        native = getattr(AutoConfig.from_pretrained(a.model),
+                          "max_position_embeddings", want_len)
+        kw["max_model_len"] = min(want_len, native)
     if a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
@@ -157,7 +168,11 @@ def main():
                     help="skip (run, idx) attempts already in predictions.jsonl "
                          "(default on; --no-resume to start fresh).")
     ap.add_argument("--max_new_tokens", type=int, default=38912)
-    ap.add_argument("--max_input_len", type=int, default=4096)
+    ap.add_argument("--max_input_len", type=int, default=2048)
+    ap.add_argument("--yarn", action=argparse.BooleanOptionalAction, default=False,
+                    help="apply YaRN rope (Qwen3). OFF for reasoning: 38912 gen + "
+                         "short prompt fits Qwen3-8B native 40960, and YaRN degrades "
+                         "in-window behavior. Only enable for >native generation.")
     ap.add_argument("--n_fac", type=int, default=2048)
     ap.add_argument("--cs_h", type=int, default=32)
     ap.add_argument("--n_tip", type=int, default=16)
@@ -228,7 +243,8 @@ def main():
                 for k, v in [("base_model", a.model), ("eval", a.eval),
                              ("mode", a.mode), ("fp8_projk", bool(a.fp8_projk)),
                              ("max_new_tokens", a.max_new_tokens),
-                             ("n_fac", a.n_fac), ("cs_h", a.cs_h)]:
+                             ("n_fac", a.n_fac), ("cs_h", a.cs_h),
+                             ("yarn", bool(a.yarn))]:
                     if old.get(k) != v:
                         print(f"  resume: config drift ({k}: {old.get(k)} != {v}) "
                               f"-> starting FRESH", flush=True)
@@ -273,7 +289,7 @@ def main():
         summ = {
             "run_name": a.run_name, "eval": a.eval, "base_model": a.model,
             "mode": a.mode, "engine": "vllm", "cs_h": a.cs_h, "n_fac": a.n_fac,
-            "n_tip": a.n_tip, "fp8_projk": bool(a.fp8_projk),
+            "n_tip": a.n_tip, "fp8_projk": bool(a.fp8_projk), "yarn": bool(a.yarn),
             "max_new_tokens": a.max_new_tokens, "num_samples": n,
             "num_runs": a.num_runs, "completed_attempts": attempts,
             "temperature": a.temperature, "top_p": a.top_p, "top_k": a.top_k,
