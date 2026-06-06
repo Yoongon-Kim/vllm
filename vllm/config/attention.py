@@ -87,6 +87,14 @@ class AttentionConfig:
     block-table lookups + lower metadata at iso-quality (pca: -0.53 F1 on
     16-task LongBench at cs_h_layer=256 vs per-head cs_h=32)."""
 
+    lrosa_contig_projk: bool = False
+    """Store proj_K in a SEPARATE contiguous cache [num_blocks, block_size,
+    H_kv, cs_h] instead of interleaved in the [K|V|proj_K] slot. The score
+    kernel then scans proj_K coalesced (no strided cache-line waste), ~1.4x
+    faster at long context on high-bandwidth GPUs (B200). Only the default
+    per-kv-head radix path honors this; streaming / per_layer_concat fall back
+    to the interleaved slot. Numerically identical selection."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

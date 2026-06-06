@@ -46,6 +46,7 @@ from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
 from vllm.v1.attention.ops.triton_fasa_score_topk import fasa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
+    lrosa_project_and_store_contig,
     lrosa_project_and_store_layer,
     lrosa_store,
 )
@@ -561,6 +562,17 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self.per_layer_concat = getattr(attn_cfg, "lrosa_per_layer_concat", False)
         self.cs_h_slot = self.cs_h
         self.cs_h_layer = self.cs_h_slot * self.num_kv_heads
+        # Contiguous proj_K: store proj_K in a separate [num_blocks, block_size,
+        # H_kv, cs_h] cache for a coalesced score scan (vs the strided read of
+        # the interleaved [K|V|proj_K] slot). Only the per-kv-head radix/topk
+        # path uses it; streaming / per_layer_concat keep the in-slot layout.
+        self.contig_projk = (
+            getattr(attn_cfg, "lrosa_contig_projk", False)
+            and not self.is_fasa
+            and not self.per_layer_concat
+            and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)
+        )
+        self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -975,6 +987,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     top_scores_out=attn_metadata.top_scores_buf,
                     use_radix=True,
                     window=window,
+                    projk_cache=self._projk_cache,
                 )  # (num_decodes, H_kv, n_fac_eff) int32
             else:
                 top_idx, _ = lrosa_score_topk(
@@ -989,6 +1002,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     top_idx_out=attn_metadata.top_idx_buf,
                     top_scores_out=attn_metadata.top_scores_buf,
                     window=window,
+                    projk_cache=self._projk_cache,
                 )  # (nd, H_kv, n_fac_eff) int64 CG path; int32 fallback
 
         K_sel, V_sel = lrosa_gather(
@@ -1095,6 +1109,25 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 out.permute(2, 0, 1, 3).reshape(L, Hkv * G, d).to(output.dtype)
             )
 
+    def _ensure_projk_cache(
+        self, kv_cache: torch.Tensor, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Lazily allocate the separate contiguous proj_K cache sized to the
+        managed kv cache's block count. Allocated on the first (eager warmup)
+        forward, before CUDA-graph capture, and kept persistent + static so
+        captured decode graphs see a fixed address."""
+        if self._projk_cache is None:
+            num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+            self._projk_cache = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads, self.cs_h,
+                dtype=dtype, device=device,
+            )
+            try:
+                torch._dynamo.mark_static_address(self._projk_cache)
+            except Exception:
+                pass
+        return self._projk_cache
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1113,5 +1146,9 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             lrosa_store(key, value, kv_cache, slot_mapping)
         elif self.per_layer_concat:
             lrosa_project_and_store_layer(key, value, kv_cache, slot_mapping, M)
+        elif self.contig_projk:
+            # K|V into the slot; proj_K into the separate contiguous cache.
+            pk = self._ensure_projk_cache(kv_cache, key.dtype, key.device)
+            lrosa_project_and_store_contig(key, value, kv_cache, pk, slot_mapping, M)
         else:
             lrosa_project_and_store(key, value, kv_cache, slot_mapping, M)

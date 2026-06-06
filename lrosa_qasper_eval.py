@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--n_tip", type=int, default=16,
                     help="FASA-fc only: # dominant FCs per kv-head (2*n_tip channels).")
     ap.add_argument("--per_layer", action="store_true")
+    ap.add_argument("--contig_projk", action="store_true",
+                    help="LRoSA: separate contiguous proj_K cache (coalesced score scan).")
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis .pt; default = pca bases/<tag>/pca_d1_cs<N>_kv_head.")
     ap.add_argument("--eager", action="store_true")
@@ -81,6 +83,8 @@ def main():
               "lrosa_use_radix_topk": True}
         if a.per_layer:
             ac["lrosa_per_layer_concat"] = True
+        if a.contig_projk:
+            ac["lrosa_contig_projk"] = True
         kw["attention_config"] = ac
     elif a.mode == "quest":
         kw["kv_cache_dtype"] = "quest"

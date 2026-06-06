@@ -274,6 +274,106 @@ def lrosa_project_and_store_layer(
     )
 
 
+# ---------------------------------------------------------------------------
+# Contiguous-proj_K store: K,V into the [K|V] slot; proj_K = M@K into a SEPARATE
+# contiguous cache [num_blocks, block_size, H_kv, cs_h]. The separate cache lets
+# the score kernel scan proj_K coalesced (vs the strided read when proj_K is
+# interleaved inside the 2*head+cs_h slot) — ~1.4x faster score at long context.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _lrosa_project_store_contig_kernel(
+    key_ptr,
+    value_ptr,
+    m_ptr,
+    kv_cache_ptr,    # [num_blocks, block_size, H_kv, slot_size]  ([K|V] used)
+    projk_ptr,       # [num_blocks, block_size, H_kv, cs_h]  contiguous proj_K
+    slot_mapping_ptr,
+    num_tokens,
+    head_size,
+    cs_h,
+    block_size,
+    key_stride_t, key_stride_h,
+    val_stride_t, val_stride_h,
+    m_stride_h, m_stride_c,
+    cache_stride_block, cache_stride_pos, cache_stride_head,
+    pk_stride_block, pk_stride_pos, pk_stride_head,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    if token_id >= num_tokens:
+        return
+    slot = tl.load(slot_mapping_ptr + token_id)
+    if slot < 0:
+        return
+    block_id = (slot // block_size).to(tl.int64)
+    pos = slot % block_size
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < head_size
+    c_offs = tl.arange(0, BLOCK_C)
+    c_mask = c_offs < cs_h
+
+    k_offset = token_id * key_stride_t + head_id * key_stride_h
+    k = tl.load(key_ptr + k_offset + d_offs, mask=d_mask, other=0.0)
+    v_offset = token_id * val_stride_t + head_id * val_stride_h
+    v = tl.load(value_ptr + v_offset + d_offs, mask=d_mask, other=0.0)
+
+    m_block_ptr = m_ptr + head_id * m_stride_h
+    m_offs = c_offs[:, None] * m_stride_c + d_offs[None, :]
+    m_mask = c_mask[:, None] & d_mask[None, :]
+    m_tile = tl.load(m_block_ptr + m_offs, mask=m_mask, other=0.0)
+    proj = tl.sum(m_tile * k[None, :].to(tl.float32), axis=1).to(k.dtype)
+
+    cache_offset = (
+        block_id * cache_stride_block
+        + pos * cache_stride_pos
+        + head_id * cache_stride_head
+    )
+    tl.store(kv_cache_ptr + cache_offset + d_offs, k, mask=d_mask)
+    tl.store(kv_cache_ptr + cache_offset + head_size + d_offs, v, mask=d_mask)
+    # proj_K → its own contiguous cache (cs_h-wide slot).
+    pk_offset = (
+        block_id * pk_stride_block
+        + pos * pk_stride_pos
+        + head_id * pk_stride_head
+    )
+    tl.store(projk_ptr + pk_offset + c_offs, proj, mask=c_mask)
+
+
+def lrosa_project_and_store_contig(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,    # [num_blocks, block_size, H_kv, slot_size]
+    projk_cache: torch.Tensor,  # [num_blocks, block_size, H_kv, cs_h]
+    slot_mapping: torch.Tensor,
+    M: torch.Tensor,           # (num_kv_heads, cs_h, head_size)
+) -> None:
+    """K,V → combined slot; proj_K = M@K → separate contiguous projk_cache."""
+    num_tokens, num_kv_heads, head_size = key.shape
+    if num_tokens == 0:
+        return
+    M_h, cs_h, M_d = M.shape
+    assert M_h == num_kv_heads and M_d == head_size
+    assert projk_cache.shape[2] == num_kv_heads and projk_cache.shape[3] == cs_h, (
+        f"projk_cache {tuple(projk_cache.shape)} expected (.,.,{num_kv_heads},{cs_h})"
+    )
+    BLOCK_D = triton.next_power_of_2(head_size)
+    BLOCK_C = triton.next_power_of_2(cs_h)
+    _lrosa_project_store_contig_kernel[(num_tokens, num_kv_heads)](
+        key, value, M, kv_cache, projk_cache, slot_mapping,
+        num_tokens, head_size, cs_h, kv_cache.shape[1],
+        key.stride(0), key.stride(1), value.stride(0), value.stride(1),
+        M.stride(0), M.stride(1),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        projk_cache.stride(0), projk_cache.stride(1), projk_cache.stride(2),
+        BLOCK_D=BLOCK_D, BLOCK_C=BLOCK_C,
+    )
+
+
 def lrosa_project_and_store(
     key: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
     value: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
