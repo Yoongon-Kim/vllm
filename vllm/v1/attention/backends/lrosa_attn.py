@@ -122,8 +122,8 @@ def _resolve_slot_cs_h(head_size: int) -> int:
     cfg = get_current_vllm_config()
     if cfg.cache_config.cache_dtype == "fasa":
         return 0
-    if _contig_projk_effective():
-        return 0  # proj_K stored in the separate contiguous cache
+    if _contig_projk_effective() and head_size <= 256:
+        return 0  # proj_K stored in the separate contiguous cache (head<=256 only)
     return _resolve_proj_cs_h(head_size)
 
 
@@ -596,15 +596,22 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # H_kv, cs_h] cache for a coalesced score scan (vs the strided read of
         # the interleaved [K|V|proj_K] slot). Only the per-kv-head radix/topk
         # path uses it; streaming / per_layer_concat keep the in-slot layout.
-        # FP8 proj_K (e4m3) implies the contiguous separate cache.
+        # FP8 proj_K (e4m3) implies the contiguous separate cache. The separate
+        # projk cache is not yet wired for hybrid / head_dim>256 models (Gemma 4:
+        # the full layers' contig store hits the hybrid cache-group block mapping
+        # → illegal access), so gate it to head_dim<=256. Gemma 4 keeps the
+        # in-slot path (its bf16 LRoSA win comes from the 5 full layers anyway).
+        _contig_ok = head_size <= 256
         self.fp8_projk = (
             getattr(attn_cfg, "lrosa_fp8_projk", False)
+            and _contig_ok
             and not self.is_fasa
             and not self.per_layer_concat
             and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)
         )
         self.contig_projk = self.fp8_projk or (
             getattr(attn_cfg, "lrosa_contig_projk", False)
+            and _contig_ok
             and not self.is_fasa
             and not self.per_layer_concat
             and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)

@@ -629,6 +629,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     getattr(_ac, "lrosa_contig_projk", False)
                     or getattr(_ac, "lrosa_fp8_projk", False)
                 )
+                and self.head_size <= 256  # contig projk not wired for head>256 (Gemma4)
                 and not getattr(_ac, "lrosa_per_layer_concat", False)
                 and not getattr(_ac, "lrosa_use_streaming_topk", False)
             )
