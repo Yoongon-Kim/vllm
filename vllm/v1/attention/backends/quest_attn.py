@@ -420,6 +420,29 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
         key_cache = kv_cache[..., :head_size]
         value_cache = kv_cache[..., head_size : 2 * head_size]
 
+        # Sliding-attention layer (hybrid models, e.g. Gemma 4: 25/30 layers are
+        # sliding head_dim=256): Quest's page selection/attention does NOT honor
+        # the sliding window, so applying it here attends tokens outside the
+        # window and corrupts the output. Fall back to plain windowed flash over
+        # the combined-slot K/V (head<=256 ⇒ FA2 OK) — one varlen call covers
+        # prefill, mixed, and the CG-captured all-decode path. Full-attention
+        # layers (window == (-1,-1)) skip this and use the page path.
+        if self.sliding_window != (-1, -1):
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens], k=key_cache, v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale, causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=list(self.sliding_window),
+                block_table=attn_metadata.block_table,
+                softcap=self.logits_soft_cap,
+            )
+            return output
+
         # Mixed / all-prefill: build prefill page min/max, then dense flash.
         if num_decodes == 0 or num_decode_tokens < num_actual_tokens:
             if num_decodes > 0:
