@@ -152,7 +152,10 @@ def main():
                     choices=["fkv", "lrosa", "loki", "fasa", "quest"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--num_samples", type=int, default=0, help="0 = all")
-    ap.add_argument("--num_runs", type=int, default=1, help="pass@k attempts")
+    ap.add_argument("--num_runs", type=int, default=1, help="attempts/problem (pass@1 avg)")
+    ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                    help="skip (run, idx) attempts already in predictions.jsonl "
+                         "(default on; --no-resume to start fresh).")
     ap.add_argument("--max_new_tokens", type=int, default=38912)
     ap.add_argument("--max_input_len", type=int, default=4096)
     ap.add_argument("--n_fac", type=int, default=2048)
@@ -203,86 +206,125 @@ def main():
                         top_k=(a.top_k if a.top_k and a.top_k > 0 else -1),
                         max_tokens=a.max_new_tokens)
 
-    # per-problem: list of bool over runs (for pass@k + avg accuracy).
     n = len(rows)
-    solved_count = [0] * n   # per-problem: # of the num_runs attempts that were correct
-    gen_lens = [[] for _ in range(n)]  # per-problem: generation token-lengths over runs
-    run_accs = []
-    recs = []
-    for run_id in range(a.num_runs):
-        sp.seed = a.seed + run_id
-        prompts, golds = [], []
-        for idx, row in enumerate(rows):
-            ptext, gold = build_prompt_and_gold(a.eval, row, idx, a.seed + run_id)
-            golds.append(gold)
-            prompts.append(TokensPrompt(prompt_token_ids=tokenize(tok, ptext, a.model)))
-        outs = llm.generate(prompts, sp, use_tqdm=True)
-        correct = 0
-        for idx, (o, gold) in enumerate(zip(outs, golds)):
-            resp = o.outputs[0].text
-            glen = len(o.outputs[0].token_ids)
-            ok = grade(a.eval, resp, gold)
-            correct += int(ok)
-            solved_count[idx] += int(ok)
-            gen_lens[idx].append(glen)
-            # per-SAMPLE record: one row per (problem, attempt).
-            recs.append({"run": run_id, "idx": idx, "gold": gold,
-                         "gen_len": glen, "correct": ok,
-                         "truncated": glen >= a.max_new_tokens})
-        acc = correct / n
-        run_accs.append(acc)
-        print(f"[REASON] {a.eval} {a.mode} run{run_id} acc={acc:.4f} ({correct}/{n})",
-              flush=True)
+    pred_path = os.path.join(run_dir, "predictions.jsonl") if run_dir else None
+    summ_path = os.path.join(run_dir, "summary.json") if run_dir else None
 
-    # pass@1 = expected single-sample accuracy, estimated by averaging over all
-    # num_runs attempts per problem (= mean over problems of solved_count/num_runs
-    # = mean of the per-run accuracies). This is "solve each problem K times,
-    # report pass@1". pass@K = fraction solved by at least one of the K attempts.
-    total_attempts = n * a.num_runs
-    pass_at_1 = sum(solved_count) / total_attempts
-    pass_at_k = sum(1 for c in solved_count if c > 0) / n
-    # Generation-length stats: per-sample lengths live in predictions.jsonl;
-    # here we aggregate per-problem (mean over runs) + overall.
-    all_lens = [l for sub in gen_lens for l in sub]
-    mean_gen_len = sum(all_lens) / len(all_lens) if all_lens else 0.0
-    max_gen_len = max(all_lens) if all_lens else 0
-    frac_truncated = (sum(1 for l in all_lens if l >= a.max_new_tokens)
-                      / len(all_lens) if all_lens else 0.0)
-    per_problem = [
-        {"idx": i, "solved_count": solved_count[i], "n_runs": len(gen_lens[i]),
-         "pass_at_1": (solved_count[i] / len(gen_lens[i]) if gen_lens[i] else 0.0),
-         "gen_lens": gen_lens[i],
-         "mean_gen_len": (sum(gen_lens[i]) / len(gen_lens[i]) if gen_lens[i] else 0.0)}
-        for i in range(n)
-    ]
-    print(f"\n=== {a.eval} mode={a.mode} model={a.model} cs_h={a.cs_h} n_fac={a.n_fac} "
-          f"runs={a.num_runs} fp8={bool(a.fp8_projk)} ===")
-    print(f"  pass@1 = {pass_at_1:.4f}  (avg over {a.num_runs} attempts/problem, n={n})")
-    print(f"  pass@{a.num_runs} = {pass_at_k:.4f}  (solved by >=1 attempt)")
-    print(f"  per-run acc: {['%.3f' % x for x in run_accs]}")
-    print(f"  gen_len: mean={mean_gen_len:.0f} max={max_gen_len} "
-          f"truncated@{a.max_new_tokens}={frac_truncated:.3f}")
+    # ---- Resume: skip (run, idx) attempts already in predictions.jsonl ----
+    # predictions.jsonl is appended + flushed per attempt, so an interrupted
+    # run resumes from exactly where it stopped. Guard against config drift:
+    # if an existing summary's key knobs differ, start fresh (don't mix).
+    recs, done = [], set()
+    fresh = True
+    if pred_path and a.resume and os.path.exists(pred_path):
+        ok_cfg = True
+        if os.path.exists(summ_path):
+            try:
+                old = json.load(open(summ_path))
+                for k, v in [("base_model", a.model), ("eval", a.eval),
+                             ("mode", a.mode), ("fp8_projk", bool(a.fp8_projk)),
+                             ("max_new_tokens", a.max_new_tokens),
+                             ("n_fac", a.n_fac), ("cs_h", a.cs_h)]:
+                    if old.get(k) != v:
+                        print(f"  resume: config drift ({k}: {old.get(k)} != {v}) "
+                              f"-> starting FRESH", flush=True)
+                        ok_cfg = False
+                        break
+            except Exception:
+                pass
+        if ok_cfg:
+            for line in open(pred_path):
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r["idx"] < n:
+                    recs.append(r)
+                    done.add((r["run"], r["idx"]))
+            fresh = False
+            print(f"  resume: {len(done)} attempts already done in {pred_path}", flush=True)
 
-    if run_dir:
-        with open(os.path.join(run_dir, "predictions.jsonl"), "w") as f:
-            for r in recs:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        summary = {
+    def aggregate(status):
+        sc = [0] * n
+        gl = [[] for _ in range(n)]
+        rcorr, rtot = {}, {}
+        for r in recs:
+            i = r["idx"]
+            sc[i] += int(bool(r.get("correct")))
+            gl[i].append(r.get("gen_len", 0))
+            rcorr[r["run"]] = rcorr.get(r["run"], 0) + int(bool(r.get("correct")))
+            rtot[r["run"]] = rtot.get(r["run"], 0) + 1
+        attempts = sum(len(g) for g in gl)
+        p1 = sum(sc) / attempts if attempts else 0.0
+        pk = sum(1 for c in sc if c > 0) / n if n else 0.0
+        alll = [x for sub in gl for x in sub]
+        mgl = sum(alll) / len(alll) if alll else 0.0
+        per_run = [rcorr[k] / rtot[k] for k in sorted(rtot)]
+        per_problem = [
+            {"idx": i, "solved_count": sc[i], "n_runs": len(gl[i]),
+             "pass_at_1": (sc[i] / len(gl[i]) if gl[i] else 0.0),
+             "gen_lens": gl[i],
+             "mean_gen_len": (sum(gl[i]) / len(gl[i]) if gl[i] else 0.0)}
+            for i in range(n)]
+        summ = {
             "run_name": a.run_name, "eval": a.eval, "base_model": a.model,
             "mode": a.mode, "engine": "vllm", "cs_h": a.cs_h, "n_fac": a.n_fac,
             "n_tip": a.n_tip, "fp8_projk": bool(a.fp8_projk),
             "max_new_tokens": a.max_new_tokens, "num_samples": n,
-            "num_runs": a.num_runs, "temperature": a.temperature,
-            "top_p": a.top_p, "top_k": a.top_k, "status": "complete",
-            "run_accuracies": run_accs, "pass_at_1": pass_at_1,
-            "pass_at_k": pass_at_k, "avg_accuracy": pass_at_1,
-            "solved_count": solved_count,
-            "mean_gen_len": mean_gen_len, "max_gen_len": max_gen_len,
-            "frac_truncated": frac_truncated, "per_problem": per_problem,
+            "num_runs": a.num_runs, "completed_attempts": attempts,
+            "temperature": a.temperature, "top_p": a.top_p, "top_k": a.top_k,
+            "status": status, "run_accuracies": per_run, "pass_at_1": p1,
+            "pass_at_k": pk, "avg_accuracy": p1, "solved_count": sc,
+            "mean_gen_len": mgl, "max_gen_len": max(alll) if alll else 0,
+            "frac_truncated": (sum(1 for x in alll if x >= a.max_new_tokens) / len(alll)
+                               if alll else 0.0),
+            "per_problem": per_problem,
         }
-        with open(os.path.join(run_dir, "summary.json"), "w") as f:
-            json.dump(summary, f, indent=2)
-            f.write("\n")
+        if summ_path:
+            with open(summ_path, "w") as f:
+                json.dump(summ, f, indent=2)
+                f.write("\n")
+        return p1, pk, mgl
+
+    pf = open(pred_path, "a" if not fresh else "w") if pred_path else None
+    for run_id in range(a.num_runs):
+        pending = [i for i in range(n) if (run_id, i) not in done]
+        if not pending:
+            print(f"[REASON] {a.eval} {a.mode} run{run_id}: all {n} done (resumed)", flush=True)
+            continue
+        sp.seed = a.seed + run_id
+        prompts, golds = [], []
+        for i in pending:
+            ptext, gold = build_prompt_and_gold(a.eval, rows[i], i, a.seed + run_id)
+            golds.append(gold)
+            prompts.append(TokensPrompt(prompt_token_ids=tokenize(tok, ptext, a.model)))
+        outs = llm.generate(prompts, sp, use_tqdm=True)
+        c = 0
+        for i, o, gold in zip(pending, outs, golds):
+            glen = len(o.outputs[0].token_ids)
+            ok = grade(a.eval, o.outputs[0].text, gold)
+            c += int(ok)
+            rec = {"run": run_id, "idx": i, "gold": gold, "gen_len": glen,
+                   "correct": ok, "truncated": glen >= a.max_new_tokens}
+            recs.append(rec)
+            done.add((run_id, i))
+            if pf:
+                pf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                pf.flush()
+        print(f"[REASON] {a.eval} {a.mode} run{run_id} +{len(pending)} acc={c / len(pending):.4f}",
+              flush=True)
+        if run_dir:
+            aggregate("partial")
+    if pf:
+        pf.close()
+
+    pass_at_1, pass_at_k, mean_gen_len = aggregate("complete")
+    print(f"\n=== {a.eval} mode={a.mode} model={a.model} cs_h={a.cs_h} n_fac={a.n_fac} "
+          f"runs={a.num_runs} fp8={bool(a.fp8_projk)} ===")
+    print(f"  pass@1 = {pass_at_1:.4f}  (avg over {a.num_runs} attempts/problem, n={n})")
+    print(f"  pass@{a.num_runs} = {pass_at_k:.4f}  (solved by >=1 attempt)")
+    print(f"  mean_gen_len = {mean_gen_len:.0f} tokens")
+    if run_dir:
         print(f"  saved -> {run_dir}")
 
 
