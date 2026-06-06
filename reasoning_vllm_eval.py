@@ -190,8 +190,12 @@ def main():
     if a.top_k is None:
         a.top_k = pr["top_k"]
     if a.run_name is None:
-        a.run_name = f"{a.mode}" + (f"_cs{a.cs_h}" if a.mode in ("lrosa", "loki") else "") \
-                     + ("_fp8" if a.fp8_projk else "")
+        if a.mode in ("lrosa", "loki"):  # _fp8 only where fp8 actually applies
+            a.run_name = f"{a.mode}_cs{a.cs_h}" + ("_fp8" if a.fp8_projk else "")
+        elif a.mode == "fasa":
+            a.run_name = f"fasa_nt{a.n_tip}"
+        else:  # fkv / quest: fp8 is ignored, no _fp8 suffix
+            a.run_name = a.mode
 
     tok = AutoTokenizer.from_pretrained(a.model)
     rows = load_rows(a.eval, a)
