@@ -51,6 +51,10 @@ from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store_layer,
     lrosa_store,
 )
+# vLLM's Triton flash attention — head_dim-agnostic (handles Gemma 4's
+# head_dim=512 full layers where FA2 caps at 256) and O(L) memory (online
+# softmax), used for the head>256 dense prefill / mixed-batch paths.
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.triton_lrosa_streaming_topk import (
     alloc_candidates_buf,
     lrosa_streaming_topk,
@@ -804,15 +808,26 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         if num_decodes == 0 or num_decode_tokens < num_actual_tokens:
             if num_decodes == 0:
                 if head_size > 256:
-                    # head_dim>256 (Gemma 4 full layers): FA2 caps at 256 and
-                    # the Triton context kernel blows shared memory at
-                    # BLOCK_DMODEL=512. Reasoning prefills are short, so a
-                    # per-request manual causal GQA attention over the
-                    # freshly-passed contiguous K/V is cheap and head-dim
-                    # agnostic. (Only the 5 full-attention layers hit this;
-                    # sliding layers use the dense FA2 path at head_dim=256.)
-                    self._manual_prefill(
-                        query, key, value, output, attn_metadata, head_size
+                    # head_dim>256 (Gemma 4 full layers): FA2 caps at 256, but
+                    # vLLM's Triton flash (unified_attention) is head-dim
+                    # agnostic and O(L) memory (online softmax), so reuse it on
+                    # the paged combined-slot K/V regions — same kernel FKV uses
+                    # for Gemma 4. (The earlier manual O(BQ·L) prefill OOM'd at
+                    # long context; this matches FKV's memory behavior.)
+                    unified_attention(
+                        q=query[:num_actual_tokens],
+                        k=key_cache, v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=attn_metadata.query_start_loc,
+                        max_seqlen_q=attn_metadata.max_query_len,
+                        seqused_k=attn_metadata.seq_lens,
+                        max_seqlen_k=attn_metadata.max_seq_len,
+                        softmax_scale=self.scale, causal=True,
+                        window_size=self.sliding_window,
+                        block_table=attn_metadata.block_table,
+                        softcap=self.logits_soft_cap,
+                        q_descale=None, k_descale=None, v_descale=None,
+                        alibi_slopes=self.alibi_slopes,
                     )
                     return output
                 flash_attn_varlen_func(
@@ -845,28 +860,31 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 head_size=head_size,
             )
 
-            if head_size > 256:
-                # head_dim>256 (Gemma 4 full layers): FA2 can't do the trailing
-                # prefill rows either. Continuous batching produces these mixed
-                # batches (a long prefill scheduled alongside other requests'
-                # decode steps). Prefix caching is off so the prefill request's
-                # full K/V is the freshly-passed contiguous slice → reuse the
-                # manual chunked attention. (sliding layers head_dim=256 keep FA2.)
-                qsl_cpu = attn_metadata.query_start_loc_cpu
-                if qsl_cpu is None:
-                    qsl_cpu = attn_metadata.query_start_loc.cpu()
-                prefill_qsl_cpu = qsl_cpu[num_decodes:] - num_decode_tokens
-                self._manual_attn_varlen(
-                    query[num_decode_tokens:num_actual_tokens],
-                    key[num_decode_tokens:num_actual_tokens],
-                    value[num_decode_tokens:num_actual_tokens],
-                    output[num_decode_tokens:num_actual_tokens],
-                    prefill_qsl_cpu, head_size,
-                )
-                return output
             prefill_qsl = (
                 attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
             )
+            if head_size > 256:
+                # head_dim>256 (Gemma 4 full layers): FA2 can't do the trailing
+                # prefill rows of the mixed batch (continuous batching schedules
+                # a long prefill next to other requests' decode steps). Use
+                # vLLM's Triton flash on the paged K/V (O(L) memory, head-dim
+                # agnostic) — same as the all-prefill branch.
+                unified_attention(
+                    q=query[num_decode_tokens:num_actual_tokens],
+                    k=key_cache, v=value_cache,
+                    out=output[num_decode_tokens:num_actual_tokens],
+                    cu_seqlens_q=prefill_qsl,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens[num_decodes:],
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True,
+                    window_size=self.sliding_window,
+                    block_table=attn_metadata.block_table[num_decodes:],
+                    softcap=self.logits_soft_cap,
+                    q_descale=None, k_descale=None, v_descale=None,
+                    alibi_slopes=self.alibi_slopes,
+                )
+                return output
             flash_attn_varlen_func(
                 q=query[num_decode_tokens:num_actual_tokens],
                 k=key_cache,
@@ -1139,65 +1157,6 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             causal=False,  # selected K is a set, not a sequence
             alibi_slopes=self.alibi_slopes,
             softcap=self.logits_soft_cap,
-        )
-
-    def _manual_attn_varlen(
-        self,
-        qf: torch.Tensor,   # (T, H_q, d) contiguous
-        kf: torch.Tensor,   # (T, H_kv, d) contiguous (fresh prefill K)
-        vf: torch.Tensor,   # (T, H_kv, d)
-        output: torch.Tensor,  # (T, H_q, d) write target
-        qsl_cpu: torch.Tensor,  # per-request start locs into [0, T], len R+1
-        head_size: int,
-    ) -> None:
-        """Per-request manual causal GQA attention over contiguous K/V — used for
-        head_dim>256 full layers (Gemma 4) where FA2 caps at 256. Query-chunked
-        (BQ rows) so peak memory is [Hkv,G,BQ,L] not the full [Hkv,G,L,L] (which
-        OOMs at long context). Reused by both the all-prefill and the mixed-batch
-        trailing-prefill paths."""
-        Hkv, G, d = self.num_kv_heads, self.num_kv_groups, head_size
-        BQ = 2048
-        for r in range(qsl_cpu.shape[0] - 1):
-            s = int(qsl_cpu[r])
-            e = int(qsl_cpu[r + 1])
-            L = e - s
-            if L <= 0:
-                continue
-            qr = qf[s:e].view(L, Hkv, G, d).permute(1, 2, 0, 3).to(torch.float32)
-            kr = kf[s:e].permute(1, 0, 2).to(torch.float32)
-            vr = vf[s:e].permute(1, 0, 2).to(torch.float32)
-            for qs in range(0, L, BQ):
-                qe = min(qs + BQ, L)
-                sc = torch.einsum(
-                    "hgld,hmd->hglm", qr[:, :, qs:qe, :], kr[:, :qe, :]
-                ) * self.scale
-                rows = torch.arange(qs, qe, device=qf.device)[:, None]
-                cols = torch.arange(qe, device=qf.device)[None, :]
-                sc = sc.masked_fill(cols > rows, float("-inf"))
-                aw = torch.softmax(sc, dim=-1)
-                ob = torch.einsum("hglm,hmd->hgld", aw, vr[:, :qe, :])
-                output[s + qs : s + qe] = (
-                    ob.permute(2, 0, 1, 3).reshape(qe - qs, Hkv * G, d).to(output.dtype)
-                )
-
-    def _manual_prefill(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: LRoSAMetadata,
-        head_size: int,
-    ) -> None:
-        """All-prefill manual causal GQA attention for head_dim>256 (Gemma 4).
-        Delegates to _manual_attn_varlen over the freshly-passed contiguous K/V."""
-        qsl_cpu = attn_metadata.query_start_loc_cpu
-        if qsl_cpu is None:
-            qsl_cpu = attn_metadata.query_start_loc.cpu()
-        n_actual = attn_metadata.num_actual_tokens
-        self._manual_attn_varlen(
-            query[:n_actual], key[:n_actual], value[:n_actual],
-            output[:n_actual], qsl_cpu, head_size,
         )
 
     def _ensure_projk_cache(
