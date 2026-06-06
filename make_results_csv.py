@@ -28,8 +28,8 @@ OUT = f"{SWEEP}/results_{TAG}.csv"
 # Preferred method row order (only those present are emitted).
 ORDER = (
     ["fkv"]
-    + [f"lrosa_cs{c}" for c in (4, 8, 16, 32)]
-    + [f"loki_cs{c}" for c in (4, 8, 16, 32)]
+    + [f"lrosa_cs{c}" for c in (4, 8, 16, 32)] + ["lrosa_cs32_fp8"]
+    + [f"loki_cs{c}" for c in (4, 8, 16, 32)] + ["loki_cs32_fp8"]
     + [f"fasa_nt{n}" for n in (2, 4, 8, 16)]
     + ["quest", "squeezed", "snap_kv"]
 )

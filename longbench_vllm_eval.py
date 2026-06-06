@@ -38,6 +38,7 @@ from eval.longbench_v1_utils import (  # noqa: E402
     ENGLISH_TASKS,
     TASK_CATEGORIES,
     TASK_MAX_NEW_TOKENS,
+    TASK_METRIC,
     build_prompt as pca_build_prompt,
     score_single,
     tokenize_and_truncate,
@@ -129,11 +130,41 @@ def eval_task(llm, tok, task, a):
     outs = llm.generate(
         [TokensPrompt(prompt_token_ids=t) for t in token_ids], sp, use_tqdm=False
     )
-    scores = [
-        score_single(o.outputs[0].text, r["answers"], task, r.get("all_classes"))
-        for r, o in zip(rows, outs)
-    ]
-    return 100.0 * sum(scores) / len(scores), len(scores)
+    recs = []
+    for r, o in zip(rows, outs):
+        pred = o.outputs[0].text
+        s = score_single(pred, r["answers"], task, r.get("all_classes"))
+        recs.append({"prediction": pred, "answers": r["answers"], "score": s})
+    avg = sum(x["score"] for x in recs) / len(recs)
+    return 100.0 * avg, len(recs), recs
+
+
+def _write_lrosa_summary(run_dir, a, per_task, status):
+    """Write a pca/eval-longbench-compatible summary.json into the LRoSA
+    results tree, so vLLM-measured runs land beside the transformers-stack
+    runs in the same format (per_task score is 0-1, like the HF eval).
+    Called after every task (status='partial') and once at the end
+    ('complete'). Scoring is identical (same score_single); only the engine
+    differs, recorded as engine='vllm'."""
+    os.makedirs(run_dir, exist_ok=True)
+    cat_avgs = {}
+    for cat, ctasks in TASK_CATEGORIES.items():
+        sc = [per_task[t]["score"] for t in ctasks if t in per_task]
+        if sc:
+            cat_avgs[cat] = sum(sc) / len(sc)
+    overall = (sum(r["score"] for r in per_task.values()) / len(per_task)
+               if per_task else 0.0)
+    summary = {
+        "run_name": a.run_name, "base_model": a.model, "mode": a.mode,
+        "n_tip": a.n_tip, "n_fac": a.n_fac, "cs_h": a.cs_h,
+        "max_input_len": a.max_input_len, "engine": "vllm",
+        "fp8_projk": bool(a.fp8_projk), "status": status,
+        "per_task": per_task, "category_averages": cat_avgs,
+        "overall_average": overall,
+    }
+    with open(os.path.join(run_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+        f.write("\n")
 
 
 def main():
@@ -158,7 +189,23 @@ def main():
                          "LRoSA/FASA max_kv-sized decode scratch at long context.")
     ap.add_argument("--gpu_mem", type=float, default=0.90)
     ap.add_argument("--output", default=None, help="optional results .json path")
+    ap.add_argument("--results_dir", default=os.path.join(PCA_REPO, "results", "longbench_v1"),
+                    help="LRoSA results tree; writes <dir>/<model>/<run_name>/"
+                         "{summary.json, <task>.jsonl} in the pca eval format. "
+                         "Pass '' to disable.")
+    ap.add_argument("--run_name", default=None,
+                    help="run dir name under results_dir/<model>/ (default: "
+                         "--output stem, else <mode>_cs<cs_h>/<mode>_nt<n_tip>).")
     a = ap.parse_args()
+    if a.run_name is None:
+        if a.output:
+            a.run_name = os.path.splitext(os.path.basename(a.output))[0]
+        elif a.mode == "fasa":
+            a.run_name = f"fasa_nt{a.n_tip}"
+        elif a.mode in ("lrosa", "loki"):
+            a.run_name = f"{a.mode}_cs{a.cs_h}" + ("_fp8" if a.fp8_projk else "")
+        else:
+            a.run_name = a.mode
 
     tasks = ENGLISH_TASKS if a.tasks == "all" else a.tasks.split(",")
     if a.basis is None and a.mode == "lrosa":
@@ -167,11 +214,29 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     llm = build_llm(a)
 
-    results = {}
+    run_dir = None
+    if a.results_dir:
+        run_dir = os.path.join(a.results_dir, a.model.split("/")[-1], a.run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        print(f"  LRoSA results -> {run_dir}", flush=True)
+
+    results = {}       # 0-100 task averages (for --output json)
+    per_task = {}      # pca-format per-task records (score 0-1)
     for task in tasks:
-        score, n = eval_task(llm, tok, task, a)
+        score, n, recs = eval_task(llm, tok, task, a)
         results[task] = score
         print(f"[LB] {a.mode:5s} {task:20s} n={n:<4d} score={score:.2f}", flush=True)
+        if run_dir:
+            with open(os.path.join(run_dir, f"{task}.jsonl"), "w") as f:
+                for rec in recs:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            per_task[task] = {"task": task, "metric": TASK_METRIC[task],
+                              "num_samples": n, "score": score / 100.0,
+                              "elapsed_sec": 0.0}
+            _write_lrosa_summary(run_dir, a, per_task, "partial")
+    if run_dir:
+        _write_lrosa_summary(run_dir, a, per_task, "complete")
+        print(f"  LRoSA summary -> {run_dir}/summary.json", flush=True)
 
     # Category + overall averages (over the tasks actually run).
     print(f"\n=== LongBench v1  mode={a.mode}  model={a.model}  "
