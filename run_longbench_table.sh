@@ -37,6 +37,9 @@ OUT=/NHNHOME/jiwonsong/tmp/lb_table/$TAG; mkdir -p "$OUT"
 echo "=== LongBench table: $MODEL (tag=$TAG)  cs_h=$CS_H n_fac=$NFAC nsamp=$NSAMP maxlen=$MAXLEN ==="
 echo "=== out: $OUT  $(date +%H:%M:%S) ==="
 
+NTASKS=$([ "$TASKS" = all ] && echo 16 || awk -F, '{print NF}' <<< "$TASKS")
+HEARTBEAT=${HEARTBEAT:-60}      # seconds between terminal progress lines
+pids=()
 for i in "${!MODES[@]}"; do
   m=${MODES[$i]}; g=${GPUS[$((i % ${#GPUS[@]}))]}
   CUDA_VISIBLE_DEVICES=$g VLLM_CACHE_ROOT="$HOME/.cache/lbt_${TAG}_${m}" \
@@ -44,6 +47,21 @@ for i in "${!MODES[@]}"; do
       --num_samples "$NSAMP" --n_fac "$NFAC" --cs_h "$CS_H" \
       --max_input_len "$MAXLEN" --gpu_mem "$GPUMEM" --output "$OUT/$m.json" \
       > "$OUT/$m.log" 2>&1 &
+  pids+=($!)
+done
+
+# Live progress heartbeat to THIS terminal (full per-backend output is in the
+# .log files). Counts completed [LB] task lines per backend until all exit.
+while :; do
+  alive=0
+  for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
+  line=""
+  for m in "${MODES[@]}"; do
+    n=$(grep -c '\[LB\]' "$OUT/$m.log" 2>/dev/null || true); line+="$m=${n:-0}/$NTASKS "
+  done
+  echo "[$(date +%H:%M:%S)] $line(engines alive: $alive/${#pids[@]})"
+  [ "$alive" -eq 0 ] && break
+  sleep "$HEARTBEAT"
 done
 wait
 echo "=== all backends done $(date +%H:%M:%S) ==="
