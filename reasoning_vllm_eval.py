@@ -205,7 +205,7 @@ def main():
 
     # per-problem: list of bool over runs (for pass@k + avg accuracy).
     n = len(rows)
-    solved_any = [False] * n
+    solved_count = [0] * n   # per-problem: # of the num_runs attempts that were correct
     run_accs = []
     recs = []
     for run_id in range(a.num_runs):
@@ -221,7 +221,7 @@ def main():
             resp = o.outputs[0].text
             ok = grade(a.eval, resp, gold)
             correct += int(ok)
-            solved_any[idx] = solved_any[idx] or ok
+            solved_count[idx] += int(ok)
             recs.append({"run": run_id, "idx": idx, "gold": gold,
                          "pred_len": len(o.outputs[0].token_ids), "correct": ok})
         acc = correct / n
@@ -229,12 +229,18 @@ def main():
         print(f"[REASON] {a.eval} {a.mode} run{run_id} acc={acc:.4f} ({correct}/{n})",
               flush=True)
 
-    avg_acc = sum(run_accs) / len(run_accs)
-    pass_at_k = sum(solved_any) / n
+    # pass@1 = expected single-sample accuracy, estimated by averaging over all
+    # num_runs attempts per problem (= mean over problems of solved_count/num_runs
+    # = mean of the per-run accuracies). This is "solve each problem K times,
+    # report pass@1". pass@K = fraction solved by at least one of the K attempts.
+    total_attempts = n * a.num_runs
+    pass_at_1 = sum(solved_count) / total_attempts
+    pass_at_k = sum(1 for c in solved_count if c > 0) / n
     print(f"\n=== {a.eval} mode={a.mode} model={a.model} cs_h={a.cs_h} n_fac={a.n_fac} "
-          f"runs={a.num_runs} ===")
-    print(f"  avg@{a.num_runs} acc = {avg_acc:.4f}   pass@{a.num_runs} = {pass_at_k:.4f}  "
-          f"(n={n})")
+          f"runs={a.num_runs} fp8={bool(a.fp8_projk)} ===")
+    print(f"  pass@1 = {pass_at_1:.4f}  (avg over {a.num_runs} attempts/problem, n={n})")
+    print(f"  pass@{a.num_runs} = {pass_at_k:.4f}  (solved by >=1 attempt)")
+    print(f"  per-run acc: {['%.3f' % x for x in run_accs]}")
 
     if run_dir:
         with open(os.path.join(run_dir, "predictions.jsonl"), "w") as f:
@@ -247,8 +253,9 @@ def main():
             "max_new_tokens": a.max_new_tokens, "num_samples": n,
             "num_runs": a.num_runs, "temperature": a.temperature,
             "top_p": a.top_p, "top_k": a.top_k, "status": "complete",
-            "run_accuracies": run_accs, "avg_accuracy": avg_acc,
-            "pass_at_k": pass_at_k,
+            "run_accuracies": run_accs, "pass_at_1": pass_at_1,
+            "pass_at_k": pass_at_k, "avg_accuracy": pass_at_1,
+            "solved_count": solved_count,
         }
         with open(os.path.join(run_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
