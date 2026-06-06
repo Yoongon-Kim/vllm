@@ -37,7 +37,7 @@ MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               max_num_seqs=0, model=MODEL, basis=None, cs_h=32, n_tip=16,
-              use_radix=True):
+              use_radix=True, streaming=False):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
     # serving concurrency (stresses the buffers; Quest's are tiny, LRoSA's
@@ -60,7 +60,8 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         kw["kv_cache_dtype"] = "lrosa"
         kw["attention_config"] = {"backend": "LROSA", "lrosa_basis_path": basis,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
-                                  "lrosa_use_radix_topk": use_radix}
+                                  "lrosa_use_radix_topk": use_radix,
+                                  "lrosa_use_streaming_topk": streaming}
     elif backend == "fasa":
         idom = basis or fasa_idom_path(model)
         kw["kv_cache_dtype"] = "fasa"
@@ -100,6 +101,9 @@ def main():
                     help="FASA-fc only: # dominant FCs per kv-head.")
     ap.add_argument("--no_radix", action="store_true",
                     help="Disable DSA radix top-K (use torch.topk); needed at bsz>1 + long ctx.")
+    ap.add_argument("--streaming", action="store_true",
+                    help="LRoSA: use V2 chunk-parallel streaming top-K (no full fp32 "
+                         "scores buffer) instead of score+radix.")
     ap.add_argument("--prefill_len", type=int, default=65536)
     ap.add_argument("--decode_len", type=int, default=128)
     ap.add_argument("--n_fac", type=int, default=256)
@@ -118,7 +122,8 @@ def main():
 
     llm = build_llm(a.backend, a.prefill_len, a.decode_len, a.n_fac, a.gpu_mem,
                     a.batch_size, a.max_num_seqs, model=a.model, basis=a.basis,
-                    cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix)
+                    cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix,
+                    streaming=a.streaming)
 
     t_prefill = time_generate(llm, prompts, 1)
     t_full = time_generate(llm, prompts, 1 + a.decode_len)
