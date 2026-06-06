@@ -70,8 +70,11 @@ def build_llm(a):
     ov = yarn_overrides(a.model)
     if ov:
         kw["hf_overrides"] = ov
-    if a.mode == "lrosa":
-        basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h)
+    if a.mode in ("lrosa", "loki"):
+        # loki = same LRoSA backend (proj_K = M@K) but a PCA-only basis (no
+        # q-aware Stiefel): pca_loki_cs{N} instead of pca_d1_cs{N}.
+        variant = "loki" if a.mode == "loki" else "d1"
+        basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
         kw["kv_cache_dtype"] = "lrosa"
         ac = {
             "backend": "LROSA", "lrosa_basis_path": basis,
@@ -135,7 +138,8 @@ def eval_task(llm, tok, task, a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["fkv", "lrosa", "fasa", "quest"], default="lrosa")
+    ap.add_argument("--mode", choices=["fkv", "lrosa", "loki", "fasa", "quest"],
+                    default="lrosa")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--tasks", default="all",
                     help="comma-separated task list, or 'all' (16 EN tasks).")
