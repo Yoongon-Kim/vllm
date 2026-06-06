@@ -11,8 +11,10 @@
 #   # Qwen3-14B / Gemma 4 live in the default ~/.cache/huggingface (offline).
 #
 # Env knobs (all optional): MODEL CS_H NFAC NSAMP MAXLEN GPUMEM TASKS GPUS
-set -u
+# conda's cuda-nvcc activate.d references NVCC_PREPEND_FLAGS while unbound, so
+# enable `set -u` only AFTER activation (activate.d scripts aren't -u clean).
 source "$HOME/miniforge3/etc/profile.d/conda.sh" && conda activate vllm
+set -u
 cd /NHNHOME/jiwonsong/vllm
 export TMPDIR=/NHNHOME/jiwonsong/tmp LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}
 export VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_USE_FLASHINFER_SAMPLER=0
