@@ -5,14 +5,15 @@
 #   FKV, Quest: budget-independent -> run once (reused from the cs32 table run
 #               at /NHNHOME/jiwonsong/tmp/lb_table/<tag> if present).
 #
-# All sparse runs use --eager. The radix top-k scratch is sized by max_kv
-# (127500) and explodes during CUDA-graph capture (batch x 127500 x f32) -> OOM
-# even at gpu_mem 0.80. Eager skips graph capture and keeps the scratch at
-# real-batch size; F1 is identical to graph mode (graphs are a latency-only
-# optimization).
+# The LRoSA/FASA decode score+radix scratch is sized by max_num_seqs * max_kv.
+# vLLM's default max_num_seqs=1024 makes it explode at 127500 ctx -> OOM in both
+# CUDA-graph capture and inference, even though only ~5 seqs fit. Capping
+# MAXSEQS (default 8) + gpu_mem 0.65 shrinks it so CUDA graphs capture AND decode
+# fit (verified). Set EAGER=1 to disable graphs (F1 identical; graphs are a
+# latency-only optimization).
 #
 # Usage:  MODEL=Qwen/Qwen3-14B bash run_longbench_sweep.sh
-# Env:    MODEL CS_LIST NSAMP MAXLEN GPUMEM TASKS GPUS HEARTBEAT NFAC
+# Env:    MODEL CS_LIST NSAMP MAXLEN GPUMEM MAXSEQS EAGER TASKS GPUS HEARTBEAT NFAC
 source "$HOME/miniforge3/etc/profile.d/conda.sh" && conda activate vllm
 set -u
 PY="${PY:-$HOME/miniforge3/envs/vllm/bin/python}"
@@ -23,7 +24,11 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 
 MODEL=${MODEL:-Qwen/Qwen3-14B}
 NFAC=${NFAC:-256}; NSAMP=${NSAMP:-200}; MAXLEN=${MAXLEN:-127500}
-GPUMEM=${GPUMEM:-0.80}; TASKS=${TASKS:-all}; HEARTBEAT=${HEARTBEAT:-60}
+GPUMEM=${GPUMEM:-0.65}; TASKS=${TASKS:-all}; HEARTBEAT=${HEARTBEAT:-60}
+MAXSEQS=${MAXSEQS:-8}        # cap concurrent seqs: bounds the max_kv-sized score
+                            # /radix decode scratch so CUDA graphs capture AND
+                            # decode fit at 127500 ctx (vLLM default 1024 OOMs).
+EAGER=${EAGER:-0}           # 1 -> add --eager (graphs off); default keeps graphs.
 read -r -a CS_LIST <<< "${CS_LIST:-4 8 16 32}"
 read -r -a GPUS <<< "${GPUS:-0 1 2 3}"
 
@@ -63,10 +68,11 @@ run_one() {  # label mode cs nt gpu
   local label=$1 mode=$2 cs=$3 nt=$4 g=$5 extra=""
   [ "$mode" = lrosa ] && extra="--cs_h $cs"
   [ "$mode" = fasa ]  && extra="--n_tip $nt"
+  [ "$EAGER" = 1 ]    && extra="$extra --eager"
   CUDA_VISIBLE_DEVICES=$g VLLM_CACHE_ROOT="$HOME/.cache/sw_${TAG}_${label}" \
     "$PY" longbench_vllm_eval.py --mode "$mode" --model "$MODEL" --tasks "$TASKS" \
       --num_samples "$NSAMP" --n_fac "$NFAC" --max_input_len "$MAXLEN" \
-      --gpu_mem "$GPUMEM" --eager $extra --output "$OUT/$label.json" \
+      --gpu_mem "$GPUMEM" --max_num_seqs "$MAXSEQS" $extra --output "$OUT/$label.json" \
       > "$OUT/$label.log" 2>&1
 }
 
