@@ -75,7 +75,7 @@ echo "=== ${#jobs[@]} jobs (of ${#all_jobs[@]}) across ${#GPUS[@]} GPUs ==="
 
 run_one() {  # label mode cs nt gpu
   local label=$1 mode=$2 cs=$3 nt=$4 g=$5 extra=""
-  [ "$mode" = lrosa ] && extra="--cs_h $cs"
+  case "$mode" in lrosa|loki) extra="--cs_h $cs";; esac   # loki also needs cs_h!
   [ "$mode" = fasa ]  && extra="--n_tip $nt"
   [ "$EAGER" = 1 ]    && extra="$extra --eager"
   CUDA_VISIBLE_DEVICES=$g VLLM_CACHE_ROOT="$HOME/.cache/sw_${TAG}_${label}" \
