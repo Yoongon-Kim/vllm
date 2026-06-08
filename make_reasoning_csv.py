@@ -23,6 +23,8 @@ for ev in EVALS:
             j = json.load(open(f))
         except Exception:
             continue
+        if j.get("engine") != "vllm":   # skip stale/transformers-format summaries
+            continue
         mode = j.get("mode", "?")
         budget = "-" if mode == "fkv" else j.get("n_fac", "?")
         rows.append({
