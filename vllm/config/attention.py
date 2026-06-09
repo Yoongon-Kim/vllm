@@ -110,6 +110,16 @@ class AttentionConfig:
     proj_K quantizes far better than FASA's K_sel; see paper). Mirrors DSA's fp8
     index logits. ~1.16x on the score kernel alone."""
 
+    lrosa_mla: bool = False
+    """Apply LRoSA token selection to an MLA model (e.g. GLM-4.7-Flash) by
+    scoring the latent c_KV with the calibrated rotation M (M:[1, cs_h,
+    kv_lora_rank]) instead of per-head K. Routes the MLA layer through the
+    existing FLASHMLA_SPARSE attend: an LRoSAMLAIndexer writes the top-``lrosa_n_fac``
+    token indices into the shared topk_indices_buffer. Reuses ``lrosa_basis_path``
+    / ``lrosa_n_fac`` / ``lrosa_cs_h`` (cs_h ≈ 25%% of the latent's K-share =
+    kv_lora_rank/2; 64 for GLM-4.7-Flash's 512 latent, iso-overhead with the
+    KV cache). Appendix / eager+bf16 only; FKV is plain dense MLA (this flag off)."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

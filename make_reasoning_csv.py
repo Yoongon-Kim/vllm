@@ -14,7 +14,7 @@ import sys
 PCA = "/NHNHOME/jiwonsong/LRoSA-dev"
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "Qwen3-8B"
 EVALS = ["aime25", "math500", "gpqa"]
-ORDER = {"fkv": 0, "lrosa": 1, "loki": 2, "quest": 3, "fasa": 4}
+ORDER = {"fkv": 0, "lrosa": 1, "loki": 2, "quest": 3, "fasa": 4, "seer": 5}
 
 rows = []
 for ev in EVALS:
@@ -23,7 +23,7 @@ for ev in EVALS:
             j = json.load(open(f))
         except Exception:
             continue
-        if j.get("engine") != "vllm":   # skip stale/transformers-format summaries
+        if j.get("engine") not in ("vllm", "seer"):  # skip stale transformers fmt
             continue
         mode = j.get("mode", "?")
         budget = "-" if mode == "fkv" else j.get("n_fac", "?")

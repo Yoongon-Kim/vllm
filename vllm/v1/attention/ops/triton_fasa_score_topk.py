@@ -52,6 +52,7 @@ def _fasa_score_kernel(
     scores_stride_r,
     scores_stride_h,
     window,
+    recent_w,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -99,6 +100,11 @@ def _fasa_score_kernel(
     ).to(tl.float32)
 
     score = tl.sum(K_vals * qs[None, :], axis=1)  # [BLOCK_T]
+    # Recency-keep: bias last recent_w in-seq positions into the top-K (mirrors
+    # LRoSA so FASA gets the same recency prior — fair comparison). recent_w=0 →
+    # predicate contradicts in_seq → no-op.
+    recent_keep = (t_offs >= seq_len - recent_w) & in_seq
+    score = tl.where(recent_keep, score + 1e4, score)
     score = tl.where(in_seq, score, float("-inf"))
 
     out_off = pid_r * scores_stride_r + pid_h * scores_stride_h + t_offs
@@ -114,6 +120,7 @@ def fasa_score(
     block_t: int = 64,
     scores_out: torch.Tensor | None = None,
     window: int = 0,
+    recent_w: int = 0,
 ) -> torch.Tensor:
     """Score every cached position via the I_dom channel-gathered dot.
     ``window`` > 0 restricts to the last ``window`` positions; 0 = full."""
@@ -155,6 +162,7 @@ def fasa_score(
         scores.stride(0),
         scores.stride(1),
         win_eff,
+        recent_w,
         BLOCK_T=BLOCK_T,
         BLOCK_C=BLOCK_C,
     )
@@ -173,12 +181,13 @@ def fasa_score_topk(
     top_scores_out: torch.Tensor | None = None,
     use_radix: bool = True,
     window: int = 0,
+    recent_w: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FASA-fc score -> top-K. Returns (top_idx, top_scores) shaped
     (num_reqs, H_kv, k), k = min(n_fac, max_kv_len). Mirrors lrosa_score_topk."""
     scores = fasa_score(
         q_kv, kv_cache, block_table, seq_lens, ch,
-        scores_out=scores_out, window=window,
+        scores_out=scores_out, window=window, recent_w=recent_w,
     )
     k = min(n_fac, scores.shape[-1])
     use_radix_eff = use_radix and _radix_topk_available()

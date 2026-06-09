@@ -124,7 +124,19 @@ def build_llm(a):
         native = getattr(AutoConfig.from_pretrained(a.model),
                           "max_position_embeddings", want_len)
         kw["max_model_len"] = min(want_len, native)
-    if a.mode in ("lrosa", "loki"):
+    if a.mode == "lrosa_mla":
+        # LRoSA on an MLA model (GLM-4.7-Flash): score the latent c_KV via the
+        # calibrated rotation M -> top-k drives the FLASHMLA_SPARSE attend. MLA keeps
+        # its own latent cache, so NO kv_cache_dtype override (unlike the GQA path).
+        basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant="d1")
+        kw["attention_config"] = {"lrosa_mla": True, "lrosa_basis_path": basis,
+                                  "lrosa_n_fac": a.n_fac, "lrosa_cs_h": a.cs_h}
+        # FlashMLASparse bf16 prefill requires num_heads | 64/128; GLM-4.7-Flash's
+        # 20 heads only fit the fp8 mixed-batch path -> use fp8_ds_mla for the
+        # (latent) KV cache. This is orthogonal to LRoSA's own bf16 proj_K cache;
+        # fp8 KV is the standard MLA serving precision. Override with --mla_kv_dtype.
+        kw["kv_cache_dtype"] = a.mla_kv_dtype
+    elif a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
         kw["kv_cache_dtype"] = "lrosa"
@@ -144,6 +156,10 @@ def build_llm(a):
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST", "quest_token_budget": a.n_fac}
     # fkv: dense default.
+    if a.mla_backend:  # force/merge a specific MLA backend (head-count workaround)
+        ac = kw.get("attention_config") or {}
+        ac["backend"] = a.mla_backend
+        kw["attention_config"] = ac
     return LLM(**kw)
 
 
@@ -160,8 +176,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
-                    choices=["fkv", "lrosa", "loki", "fasa", "quest"])
+                    choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--mla_backend", default=None,
+                    help="Force the MLA attention backend (attention_config.backend). "
+                         "GLM-4.7-Flash has 20 heads which the trtllm FMHA "
+                         "(FLASHINFER_MLA / _SPARSE) rejects -> use TRITON_MLA for fkv, "
+                         "FLASHMLA_SPARSE for lrosa_mla (both head-count agnostic).")
+    ap.add_argument("--mla_kv_dtype", default="fp8_ds_mla",
+                    help="KV cache dtype for the lrosa_mla path. fp8_ds_mla enables "
+                         "FlashMLASparse's mixed-batch prefill (the only path that "
+                         "fits GLM's 20 heads). Set 'auto' for bf16 (fails on <32 heads "
+                         "not dividing 128).")
     ap.add_argument("--num_samples", type=int, default=0, help="0 = all")
     ap.add_argument("--num_runs", type=int, default=1, help="attempts/problem (pass@1 avg)")
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -207,6 +233,8 @@ def main():
     if a.run_name is None:
         if a.mode in ("lrosa", "loki"):  # _fp8 only where fp8 actually applies
             a.run_name = f"{a.mode}_cs{a.cs_h}" + ("_fp8" if a.fp8_projk else "")
+        elif a.mode == "lrosa_mla":
+            a.run_name = f"lrosa_mla_cs{a.cs_h}"
         elif a.mode == "fasa":
             a.run_name = f"fasa_nt{a.n_tip}"
         else:  # fkv / quest: fp8 is ignored, no _fp8 suffix

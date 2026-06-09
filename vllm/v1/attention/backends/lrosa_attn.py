@@ -18,6 +18,7 @@ Step 4b: CUDA-Graph-friendly decode path
            ``UNIFORM_SINGLE_TOKEN_DECODE``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -645,6 +646,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self.logits_soft_cap = 0 if logits_soft_cap is None else logits_soft_cap
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        # Recency-keep (env LROSA_RECENT_KEEP_W>0): force the last W cached
+        # positions into the top-K budget by biasing their selection score
+        # (iso-budget — W recent + (n_fac-W) content). Applies to both the LRoSA
+        # (proj_K) and FASA (I_dom-channel) score kernels so the recency prior is
+        # identical for a fair comparison. 0 = off (paper default). Mirrors the
+        # MLA indexer's LROSA_MLA_RECENT_W knob.
+        self.recent_keep_w = int(os.environ.get("LROSA_RECENT_KEEP_W", "0"))
 
     def _ensure_on_device(
         self, layer: torch.nn.Module, device: torch.device, dtype: torch.dtype
@@ -1042,6 +1050,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 top_scores_out=attn_metadata.top_scores_buf,
                 use_radix=self.use_radix_topk,
                 window=window,
+                recent_w=self.recent_keep_w,
             )
         else:
             # proj_q[r,h,c] = Σ_d q_kv[r,h,d]·M[h,c,d]  — per-kv-head bmm into
@@ -1094,6 +1103,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     use_radix=True,
                     window=window,
                     projk_cache=self._projk_cache,
+                    recent_w=self.recent_keep_w,
                 )  # (num_decodes, H_kv, n_fac_eff) int32
             else:
                 top_idx, _ = lrosa_score_topk(
@@ -1109,6 +1119,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     top_scores_out=attn_metadata.top_scores_buf,
                     window=window,
                     projk_cache=self._projk_cache,
+                    recent_w=self.recent_keep_w,
                 )  # (nd, H_kv, n_fac_eff) int64 CG path; int32 fallback
 
         K_sel, V_sel = lrosa_gather(

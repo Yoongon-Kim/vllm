@@ -295,7 +295,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             FlashMLASparseImpl._compute_fp8_decode_padded_heads(self.num_heads)
         )
 
-        self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        # LRoSA-on-MLA models have no native DSA `index_topk`; the selection
+        # budget is the configured lrosa_n_fac (LRoSAMLAIndexer writes that many).
+        self.topk_tokens = getattr(
+            vllm_config.model_config.hf_config, "index_topk", None)
+        if self.topk_tokens is None:
+            self.topk_tokens = vllm_config.attention_config.lrosa_n_fac
         self.use_fp8_kv_cache = cache_config.cache_dtype == "fp8_ds_mla"
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Shape: [max_num_seqs], all elements = topk_tokens (constant for full-CG)

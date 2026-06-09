@@ -43,6 +43,7 @@ def _lrosa_score_kernel(
     scores_stride_r,
     scores_stride_h,
     window,
+    recent_w,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -93,6 +94,12 @@ def _lrosa_score_kernel(
     ).to(tl.float32)
 
     score = tl.sum(proj_K * pq[None, :], axis=1)  # [BLOCK_T]
+    # Recency-keep: force the last ``recent_w`` in-seq positions into the top-K
+    # by adding a large finite bias before selection (iso-budget — they occupy
+    # recent_w of the n_fac slots, the rest go to content). recent_w=0 makes the
+    # predicate (t_offs >= seq_len) contradict in_seq (t_offs < seq_len) → no-op.
+    recent_keep = (t_offs >= seq_len - recent_w) & in_seq
+    score = tl.where(recent_keep, score + 1e4, score)
     score = tl.where(in_seq, score, float("-inf"))
 
     out_off = pid_r * scores_stride_r + pid_h * scores_stride_h + t_offs
@@ -114,6 +121,7 @@ def _lrosa_score_contig_kernel(
     bt_stride_r,
     scores_stride_r, scores_stride_h,
     window,
+    recent_w,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -153,6 +161,9 @@ def _lrosa_score_contig_kernel(
     ).to(tl.float32)
 
     score = tl.sum(proj_K * pq[None, :], axis=1)
+    # Recency-keep (see _lrosa_score_kernel): bias last recent_w in-seq positions.
+    recent_keep = (t_offs >= seq_len - recent_w) & in_seq
+    score = tl.where(recent_keep, score + 1e4, score)
     score = tl.where(in_seq, score, float("-inf"))
     out_off = pid_r * scores_stride_r + pid_h * scores_stride_h + t_offs
     tl.store(scores_ptr + out_off, score, mask=in_range)
@@ -267,6 +278,7 @@ def _launch_score_kernel(
     cs_h: int,
     block_t: int,
     window: int = 0,
+    recent_w: int = 0,
 ) -> None:
     num_reqs, H_kv, _ = proj_q.shape
     block_size = kv_cache.shape[1]
@@ -298,6 +310,7 @@ def _launch_score_kernel(
         scores.stride(0),
         scores.stride(1),
         win_eff,
+        recent_w,
         BLOCK_T=BLOCK_T,
         BLOCK_C=BLOCK_C,
     )
@@ -314,6 +327,7 @@ def lrosa_score(
     scores_out: torch.Tensor | None = None,
     window: int = 0,
     projk_cache: torch.Tensor | None = None,
+    recent_w: int = 0,
 ) -> torch.Tensor:
     """Compute scores for every cached KV position.
 
@@ -354,7 +368,7 @@ def lrosa_score(
             proj_q.stride(0), proj_q.stride(1),
             projk_cache.stride(0), projk_cache.stride(1), projk_cache.stride(2),
             block_table.stride(0), scores.stride(0), scores.stride(1),
-            win_eff, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C,
+            win_eff, recent_w, BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C,
         )
         return scores
 
@@ -368,6 +382,7 @@ def lrosa_score(
         cs_h,
         block_t,
         window=window,
+        recent_w=recent_w,
     )
     return scores
 
@@ -519,6 +534,7 @@ def lrosa_score_topk(
     use_radix: bool = False,
     window: int = 0,
     projk_cache: torch.Tensor | None = None,
+    recent_w: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score → top-K. ``window`` > 0 restricts selection to the last
     ``window`` positions (sliding-window layers); 0 = full attention.
@@ -542,6 +558,7 @@ def lrosa_score_topk(
         scores_out=scores_out,
         window=window,
         projk_cache=projk_cache,
+        recent_w=recent_w,
     )
     k = min(n_fac, scores.shape[-1])
 

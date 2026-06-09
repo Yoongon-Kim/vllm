@@ -1022,6 +1022,35 @@ class DeepseekV2MLAAttention(nn.Module):
             self.indexer_rope_emb = None
             self.indexer = None
 
+        # LRoSA-on-MLA (appendix): when no native DSA indexer, optionally swap in a
+        # learned-rotation latent scorer that drives the same FLASHMLA_SPARSE attend.
+        if not self.is_v32 and getattr(
+            vllm_config.attention_config, "lrosa_mla", False
+        ):
+            from vllm.model_executor.layers.lrosa_mla_indexer import LRoSAMLAIndexer
+
+            ac = vllm_config.attention_config
+            cs_h = ac.lrosa_cs_h or (config.kv_lora_rank // 8)
+            self.indexer = LRoSAMLAIndexer(
+                vllm_config=vllm_config,
+                config=config,
+                cache_config=cache_config,
+                fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
+                kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
+                q_b_proj=getattr(self, "q_b_proj", None),
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                rotary_emb=self.rotary_emb,
+                q_lora_rank=self.q_lora_rank,
+                basis_path=ac.lrosa_basis_path,
+                cs_h=cs_h,
+                n_fac=ac.lrosa_n_fac,
+                topk_indices_buffer=topk_indices_buffer,
+                prefix=f"{prefix}.lrosa_indexer",
+            )
+            self.indexer_rope_emb = None  # LRoSAMLAIndexer uses self.rotary_emb
+            self.is_v32 = True  # route the MLA layer through the sparse attend + buffer
+
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
