@@ -75,10 +75,11 @@ echo "=== ${#jobs[@]} jobs (of ${#all_jobs[@]}) across ${#GPUS[@]} GPUs ==="
 
 run_one() {  # label mode cs nt gpu
   local label=$1 mode=$2 cs=$3 nt=$4 g=$5 extra=""
-  case "$mode" in lrosa|loki) extra="--cs_h $cs";; esac   # loki also needs cs_h!
+  # bf16 logit/score by default here (FP8PROJK="--fp8_projk" to switch back to fp8).
+  case "$mode" in lrosa|loki) extra="--cs_h $cs ${FP8PROJK:---no-fp8_projk}";; esac   # loki also needs cs_h!
   [ "$mode" = fasa ]  && extra="--n_tip $nt"
   [ "$EAGER" = 1 ]    && extra="$extra --eager"
-  CUDA_VISIBLE_DEVICES=$g VLLM_CACHE_ROOT="$HOME/.cache/sw_${TAG}_${label}" \
+  CUDA_VISIBLE_DEVICES=$g VLLM_PORT=$((46000 + g * 200)) VLLM_CACHE_ROOT="$HOME/.cache/sw_${TAG}_${label}" \
     "$PY" longbench_vllm_eval.py --mode "$mode" --model "$MODEL" --tasks "$TASKS" \
       --num_samples "$NSAMP" --n_fac "$NFAC" --max_input_len "$MAXLEN" \
       --gpu_mem "$GPUMEM" --max_num_seqs "$MAXSEQS" $extra --output "$OUT/$label.json" \
