@@ -12,9 +12,12 @@ that offsets LRoSA's +10.8 AIME reasoning win? Only a same-stack
 measurement settles it.
 
 Cache layout — block == page (block_size forced to page_size):
-    slot per (token, kv-head): [ K(hs) | V(hs) | K_min(hs) | K_max(hs) ]
-    slot_size = 4 * head_size. K_min/K_max are the page's per-channel
-    min/max, kept ONLY at the block's representative slot (position 0).
+    per-token slot per (token, kv-head): [ K(hs) | V(hs) ], slot_size = 2*hs.
+    Per-page K_min/K_max live in a SEPARATE backend-managed buffer
+    ``layer._quest_minmax`` of shape (num_blocks, H_kv, 2*head_size)
+    ([:hs]=min, [hs:]=max), indexed by physical block id. This matches the
+    original MIT Quest layout and cuts Quest KV memory from ~2.0x dense
+    (old 4*hs slot, 15/16 of the min/max region wasted) to ~1.06x dense.
 
 Decode path (CG-captured, all-decode batch):
   1. fold the new decode K into its block's running min/max
@@ -122,13 +125,14 @@ class QuestAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # Combined slot: [ K | V | K_min | K_max ].
+        # Per-token slot: [ K | V ]. Page min/max live in a SEPARATE
+        # backend-managed per-page buffer (see QuestImpl), not in the slot.
         if block_size != _QUEST_PAGE_SIZE:
             raise ValueError(
                 f"Quest: block_size must equal page_size ({_QUEST_PAGE_SIZE}); "
                 f"got {block_size}."
             )
-        slot_size = 4 * head_size
+        slot_size = 2 * head_size
         return (num_blocks, block_size, num_kv_heads, slot_size)
 
     @classmethod
@@ -355,7 +359,7 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
-        self.slot_size = 4 * head_size
+        self.slot_size = 2 * head_size
         self.kv_cache_dtype = kv_cache_dtype
 
         vllm_config = get_current_vllm_config()
@@ -443,12 +447,24 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             )
             return output
 
+        # Per-page min/max buffer (backend-managed, separate from the 2*hs
+        # per-token slot). Lazily allocated on the first forward — which runs
+        # during warmup BEFORE CUDA-graph capture — so its address is stable
+        # for graph replay (mark_static_address). Indexed by physical block id.
+        minmax = getattr(layer, "_quest_minmax", None)
+        if minmax is None:
+            minmax = torch.zeros(
+                kv_cache.shape[0], self.num_kv_heads, 2 * head_size,
+                dtype=kv_cache.dtype, device=kv_cache.device)
+            layer._quest_minmax = minmax
+            torch._dynamo.mark_static_address(minmax)
+
         # Mixed / all-prefill: build prefill page min/max, then dense flash.
         if num_decodes == 0 or num_decode_tokens < num_actual_tokens:
             if num_decodes > 0:
                 # Decode portion: fold the new K + run the sparse page path.
                 self._sparse_decode_forward(
-                    query=query, key=key, kv_cache=kv_cache,
+                    query=query, key=key, kv_cache=kv_cache, minmax=minmax,
                     attn_metadata=attn_metadata, output=output,
                     head_size=head_size, page_size=page_size,
                 )
@@ -456,7 +472,7 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             # Build per-full-page min/max for each prefill request so its
             # later decode steps have valid metadata.
             self._build_prefill_minmax(
-                key, kv_cache, attn_metadata, head_size, page_size,
+                key, kv_cache, minmax, attn_metadata, head_size, page_size,
                 num_decodes, num_decode_tokens)
 
             # Dense flash over the prefill rows. head_dim>256 (Gemma 4 full
@@ -500,14 +516,14 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
 
         # All-decode (CG-captured): sparse page path always runs.
         self._sparse_decode_forward(
-            query=query, key=key, kv_cache=kv_cache,
+            query=query, key=key, kv_cache=kv_cache, minmax=minmax,
             attn_metadata=attn_metadata, output=output,
             head_size=head_size, page_size=page_size,
         )
         return output
 
     def _build_prefill_minmax(
-        self, key, kv_cache, attn_metadata, head_size, page_size,
+        self, key, kv_cache, minmax, attn_metadata, head_size, page_size,
         num_decodes, num_decode_tokens,
     ) -> None:
         """Per-request prefill page min/max build (PyTorch loop; not CG /
@@ -528,12 +544,13 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             start_pos = seq_len - plen  # absolute pos of key[q0] (chunked prefill)
             key_i = key[q0:q1].view(plen, self.num_kv_heads, head_size)
             quest_build_page_minmax_prefill(
-                key_i, kv_cache, block_table[i], page_size, head_size,
+                key_i, kv_cache, minmax, block_table[i], page_size, head_size,
                 prefill_start_pos=max(start_pos, 0),
             )
 
     def _sparse_decode_forward(
-        self, query, key, kv_cache, attn_metadata, output, head_size, page_size,
+        self, query, key, kv_cache, minmax, attn_metadata, output, head_size,
+        page_size,
     ) -> None:
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
@@ -547,7 +564,7 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
         key_dec = key[:num_decode_tokens].view(
             num_decodes, self.num_kv_heads, head_size)
         quest_minmax_update(
-            key_dec, kv_cache, block_table_dec, seq_lens_dec,
+            key_dec, minmax, block_table_dec, seq_lens_dec,
             head_size, page_size)
 
         # 2. GQA group-mean query → per-kv-head, then page upper-bound score.
@@ -556,7 +573,7 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             num_decodes, self.num_kv_heads, self.num_kv_groups, head_size
         ).mean(dim=2)  # (nd, H_kv, hs)
         scores = quest_page_score(
-            q_kv, kv_cache, block_table_dec, seq_lens_dec,
+            q_kv, minmax, block_table_dec, seq_lens_dec,
             page_size, head_size, scores_out=attn_metadata.scores_buf)
 
         # 3. Page top-K. num_full = (seq_len-1)//page_size selectable pages.

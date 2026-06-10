@@ -15,14 +15,19 @@ combined-slot cache so LRoSA and Quest can be compared in the *same*
 CUDA-graph + flash-attn stack.
 
 Cache layout (block == page; block_size == page_size):
-    slot per (token, kv-head):
-      elems:   0────hs────2*hs────3*hs────4*hs
-      content: [   K   |   V   | K_min | K_max ]
-    K_min / K_max are the page's per-channel min/max, stored ONCE at the
-    block's representative slot (position 0). The other 15 positions'
-    min/max bytes are slack — this trades cache memory for backend
-    drop-in simplicity (a single cache tensor, no model edits). Acceptable
-    for the latency/quality comparison this backend exists to run.
+    per-token slot per (token, kv-head):
+      elems:   0────hs────2*hs
+      content: [   K   |   V   ]
+      slot_size = 2 * head_size.
+    Per-page min/max live in a SEPARATE backend-managed buffer
+    ``minmax`` of shape (num_blocks, H_kv, 2*head_size):
+      elems:   0──────head_size──────2*head_size
+      content: [    K_min     |     K_max     ]
+    indexed by physical block id (the same ids used in block_table) — so
+    it moves with the block content (CUDA-graph- and prefix-cache-safe).
+    This matches the original MIT Quest layout and cuts Quest KV memory
+    from ~2.0x dense to ~1.06x dense (vs the old 4*head_size slot that
+    wasted 15/16 of the min/max region).
 
 Three pieces:
   1. ``quest_minmax_update`` — decode running min/max into the repr slot.
@@ -49,16 +54,15 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _quest_minmax_update_kernel(
     key_ptr,            # [num_decodes, H_kv, head_size]  new decode K (post-RoPE)
-    kv_cache_ptr,       # [num_blocks, block_size, H_kv, slot_size]
+    minmax_ptr,         # [num_blocks, H_kv, 2*head_size]  page min|max buffer
     block_table_ptr,    # [num_decodes, max_blocks]
     seq_lens_ptr,       # [num_decodes]  int32 — length INCLUDING the new token
     head_size,
     page_size,
     key_stride_t,
     key_stride_h,
-    cache_stride_block,
-    cache_stride_pos,
-    cache_stride_head,
+    mm_stride_block,
+    mm_stride_head,
     bt_stride_r,
     BLOCK_D: tl.constexpr,
 ):
@@ -76,25 +80,25 @@ def _quest_minmax_update_kernel(
     k = tl.load(key_ptr + r * key_stride_t + h * key_stride_h + d, mask=dmask,
                 other=0.0)
 
-    repr_base = (phys_block * cache_stride_block
-                 + h * cache_stride_head)   # block position 0 ⇒ no pos term
-    min_off = repr_base + 2 * head_size + d
-    max_off = repr_base + 3 * head_size + d
+    # Per-page min|max buffer: [min(head_size) | max(head_size)] per (block, head).
+    mm_base = phys_block * mm_stride_block + h * mm_stride_head
+    min_off = mm_base + d
+    max_off = mm_base + head_size + d
 
     if pos == 0:
         # First token of a fresh block: min = max = K.
-        tl.store(kv_cache_ptr + min_off, k, mask=dmask)
-        tl.store(kv_cache_ptr + max_off, k, mask=dmask)
+        tl.store(minmax_ptr + min_off, k, mask=dmask)
+        tl.store(minmax_ptr + max_off, k, mask=dmask)
     else:
-        cur_min = tl.load(kv_cache_ptr + min_off, mask=dmask, other=0.0)
-        cur_max = tl.load(kv_cache_ptr + max_off, mask=dmask, other=0.0)
-        tl.store(kv_cache_ptr + min_off, tl.minimum(cur_min, k), mask=dmask)
-        tl.store(kv_cache_ptr + max_off, tl.maximum(cur_max, k), mask=dmask)
+        cur_min = tl.load(minmax_ptr + min_off, mask=dmask, other=0.0)
+        cur_max = tl.load(minmax_ptr + max_off, mask=dmask, other=0.0)
+        tl.store(minmax_ptr + min_off, tl.minimum(cur_min, k), mask=dmask)
+        tl.store(minmax_ptr + max_off, tl.maximum(cur_max, k), mask=dmask)
 
 
 def quest_minmax_update(
     key: torch.Tensor,          # (num_decodes, H_kv, head_size)
-    kv_cache: torch.Tensor,     # (num_blocks, block_size, H_kv, slot_size)
+    minmax: torch.Tensor,       # (num_blocks, H_kv, 2*head_size)  page min|max
     block_table: torch.Tensor,  # (num_decodes, max_blocks)
     seq_lens: torch.Tensor,     # (num_decodes,)  length including the new token
     head_size: int,
@@ -106,10 +110,10 @@ def quest_minmax_update(
         return
     BLOCK_D = triton.next_power_of_2(head_size)
     _quest_minmax_update_kernel[(num_decodes, H_kv)](
-        key, kv_cache, block_table, seq_lens,
+        key, minmax, block_table, seq_lens,
         head_size, page_size,
         key.stride(0), key.stride(1),
-        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        minmax.stride(0), minmax.stride(1),
         block_table.stride(0),
         BLOCK_D=BLOCK_D,
     )
@@ -120,16 +124,15 @@ def quest_minmax_update(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _quest_scatter_minmax_kernel(
-    minmax_ptr,         # [num_pages_total, H_kv, 2, head_size]  (min,max packed)
-    kv_cache_ptr,       # [num_blocks, block_size, H_kv, slot_size]
+    src_ptr,            # [num_pages_total, H_kv, 2, head_size]  (min,max packed)
+    minmax_ptr,         # [num_blocks, H_kv, 2*head_size]  page min|max buffer
     page_block_ptr,     # [num_pages_total]  physical block id of each page row
     head_size,
-    cache_stride_block,
-    cache_stride_pos,
-    cache_stride_head,
-    mm_stride_p,
-    mm_stride_h,
-    mm_stride_x,
+    mm_stride_block,
+    mm_stride_head,
+    src_stride_p,
+    src_stride_h,
+    src_stride_x,
     BLOCK_D: tl.constexpr,
 ):
     p = tl.program_id(0)
@@ -138,19 +141,20 @@ def _quest_scatter_minmax_kernel(
     d = tl.arange(0, BLOCK_D)
     dmask = d < head_size
 
-    kmin = tl.load(minmax_ptr + p * mm_stride_p + h * mm_stride_h
-                   + 0 * mm_stride_x + d, mask=dmask, other=0.0)
-    kmax = tl.load(minmax_ptr + p * mm_stride_p + h * mm_stride_h
-                   + 1 * mm_stride_x + d, mask=dmask, other=0.0)
+    kmin = tl.load(src_ptr + p * src_stride_p + h * src_stride_h
+                   + 0 * src_stride_x + d, mask=dmask, other=0.0)
+    kmax = tl.load(src_ptr + p * src_stride_p + h * src_stride_h
+                   + 1 * src_stride_x + d, mask=dmask, other=0.0)
 
-    repr_base = phys_block * cache_stride_block + h * cache_stride_head
-    tl.store(kv_cache_ptr + repr_base + 2 * head_size + d, kmin, mask=dmask)
-    tl.store(kv_cache_ptr + repr_base + 3 * head_size + d, kmax, mask=dmask)
+    mm_base = phys_block * mm_stride_block + h * mm_stride_head
+    tl.store(minmax_ptr + mm_base + d, kmin, mask=dmask)
+    tl.store(minmax_ptr + mm_base + head_size + d, kmax, mask=dmask)
 
 
 def quest_build_page_minmax_prefill(
     key: torch.Tensor,          # (prefill_len, H_kv, head_size)  one request
     kv_cache: torch.Tensor,
+    minmax: torch.Tensor,       # (num_blocks, H_kv, 2*head_size)  page min|max
     block_table_row: torch.Tensor,  # (max_blocks,) physical block ids for this req
     page_size: int,
     head_size: int,
@@ -188,28 +192,30 @@ def quest_build_page_minmax_prefill(
         K_full = key[lo:hi].reshape(n_full, page_size, H_kv, head_size)
         kmin = K_full.min(dim=1).values                  # (n_full, H_kv, hs)
         kmax = K_full.max(dim=1).values
-        minmax = torch.stack([kmin, kmax], dim=2).contiguous()  # (n_full,H_kv,2,hs)
+        src = torch.stack([kmin, kmax], dim=2).contiguous()  # (n_full,H_kv,2,hs)
         page_ids = block_table_row[first_full:last_full].contiguous()
         BLOCK_D = triton.next_power_of_2(head_size)
         _quest_scatter_minmax_kernel[(n_full, H_kv)](
-            minmax, kv_cache, page_ids,
+            src, minmax, page_ids,
             head_size,
-            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
-            minmax.stride(0), minmax.stride(1), minmax.stride(2),
+            minmax.stride(0), minmax.stride(1),
+            src.stride(0), src.stride(1), src.stride(2),
             BLOCK_D=BLOCK_D,
         )
     # Leading partial page (chunked prefill not starting on a boundary) and the
     # trailing partial page are handled by folding each of their tokens via the
     # running-update path. For the common from-scratch prefill, only a trailing
     # partial page exists; fold it here so decode can extend it.
-    _fold_partial_pages(key, kv_cache, block_table_row, page_size, head_size,
+    _fold_partial_pages(key, minmax, block_table_row, page_size, head_size,
                         prefill_start_pos, first_full, last_full)
 
 
-def _fold_partial_pages(key, kv_cache, block_table_row, page_size, head_size,
+def _fold_partial_pages(key, minmax, block_table_row, page_size, head_size,
                         prefill_start_pos, first_full, last_full):
-    """Fold leading/trailing partial-page tokens into their repr slots with a
-    per-token running min/max (PyTorch; prefill is not perf-critical)."""
+    """Fold leading/trailing partial-page tokens into their per-page min/max
+    buffer with a per-token running min/max (PyTorch; prefill not perf-critical).
+
+    ``minmax`` is (num_blocks, H_kv, 2*head_size): [:head_size]=min, [head_size:]=max."""
     prefill_len, H_kv, _ = key.shape
     abs_end = prefill_start_pos + prefill_len
     # Trailing partial page: [last_full*ps, abs_end)
@@ -220,8 +226,8 @@ def _fold_partial_pages(key, kv_cache, block_table_row, page_size, head_size,
         kmin = K_part.min(dim=0).values                 # (H_kv, hs)
         kmax = K_part.max(dim=0).values
         phys = int(block_table_row[last_full].item())
-        kv_cache[phys, 0, :, 2 * head_size:3 * head_size] = kmin.to(kv_cache.dtype)
-        kv_cache[phys, 0, :, 3 * head_size:4 * head_size] = kmax.to(kv_cache.dtype)
+        minmax[phys, :, :head_size] = kmin.to(minmax.dtype)
+        minmax[phys, :, head_size:2 * head_size] = kmax.to(minmax.dtype)
     # Leading partial page (only for chunked prefill mid-page starts).
     lead_hi_abs = first_full * page_size
     if prefill_start_pos < lead_hi_abs and prefill_start_pos < abs_end:
@@ -233,12 +239,12 @@ def _fold_partial_pages(key, kv_cache, block_table_row, page_size, head_size,
             kmax = K_part.max(dim=0).values
             phys = int(block_table_row[page].item())
             # Fold with any existing repr (a previous chunk may have written it).
-            ex_min = kv_cache[phys, 0, :, 2 * head_size:3 * head_size]
-            ex_max = kv_cache[phys, 0, :, 3 * head_size:4 * head_size]
-            kv_cache[phys, 0, :, 2 * head_size:3 * head_size] = torch.minimum(
-                ex_min, kmin.to(kv_cache.dtype))
-            kv_cache[phys, 0, :, 3 * head_size:4 * head_size] = torch.maximum(
-                ex_max, kmax.to(kv_cache.dtype))
+            ex_min = minmax[phys, :, :head_size]
+            ex_max = minmax[phys, :, head_size:2 * head_size]
+            minmax[phys, :, :head_size] = torch.minimum(
+                ex_min, kmin.to(minmax.dtype))
+            minmax[phys, :, head_size:2 * head_size] = torch.maximum(
+                ex_max, kmax.to(minmax.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +253,7 @@ def _fold_partial_pages(key, kv_cache, block_table_row, page_size, head_size,
 @triton.jit
 def _quest_page_score_kernel(
     q_ptr,              # [num_reqs, H_kv, head_size]  group-mean query (per kv-head)
-    kv_cache_ptr,       # [num_blocks, block_size, H_kv, slot_size]
+    minmax_ptr,         # [num_blocks, H_kv, 2*head_size]  page min|max buffer
     block_table_ptr,    # [num_reqs, max_blocks]
     seq_lens_ptr,       # [num_reqs]
     scores_ptr,         # [num_reqs, H_kv, max_pages]  fp32
@@ -256,9 +262,8 @@ def _quest_page_score_kernel(
     page_size,
     q_stride_r,
     q_stride_h,
-    cache_stride_block,
-    cache_stride_pos,
-    cache_stride_head,
+    mm_stride_block,
+    mm_stride_head,
     bt_stride_r,
     sc_stride_r,
     sc_stride_h,
@@ -280,10 +285,10 @@ def _quest_page_score_kernel(
     dmask = d < head_size
     q = tl.load(q_ptr + r * q_stride_r + h * q_stride_h + d, mask=dmask,
                 other=0.0).to(tl.float32)
-    base = phys_block * cache_stride_block + h * cache_stride_head
-    kmin = tl.load(kv_cache_ptr + base + 2 * head_size + d, mask=dmask,
+    mm_base = phys_block * mm_stride_block + h * mm_stride_head
+    kmin = tl.load(minmax_ptr + mm_base + d, mask=dmask,
                    other=0.0).to(tl.float32)
-    kmax = tl.load(kv_cache_ptr + base + 3 * head_size + d, mask=dmask,
+    kmax = tl.load(minmax_ptr + mm_base + head_size + d, mask=dmask,
                    other=0.0).to(tl.float32)
     # Upper bound: per-channel max of q·K over the page extremes.
     prod = tl.maximum(q * kmin, q * kmax)
@@ -293,7 +298,7 @@ def _quest_page_score_kernel(
 
 def quest_page_score(
     q_kv: torch.Tensor,         # (num_reqs, H_kv, head_size)  group-mean query
-    kv_cache: torch.Tensor,
+    minmax: torch.Tensor,       # (num_blocks, H_kv, 2*head_size)  page min|max
     block_table: torch.Tensor,  # (num_reqs, max_blocks)
     seq_lens: torch.Tensor,     # (num_reqs,)
     page_size: int,
@@ -311,10 +316,10 @@ def quest_page_score(
                              device=q_kv.device)
     BLOCK_D = triton.next_power_of_2(head_size)
     _quest_page_score_kernel[(num_reqs, H_kv, max_pages)](
-        q_kv, kv_cache, block_table, seq_lens, scores,
+        q_kv, minmax, block_table, seq_lens, scores,
         max_pages, head_size, page_size,
         q_kv.stride(0), q_kv.stride(1),
-        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        minmax.stride(0), minmax.stride(1),
         block_table.stride(0),
         scores.stride(0), scores.stride(1),
         BLOCK_D=BLOCK_D,
