@@ -81,10 +81,36 @@ class LRoSAMLAIndexer(nn.Module):
         # Load the calibrated rotation M HERE (not lazily in forward): torch.load is
         # untraceable and breaks vLLM's fullgraph CUDA-graph capture. Register as a
         # non-persistent buffer so it moves to device with the model.
-        M = torch.load(basis_path, map_location="cpu",
-                       weights_only=False)["M"][self.layer_idx]
-        self.register_buffer("M_basis", M[0].to(torch.bfloat16).contiguous(),
-                             persistent=False)             # [cs_h, kv_lora_rank]
+        ckpt = torch.load(basis_path, map_location="cpu", weights_only=False)
+        M = ckpt["M"][self.layer_idx]
+        # Put M_basis on the worker's device at construction (vLLM builds the
+        # model on the target GPU; current_device == this worker's GPU). A
+        # non-persistent CPU buffer is NOT moved by vLLM weight loading, which
+        # would force a CPU->CUDA copy in forward that breaks CUDA-graph capture.
+        _dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        self.register_buffer("M_basis",
+                             M[0].to(torch.bfloat16).to(_dev).contiguous(),
+                             persistent=False)             # [rows, kv_lora_rank] on-device
+        torch._dynamo.mark_static_address(self.M_basis)
+        # ReLU-shift: the deepgemm logits kernel computes sum_h w_h*RELU(q_h.k)
+        # (sm100_fp8_paged_mqa_logits.cuh) while M is calibrated for the plain
+        # head-sum — the ReLU breaks the calibrated ranking (true-attention
+        # coverage 0.91 -> 0.79 on reasoning traces). Basis files with
+        # "shift_c" carry a 63-row M + a per-layer constant c: one head_dim
+        # slot is spent on the pair (beta, c/beta), beta = sqrt(c), so every
+        # per-head logit gains +c and ReLU is the identity (relu(x+c)=x+c);
+        # the +c offset is constant per key, leaving the ranking equal to the
+        # calibrated head-sum. Verified: coverage 0.787 -> 0.912 incl. fp8.
+        shift = ckpt.get("shift_c")
+        self.shift_c = float(shift[self.layer_idx]) if shift is not None else 0.0
+        self.shift_beta = self.shift_c ** 0.5 if self.shift_c > 0 else 1.0
+        rows = self.M_basis.shape[0]
+        expect = self.head_dim - self.qk_rope_head_dim - (1 if self.shift_c > 0 else 0)
+        if rows != expect:
+            raise RuntimeError(
+                f"LRoSA-MLA basis rows {rows} != expected {expect} "
+                f"(head_dim={self.head_dim}, rope={self.qk_rope_head_dim}, "
+                f"shift={'on' if self.shift_c > 0 else 'off'}).")
         # env knobs read once (NOT in the traced forward)
         self.alpha = float(os.environ.get("LROSA_MLA_ROPE_W", "1.0"))
         self.recent_window = int(os.environ.get("LROSA_MLA_RECENT_W", "0"))
@@ -118,7 +144,7 @@ class LRoSAMLAIndexer(nn.Module):
         W_UK = self.kv_b_proj.weight.view(
             H, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )[:, : self.qk_nope_head_dim, :]                                   # [H,nope,kvlr] view
-        Mb = self.M_basis.to(hidden_states.device)  # buffer isn't auto-moved; cheap (64x512)
+        Mb = self.M_basis   # already on-device (set in __init__), graph-capture safe
         q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)              # [T,H,kvlr]
         proj_q = torch.einsum("thl,cl->thc", q_latent, Mb)                 # [T,H,cs_h]
         proj_K = c_kv @ Mb.T                                               # [T,cs_h]
@@ -127,8 +153,15 @@ class LRoSAMLAIndexer(nn.Module):
         # the real fix (below).
         if self.alpha != 1.0:
             q_pe = q_pe * self.alpha
-        index_q = torch.cat([proj_q, q_pe], dim=-1)                        # [T,H,head_dim]
-        index_k = torch.cat([proj_K, k_pe], dim=-1)                        # [T,head_dim]
+        if self.shift_c > 0:
+            # ReLU-shift constant pair (see __init__): logit += beta*(c/beta)=c.
+            bq = q_pe.new_full((T, H, 1), self.shift_beta)
+            bk = k_pe.new_full((T, 1), self.shift_c / self.shift_beta)
+            index_q = torch.cat([proj_q, q_pe, bq], dim=-1)                # [T,H,head_dim]
+            index_k = torch.cat([proj_K, k_pe, bk], dim=-1)                # [T,head_dim]
+        else:
+            index_q = torch.cat([proj_q, q_pe], dim=-1)                    # [T,H,head_dim]
+            index_k = torch.cat([proj_K, k_pe], dim=-1)                    # [T,head_dim]
         # The deepgemm fp8 paged-MQA-logits kernel only supports num_heads in
         # {32, 64}. GLM has H=20 -> zero-pad the query heads to H_pad; padded heads
         # contribute 0 to the head-sum score (q=0) and get weight 0, so the top-k

@@ -999,12 +999,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         # NOTE(Chen): kernel requires num_local_head to be a multiple of
         # 64 on hopper and 128 on blackwell
         if self.num_heads % self.prefill_padding != 0:
-            assert self.prefill_padding % self.num_heads == 0
             logger.warning_once(
                 f"Padding num_heads from {self.num_heads} to "
                 f"{self.prefill_padding} for BF16 sparse prefill kernel"
             )
-            q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
+            # Zero-pad (NOT new_empty): garbage q rows can produce inf/NaN in
+            # the padded heads. Padded head outputs are sliced off below, but
+            # zeros keep them finite. Non-divisible head counts (e.g. GLM
+            # H=20 -> 128) are fine: extra rows are dead weight only.
+            q_padded = q.new_zeros((q.shape[0], self.prefill_padding, q.shape[2]))
             q_padded[:, : self.num_heads, :] = q
             q = q_padded
 
