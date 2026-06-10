@@ -580,6 +580,7 @@ class Attention(nn.Module, AttentionLayerBase):
             "lrosa",
             "fasa",
             "quest",
+            "seer",
         ):
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -671,6 +672,25 @@ class Attention(nn.Module, AttentionLayerBase):
             # live in a SEPARATE backend-managed per-page buffer (see
             # quest_attn.py), not in the slot. Reuse LRoSAFullAttentionSpec
             # (the spec only needs per-slot bytes).
+            from vllm.utils.torch_utils import get_dtype_size
+            from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
+
+            slot_elems = 2 * self.head_size
+            dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
+            return LRoSAFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                lrosa_slot_size=slot_elems * dtype_size,
+            )
+        elif self.kv_cache_dtype == "seer":
+            # SeerAttention-R stores a plain [ K | V ] per-token slot
+            # (= 2 * head_size); the AttnGate's compressed-K block cache lives
+            # in a SEPARATE backend-managed buffer (see seer_attn.py), not in
+            # the paged slot. Reuse LRoSAFullAttentionSpec (only the per-slot
+            # bytes matter to the spec).
             from vllm.utils.torch_utils import get_dtype_size
             from vllm.v1.kv_cache_interface import LRoSAFullAttentionSpec
 

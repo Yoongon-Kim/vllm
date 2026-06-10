@@ -51,6 +51,23 @@ from vllm.inputs import TokensPrompt  # noqa: E402
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
+_SEER_GATE_REPOS = {
+    "qwen3-8b": "SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates",
+    "qwen3-4b": "SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates",
+    "qwen3-14b": "SeerAttention/SeerAttention-Decode-Qwen3-14B-AttnGates",
+}
+
+
+def seer_gate_path(model):
+    key = model.split("/")[-1].lower()
+    for k, repo in _SEER_GATE_REPOS.items():
+        if k in key:
+            return repo
+    raise ValueError(
+        f"No default SeerAttention AttnGate adapter for {model!r}; "
+        f"pass --seer_gate_path explicitly.")
+
+
 def build_llm(a):
     """One vLLM engine for the chosen backend, sized to cover the longest task
     (max_input_len prompt + the 512-token summarization generations)."""
@@ -101,6 +118,13 @@ def build_llm(a):
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {
             "backend": "QUEST", "quest_token_budget": a.n_fac,
+        }
+    elif a.mode == "seer":
+        kw["kv_cache_dtype"] = "seer"
+        kw["attention_config"] = {
+            "backend": "SEER",
+            "seer_gate_path": a.seer_gate_path or seer_gate_path(a.model),
+            "seer_token_budget": a.n_fac,
         }
     # fkv: dense default, no special kv_cache_dtype.
     return LLM(**kw)
@@ -174,7 +198,8 @@ def _write_lrosa_summary(run_dir, a, per_task, status):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["fkv", "lrosa", "loki", "fasa", "quest"],
+    ap.add_argument("--mode",
+                    choices=["fkv", "lrosa", "loki", "fasa", "quest", "seer"],
                     default="lrosa")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--tasks", default="all",
@@ -185,6 +210,9 @@ def main():
     ap.add_argument("--cs_h", type=int, default=32)
     ap.add_argument("--n_tip", type=int, default=16)
     ap.add_argument("--basis", default=None)
+    ap.add_argument("--seer_gate_path", default=None,
+                    help="SeerAttention-R AttnGate adapter (default: resolved "
+                         "from --model).")
     ap.add_argument("--per_layer", action="store_true")
     ap.add_argument("--contig_projk", action="store_true")
     # FP8 score is the DEFAULT for LRoSA/Loki (essentially lossless vs bf16,

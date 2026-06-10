@@ -87,6 +87,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
     LROSA = "vllm.v1.attention.backends.lrosa_attn.LRoSAAttentionBackend"
     QUEST = "vllm.v1.attention.backends.quest_attn.QuestAttentionBackend"
+    SEER = "vllm.v1.attention.backends.seer_attn.SeerAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

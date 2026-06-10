@@ -132,6 +132,38 @@ class AttentionConfig:
     cache blocks, so the engine block_size is forced to this value. Default
     16 matches the Quest paper and pca's ``quest/quest.py`` reference."""
 
+    seer_gate_path: str | None = None
+    """SeerAttention-R backend (kv_cache_dtype="seer"): path to the AttnGate
+    weights (``attn_gate_weights.pth`` state_dict with keys
+    ``model.layers.{i}.self_attn.attn_gate.attngate_{linear_q,linear_k,qnorm,
+    knorm}.weight``) or the HF adapter repo dir (e.g.
+    ``SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates``). Required."""
+
+    seer_token_budget: int = 4096
+    """SeerAttention-R: total per-(decode step, kv-head) token budget. The
+    block budget is ``seer_token_budget // seer_gate_block_size`` selected
+    64-token K-blocks; the trailing partial block is always attended."""
+
+    seer_gate_block_size: int = 64
+    """SeerAttention-R: AttnGate K-block size in tokens (must be a multiple of
+    the paged page size 16). Default 64 matches the released AttnGates."""
+
+    seer_gate_hidden_size: int = 128
+    """SeerAttention-R: AttnGate projection dim. Overridden by the adapter's
+    config.json ``seerattn_gate_hidden_size`` when present."""
+
+    seer_sparsity_method: str = "token_budget"
+    """SeerAttention-R: "token_budget" (top-k blocks) or "threshold" (blocks
+    with softmax gate-score > ``seer_threshold``)."""
+
+    seer_threshold: float = 0.0
+    """SeerAttention-R: gate-score threshold when ``seer_sparsity_method`` is
+    "threshold"."""
+
+    seer_start_layer: int = 0
+    """SeerAttention-R: first decoder layer (inclusive) to apply gate sparsity;
+    earlier layers run dense."""
+
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
     in flashinfer. If None, auto-detect the attention backend in flashinfer."""

@@ -50,6 +50,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "lrosa": torch.bfloat16,
     "fasa": torch.bfloat16,
     "quest": torch.bfloat16,
+    "seer": torch.bfloat16,
     "nvfp4": torch.uint8,
 }
 

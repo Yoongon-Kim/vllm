@@ -79,7 +79,7 @@ def _sparse_decode_buffer_reservation(vllm_config) -> int:
     KV blocks, whereas under-reserving OOMs at decode).
     """
     dt = vllm_config.cache_config.cache_dtype
-    if dt not in ("lrosa", "fasa", "quest"):
+    if dt not in ("lrosa", "fasa", "quest", "seer"):
         return 0
     mc = vllm_config.model_config
     pc = vllm_config.parallel_config
@@ -103,6 +103,22 @@ def _sparse_decode_buffer_reservation(vllm_config) -> int:
         # top-K index/score buffers (i64 + i32 + fp32).
         topk = mns * H_kv * n_fac * (8 + 4 + 4)
         return ksel + scores + topk
+
+    if dt == "seer":
+        # SeerAttention-R: per-request compressed-K block cache (the dominant
+        # term) + gate scores + selected gate-block / page-idx buffers. Block
+        # 64 == 4 paged blocks (page_size 16); decode reuses quest_blocksparse.
+        gbs = int(getattr(ac, "seer_gate_block_size", 64))
+        gh = int(getattr(ac, "seer_gate_hidden_size", 128))
+        budget = int(getattr(ac, "seer_token_budget", 4096))
+        max_gblocks = _align((L + gbs - 1) // gbs, 64)
+        block_budget = max(budget // gbs, 1)
+        page_budget = block_budget * (gbs // 16)
+        kc = mns * max_gblocks * H_kv * gh * 2  # bf16 compressed K
+        scores = mns * H_kv * max_gblocks * 4  # fp32 gate scores
+        gblk_idx = mns * H_kv * block_budget * (4 + 8)  # i32 + i64 topk
+        page_idx = mns * H_kv * page_budget * 4  # expanded page columns
+        return kc + scores + gblk_idx + page_idx
 
     # quest: block-sparse → no gather buffers, only page-score + page-idx +
     # split-KV partials. Tiny, but reserve for correctness at large concurrency.

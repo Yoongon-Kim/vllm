@@ -31,6 +31,7 @@ CacheDType = Literal[
     "lrosa",
     "fasa",
     "quest",
+    "seer",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",

@@ -100,6 +100,25 @@ def grade(ev, response, gold):
     return bool(math_check_is_correct(math_extract_answer(response), gold))
 
 
+_SEER_GATE_REPOS = {
+    "qwen3-8b": "SeerAttention/SeerAttention-Decode-Qwen3-8B-AttnGates",
+    "qwen3-4b": "SeerAttention/SeerAttention-Decode-Qwen3-4B-AttnGates",
+    "qwen3-14b": "SeerAttention/SeerAttention-Decode-Qwen3-14B-AttnGates",
+}
+
+
+def seer_gate_path(model):
+    """Resolve the SeerAttention-R AttnGate adapter for a base model. Matches
+    on the model name's basename; raises if unknown (pass --seer_gate_path)."""
+    key = model.split("/")[-1].lower()
+    for k, repo in _SEER_GATE_REPOS.items():
+        if k in key:
+            return repo
+    raise ValueError(
+        f"No default SeerAttention AttnGate adapter for {model!r}; "
+        f"pass --seer_gate_path explicitly.")
+
+
 def build_llm(a):
     want_len = a.max_input_len + a.max_new_tokens + 16
     kw = dict(
@@ -155,6 +174,16 @@ def build_llm(a):
     elif a.mode == "quest":
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST", "quest_token_budget": a.n_fac}
+    elif a.mode == "seer":
+        # SeerAttention-R decode-sparse: learned AttnGate scores 64-token
+        # K-blocks, attends the top (token_budget // 64). The gate adapter is
+        # composed on top of the frozen base model.
+        kw["kv_cache_dtype"] = "seer"
+        kw["attention_config"] = {
+            "backend": "SEER",
+            "seer_gate_path": a.seer_gate_path or seer_gate_path(a.model),
+            "seer_token_budget": a.n_fac,
+        }
     # fkv: dense default.
     if a.mla_backend:  # force/merge a specific MLA backend (head-count workaround)
         ac = kw.get("attention_config") or {}
@@ -176,7 +205,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
-                    choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla"])
+                    choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
+                             "seer"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
@@ -203,6 +233,10 @@ def main():
     ap.add_argument("--cs_h", type=int, default=32)
     ap.add_argument("--n_tip", type=int, default=16)
     ap.add_argument("--basis", default=None)
+    ap.add_argument("--seer_gate_path", default=None,
+                    help="SeerAttention-R AttnGate adapter (attn_gate_weights.pth "
+                         "/ adapter dir / HF repo id). Default: resolved from "
+                         "--model (Qwen3-8B/4B/14B).")
     # FP8 score is the DEFAULT for LRoSA/Loki (lossless vs bf16, deployment
     # config); --no-fp8_projk for bf16. Ignored for fkv/fasa/quest and
     # auto-gated off for head_size>256 (e.g. Gemma 4 -> effectively bf16).
