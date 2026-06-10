@@ -132,7 +132,12 @@ def eval_task(llm, tok, task, a):
     )
     recs = []
     for r, o in zip(rows, outs):
-        pred = o.outputs[0].text
+        # Decode with the HF tokenizer, NOT vLLM's incremental detokenizer
+        # (o.outputs[0].text): the latter drops inter-word spaces for
+        # Mistral/tekken tokenizers, collapsing the prediction into one run-on
+        # token and tanking word-level F1/ROUGE (Ministral overall 29 -> ~49).
+        # Matches the transformers-stack eval (eval/longbench.py).
+        pred = tok.decode(o.outputs[0].token_ids, skip_special_tokens=True)
         s = score_single(pred, r["answers"], task, r.get("all_classes"))
         recs.append({"prediction": pred, "answers": r["answers"], "score": s})
     avg = sum(x["score"] for x in recs) / len(recs)
@@ -214,7 +219,15 @@ def main():
     if a.basis is None and a.mode == "lrosa":
         a.basis = lrosa_basis_path(a.model, cs_h=a.cs_h)
 
-    tok = AutoTokenizer.from_pretrained(a.model)
+    # Mistral models: AutoTokenizer picks a broken LlamaTokenizer path when
+    # mistral_common is installed (drops inter-word spaces on decode -> F1
+    # collapses). PreTrainedTokenizerFast forces the correct Rust
+    # TokenizersBackend (round-trips spaces), matching the transformers-stack.
+    if "mistral" in a.model.lower():
+        from transformers import PreTrainedTokenizerFast
+        tok = PreTrainedTokenizerFast.from_pretrained(a.model)
+    else:
+        tok = AutoTokenizer.from_pretrained(a.model)
     llm = build_llm(a)
 
     run_dir = None
