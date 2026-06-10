@@ -42,7 +42,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.triton_lrosa_gather import lrosa_gather
+from vllm.v1.attention.ops.triton_lrosa_gather import lrosa_gather, lrosa_gather_layer
 from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
 from vllm.v1.attention.ops.triton_fasa_score_topk import fasa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
@@ -741,6 +741,19 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     f"H_kv*d={self.num_kv_heads * self.head_size})."
                 )
         else:
+            # Tensor parallel: the basis is calibrated over ALL kv heads, but
+            # self.num_kv_heads is the TP-local count. vLLM shards kv heads as
+            # contiguous slices per rank, so take this rank's slice of M.
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1 and M_cpu.shape[0] == self.num_kv_heads * tp_size:
+                tp_rank = get_tensor_model_parallel_rank()
+                M_cpu = M_cpu[
+                    tp_rank * self.num_kv_heads : (tp_rank + 1) * self.num_kv_heads
+                ]
             expected_shape = (self.num_kv_heads, self.cs_h, self.head_size)
             if tuple(M_cpu.shape) != expected_shape:
                 raise RuntimeError(
@@ -1007,14 +1020,16 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 ti = _radix_topk(scores.unsqueeze(1), seq_lens_dec, k)  # (nd,1,k) i32
             else:
                 ti = scores.topk(k, dim=-1).indices.to(torch.int32).unsqueeze(1)
-            # broadcast the single selection to all kv-heads for the gather
-            top_idx = ti.expand(num_decodes, self.num_kv_heads, k).contiguous()
-            K_sel, V_sel = lrosa_gather(
-                kv_cache, block_table_dec, top_idx, head_size=head_size,
+            # Shared-index gather: one top-K per request, gathered for all kv
+            # heads in an H_kv× smaller grid (vs broadcasting to a per-head index
+            # and reusing the per-head gather, whose limiter was the block count).
+            ti_single = ti[:, 0, :]  # (num_decodes, k) — same tokens for all heads
+            K_sel, V_sel = lrosa_gather_layer(
+                kv_cache, block_table_dec, ti_single, head_size=head_size,
                 dtype=q_decode.dtype, K_sel_out=attn_metadata.K_sel_buf,
                 V_sel_out=attn_metadata.V_sel_buf,
             )
-            n_fac_eff = top_idx.shape[-1]
+            n_fac_eff = ti_single.shape[-1]
             cu_seqlens_q = attn_metadata.cu_seqlens_q_dec
             cu_seqlens_k = (attn_metadata.cu_seqlens_k_dec
                             if n_fac_eff == self.n_fac
