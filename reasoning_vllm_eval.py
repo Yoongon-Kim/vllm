@@ -185,6 +185,10 @@ def build_llm(a):
             "seer_token_budget": a.n_fac,
         }
     # fkv: dense default.
+    if a.mode == "fkv" and getattr(a, "fkv_kv_fp8", False):
+        # Attend-numerics isolation control: dense attention but with the same
+        # fp8 latent KV cache the lrosa_mla path is forced to use (H=20).
+        kw["kv_cache_dtype"] = a.mla_kv_dtype
     if a.mla_backend:  # force/merge a specific MLA backend (head-count workaround)
         ac = kw.get("attention_config") or {}
         ac["backend"] = a.mla_backend
@@ -244,6 +248,9 @@ def main():
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--max_num_seqs", type=int, default=0)
     ap.add_argument("--gpu_mem", type=float, default=0.85)
+    ap.add_argument("--fkv_kv_fp8", action="store_true",
+                    help="fkv only: use the fp8_ds_mla latent KV cache "
+                         "(attend-numerics isolation control).")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top_p", type=float, default=None)
     ap.add_argument("--top_k", type=int, default=None)
