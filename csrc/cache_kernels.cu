@@ -508,8 +508,16 @@ __global__ void concat_and_cache_ds_mla_kernel(
     max_abs = fmaxf(max_abs, VLLM_SHFL_XOR_SYNC_WIDTH(max_abs, offset, 16));
   }
 
-  // Compute the scale for the tile
+  // Compute the scale for the tile.
+  // NOTE: the fp8_ds_mla sparse decode kernel (flashmla sm100) converts this
+  // scale to e8m0 (power-of-two) with round-toward-zero (floor of the
+  // exponent). A non-power-of-two fp32 scale is therefore floored down by up
+  // to 2x (~2^-0.5 on average), shrinking dequantized values and scaling
+  // attention outputs by ~0.70 -> severe accuracy loss. Pre-round the scale UP
+  // to a power of two so the kernel's e8m0 floor is lossless. Rounding up (not
+  // down) keeps quantized values within the fp8 representable range.
   float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
+  tile_scale = exp2f(ceilf(log2f(tile_scale)));
 
   // The first lane of each half-warp writes the scale to kv_cache
   if ((lane_idx == 0) || (lane_idx == 16)) {
