@@ -140,6 +140,138 @@ def indexed_attend_kv(q, kv_cache, block_table, top_idx, head_size, scale, out=N
     return out
 
 
+# ---------------------------------------------------------------------------
+# v3: split-N (flash-decoding style). Grid R x H_kv x S so the GPU is occupied
+# even at small batch (the v2 grid R x H_kv under-fills SMs and regresses below
+# ~batch 6). Each split does its slice of n_fac -> partial (m,l,acc); a reduce
+# kernel merges the S partials per q-head with the online-softmax combine.
+@triton.jit
+def _split_attend_kernel(
+    q_ptr, kv_cache_ptr, block_table_ptr, top_idx_ptr,
+    m_ptr, l_ptr, acc_ptr,
+    scale, n_fac, hs, block_size, S,
+    q_sr, q_sh, kv_sb, kv_sp, kv_sh, bt_sr, top_sr, top_sh,
+    m_sr, m_sh, m_ss, a_sr, a_sh, a_ss,
+    G: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_hk = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    d = tl.arange(0, BLOCK_D)
+    dm = d < hs
+    g = tl.arange(0, G)
+    qh = pid_hk * G + g
+    q = tl.load(q_ptr + pid_r * q_sr + qh[:, None] * q_sh + d[None, :],
+                mask=dm[None, :], other=0.0).to(tl.float32)
+    m_i = tl.full([G], -float("inf"), tl.float32)
+    l_i = tl.zeros([G], tl.float32)
+    acc = tl.zeros([G, BLOCK_D], tl.float32)
+    nblk = (n_fac + BLOCK_N - 1) // BLOCK_N
+    per = (nblk + S - 1) // S                      # tiles handled by this split
+    for j in range(0, per):
+        tile = pid_s * per + j
+        start = tile * BLOCK_N
+        n = start + tl.arange(0, BLOCK_N)
+        nm = n < n_fac
+        tok = tl.load(top_idx_ptr + pid_r * top_sr + pid_hk * top_sh + n,
+                      mask=nm, other=0)
+        blk = tl.load(block_table_ptr + pid_r * bt_sr + (tok // block_size),
+                      mask=nm, other=0)
+        base = (blk.to(tl.int64) * kv_sb.to(tl.int64)
+                + (tok % block_size).to(tl.int64) * kv_sp.to(tl.int64)
+                + pid_hk.to(tl.int64) * kv_sh.to(tl.int64))
+        k = tl.load(kv_cache_ptr + base[:, None] + d[None, :],
+                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
+        v = tl.load(kv_cache_ptr + base[:, None] + (hs + d[None, :]),
+                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
+        s = tl.dot(q, tl.trans(k)) * scale
+        s = tl.where(nm[None, :], s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        # A split may own only empty tiles (tile index >= nblk) -> m_new stays
+        # -inf -> exp(-inf-(-inf))=nan. Use a finite m_safe for the exponentials;
+        # contributions are 0 anyway (acc/l stay 0, m_i stays -inf for reduce).
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(s - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+    # store partials for this (req, q-heads in group, split)
+    tl.store(m_ptr + pid_r * m_sr + qh * m_sh + pid_s * m_ss, m_i)
+    tl.store(l_ptr + pid_r * m_sr + qh * m_sh + pid_s * m_ss, l_i)
+    tl.store(acc_ptr + pid_r * a_sr + qh[:, None] * a_sh + pid_s * a_ss + d[None, :],
+             acc, mask=dm[None, :])
+
+
+@triton.jit
+def _split_reduce_kernel(
+    m_ptr, l_ptr, acc_ptr, o_ptr,
+    hs, S,
+    m_sr, m_sh, m_ss, a_sr, a_sh, a_ss, o_sr, o_sh,
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    d = tl.arange(0, BLOCK_D)
+    dm = d < hs
+    sm = tl.arange(0, BLOCK_S)
+    smask = sm < S
+    base_m = pid_r * m_sr + pid_hq * m_sh
+    m_s = tl.load(m_ptr + base_m + sm * m_ss, mask=smask, other=-float("inf"))
+    l_s = tl.load(l_ptr + base_m + sm * m_ss, mask=smask, other=0.0)
+    m_g = tl.max(m_s)
+    alpha = tl.where(smask, tl.exp(m_s - m_g), 0.0)        # [BLOCK_S]
+    l_g = tl.sum(l_s * alpha)
+    acc_s = tl.load(acc_ptr + pid_r * a_sr + pid_hq * a_sh + sm[:, None] * a_ss + d[None, :],
+                    mask=smask[:, None] & dm[None, :], other=0.0)  # [BLOCK_S, BLOCK_D]
+    acc_g = tl.sum(acc_s * alpha[:, None], axis=0)         # [BLOCK_D]
+    o = acc_g / l_g
+    tl.store(o_ptr + pid_r * o_sr + pid_hq * o_sh + d, o.to(o_ptr.dtype.element_ty), mask=dm)
+
+
+def indexed_attend_kv_split(q, kv_cache, block_table, top_idx, head_size, scale,
+                            out=None, target_blocks=304, _splits_buf=None):
+    R, Hq, hs = q.shape
+    Hk = top_idx.shape[1]
+    n_fac = top_idx.shape[2]
+    G = Hq // Hk
+    BLOCK_N = 128
+    BLOCK_D = triton.next_power_of_2(hs)
+    max_splits = max(1, (n_fac + BLOCK_N - 1) // BLOCK_N)
+    sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    # v2's grid R*H_kv already saturates the SMs at high batch (and wins there);
+    # only split when it under-fills, targeting ~2*SM blocks for occupancy.
+    if R * Hk >= sm:
+        S = 1
+    else:
+        S = min(max_splits, max(2, -(-(2 * sm) // (R * Hk))))
+    if out is None:
+        out = torch.empty_like(q)
+    if S == 1:
+        return indexed_attend_kv(q, kv_cache, block_table, top_idx, head_size, scale, out=out)
+    m = torch.empty((R, Hq, S), dtype=torch.float32, device=q.device)
+    l = torch.empty((R, Hq, S), dtype=torch.float32, device=q.device)
+    acc = torch.empty((R, Hq, S, BLOCK_D), dtype=torch.float32, device=q.device)
+    _split_attend_kernel[(R, Hk, S)](
+        q, kv_cache, block_table, top_idx, m, l, acc,
+        scale, n_fac, hs, kv_cache.shape[1], S,
+        q.stride(0), q.stride(1),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        block_table.stride(0), top_idx.stride(0), top_idx.stride(1),
+        m.stride(0), m.stride(1), m.stride(2),
+        acc.stride(0), acc.stride(1), acc.stride(2),
+        G=G, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+    )
+    _split_reduce_kernel[(R, Hq)](
+        m, l, acc, out, hs, S,
+        m.stride(0), m.stride(1), m.stride(2),
+        acc.stride(0), acc.stride(1), acc.stride(2),
+        out.stride(0), out.stride(1),
+        BLOCK_S=triton.next_power_of_2(S), BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
 def indexed_attend(q, kv_cache, block_table, top_idx, head_size, scale, out=None):
     R, Hq, hs = q.shape
     Hk = top_idx.shape[1]
@@ -218,6 +350,7 @@ def main():
 
     o_idx = torch.empty_like(q)
     o_idx2 = torch.empty_like(q)
+    o_idx3 = torch.empty_like(q)
 
     def indexed():
         indexed_attend(q, kv_cache, block_table, top_idx, hs, scale, out=o_idx)
@@ -225,15 +358,21 @@ def main():
     def indexed_kv():
         indexed_attend_kv(q, kv_cache, block_table, top_idx, hs, scale, out=o_idx2)
 
+    def indexed_split():
+        indexed_attend_kv_split(q, kv_cache, block_table, top_idx, hs, scale, out=o_idx3)
+
     # correctness vs (gather + varlen) reference
     gather()
     ref = flash_attn_varlen_func(q=q, k=K_sel, v=V_sel, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                                  max_seqlen_q=1, max_seqlen_k=n_fac, softmax_scale=scale, causal=False)
-    indexed(); indexed_kv()
+    indexed(); indexed_kv(); indexed_split()
     torch.cuda.synchronize()
     refmax = ref.float().abs().max().item() + 1e-6
     rel1 = (o_idx.float() - ref.float()).abs().max().item() / refmax
     rel2 = (o_idx2.float() - ref.float()).abs().max().item() / refmax
+    rel3 = (o_idx3.float() - ref.float()).abs().max().item() / refmax
+    _sm = torch.cuda.get_device_properties(dev).multi_processor_count
+    _splits = 1 if R * Hk >= _sm else min((n_fac + 127) // 128, max(2, -(-(2 * _sm) // (R * Hk))))
 
     # SCORE+topk path (scales with context: reads proj_K over full ctx)
     proj_q = torch.randn(R, Hk, a.cs_h, dtype=dt, device=dev)
@@ -273,14 +412,16 @@ def main():
 
     i_ms = _safe(indexed)
     i2_ms = _safe(indexed_kv)
+    i3_ms = _safe(indexed_split)
     NL = 36  # qwen3-8b layers (per-step = NL * per-layer)
     print(f"[microbench] R={R} ctx={L} n_fac={n_fac} hs={hs} Hk={Hk} Hq={Hq}")
     print(f"  SCORE per-layer: in-slot={s_ms:.4f} contig-bf16={sc_ms:.4f} contig-fp8={sf_ms:.4f}"
           f"  (contig {s_ms/sc_ms:.2f}x, fp8 {s_ms/sf_ms:.2f}x)")
-    print(f"  ATTEND-side per-layer: gather={g_ms:.4f} attend={a_ms:.4f} gather+attend={t_ms:.4f}"
-          f"  indexed-v2={i2_ms:.4f} ({t_ms/i2_ms:.2f}x, rel={rel2:.4f})")
-    print(f"  per-step (x{NL}): SCORE={s_ms*NL:.2f}ms GATHER={g_ms*NL:.2f} ATTEND={a_ms*NL:.2f}"
-          f" | gather+attend={t_ms*NL:.2f} -> indexed-v2 {i2_ms*NL:.2f}  saves {(t_ms-i2_ms)*NL:.2f}ms/step")
+    print(f"  ATTEND-side per-layer: gather+attend={t_ms:.4f}"
+          f"  v2={i2_ms:.4f} ({t_ms/i2_ms:.2f}x,rel{rel2:.3f})"
+          f"  v3-split[S={_splits}]={i3_ms:.4f} ({t_ms/i3_ms:.2f}x,rel{rel3:.3f})")
+    print(f"  per-step (x{NL}): gather+attend={t_ms*NL:.2f}ms -> v2 {i2_ms*NL:.2f} -> v3 {i3_ms*NL:.2f}"
+          f"  (v3 saves {(t_ms-i3_ms)*NL:.2f}ms/step)")
 
 
 if __name__ == "__main__":

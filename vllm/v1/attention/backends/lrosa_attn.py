@@ -655,14 +655,16 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             and not self.is_fasa
             and not self.per_layer_concat
         )
-        # The fused kernel's grid is num_decodes x H_kv, so it is occupancy-bound
-        # at small batch (e.g. b4 -> 32 blocks << ~148 B200 SMs) and REGRESSES
-        # vs gather+flash there; the gather buffer it removes only dominates at
-        # large batch. Microbench crossover ~R5-6, clear win >=R16. Gate on the
-        # captured batch (num_decodes is constant within a CUDA-graph) so small
-        # batches keep the well-occupied gather+flash path.
+        # The v3 split-N path occupies the SMs even at small batch, so the fused
+        # kernel is a net win across all batch sizes (default min_batch 1). The
+        # knob is kept for hardware where the split heuristic needs a floor. SM
+        # count drives the adaptive split count.
         self.indexed_min_batch = int(
-            getattr(attn_cfg, "lrosa_indexed_min_batch", 16) or 16
+            getattr(attn_cfg, "lrosa_indexed_min_batch", 1) or 1
+        )
+        self._sm_count = (
+            torch.cuda.get_device_properties(0).multi_processor_count
+            if torch.cuda.is_available() else 132
         )
         self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
         self._projk_scale: torch.Tensor | None = None  # [H_kv, cs_h] fp8 scale
@@ -1243,10 +1245,14 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             from vllm.v1.attention.ops.triton_lrosa_indexed_attend import (
                 lrosa_indexed_attend,
             )
+            # v3 split-N path occupies the SMs at low batch too, so it is a net
+            # win across all batch sizes (no v2 low-batch regression). _decode_
+            # scratch gives the split's partials a persistent (CG-safe) buffer.
             lrosa_indexed_attend(
                 q_decode, kv_cache, block_table_dec, top_idx,
                 head_size=head_size, scale=self.scale,
                 out=output[:num_decode_tokens],
+                scratch=_decode_scratch, sm_count=self._sm_count,
             )
             return
 

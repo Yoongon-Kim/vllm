@@ -123,13 +123,12 @@ class AttentionConfig:
     Reads only K|V from the slot, so independent of the fp8/contig proj_K score
     path. OFF by default."""
 
-    lrosa_indexed_min_batch: int = 16
+    lrosa_indexed_min_batch: int = 1
     """Minimum decode batch (num_decodes) for the gather-free indexed kernel to
-    engage; below this, fall back to gather+flash. The fused kernel's grid is
-    num_decodes*H_kv, so it under-occupies the SMs and regresses at small batch
-    (microbench crossover ~R5-6, clear win >=R16 on B200's ~148 SMs); the buffer
-    it removes only dominates at large batch. Gated on the captured batch so the
-    flag is regression-safe across all CUDA-graph capture sizes. Tune per GPU."""
+    engage; below this, fall back to gather+flash. The v3 split-N path occupies
+    the SMs at small batch too (grid num_decodes*H_kv*S), so the kernel is a net
+    win at every batch and the default floor is 1. Raise it only on hardware
+    where the split heuristic underperforms the gather+flash path at tiny batch."""
 
     lrosa_mla: bool = False
     """Apply LRoSA token selection to an MLA model (e.g. GLM-4.7-Flash) by
