@@ -644,6 +644,17 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             and not self.per_layer_concat
             and not getattr(attn_cfg, "lrosa_use_streaming_topk", False)
         )
+        # Gather-free indexed attention: fuse selection-gather + attend into one
+        # kernel (no K_sel/V_sel buffer). The buffer scales with num_decodes ×
+        # n_fac, so removing it cuts the attention-side fixed overhead ~2.3x at
+        # large batch (the throughput operating point). Decode-time gate also
+        # requires head<=256 and no sinks/softcap/alibi/partial (else fall back
+        # to gather+flash, which handles those).
+        self.indexed_attend = (
+            getattr(attn_cfg, "lrosa_indexed_attend", False)
+            and not self.is_fasa
+            and not self.per_layer_concat
+        )
         self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
         self._projk_scale: torch.Tensor | None = None  # [H_kv, cs_h] fp8 scale
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
@@ -1210,6 +1221,24 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             invalid = top_idx.long() >= seq_lens_dec.view(num_decodes, 1, 1)
             order = torch.argsort(invalid.to(torch.uint8), dim=-1, stable=True)
             top_idx = torch.gather(top_idx, -1, order)
+
+        # Gather-free fused attention: stream the selected paged slots directly
+        # through an online-softmax kernel, skipping the K_sel/V_sel buffer.
+        # Only the plain qwen-like path (head<=256, set attention, no
+        # sinks/softcap/alibi, steady-state non-partial); everything else keeps
+        # the gather+flash path below which supports those features.
+        if (self.indexed_attend and head_size <= 256 and not partial
+                and self.sinks is None and not self.logits_soft_cap
+                and self.alibi_slopes is None):
+            from vllm.v1.attention.ops.triton_lrosa_indexed_attend import (
+                lrosa_indexed_attend,
+            )
+            lrosa_indexed_attend(
+                q_decode, kv_cache, block_table_dec, top_idx,
+                head_size=head_size, scale=self.scale,
+                out=output[:num_decode_tokens],
+            )
+            return
 
         K_sel, V_sel = lrosa_gather(
             kv_cache,

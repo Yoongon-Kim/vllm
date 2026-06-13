@@ -110,6 +110,19 @@ class AttentionConfig:
     proj_K quantizes far better than FASA's K_sel; see paper). Mirrors DSA's fp8
     index logits. ~1.16x on the score kernel alone."""
 
+    lrosa_indexed_attend: bool = False
+    """Gather-free fused indexed attention for decode: stream the
+    top-``lrosa_n_fac`` selected paged slots directly through an online-softmax
+    kernel instead of materializing a contiguous K_sel/V_sel buffer and running
+    a dense flash_attn over it. The buffer scales with num_decodes * n_fac, so
+    removing it cuts the attention-side per-step fixed overhead ~2.3x at large
+    batch (the throughput operating point); negligible at batch 1. Only the
+    plain path (head_size<=256, set attention, no sinks/softcap/alibi,
+    steady-state non-partial) takes it — gemma full layers (head 512), gpt-oss
+    (sinks), and the eager seq<k_eff partial tail fall back to gather+flash.
+    Reads only K|V from the slot, so independent of the fp8/contig proj_K score
+    path. OFF by default."""
+
     lrosa_mla: bool = False
     """Apply LRoSA token selection to an MLA model (e.g. GLM-4.7-Flash) by
     scoring the latent c_KV with the calibrated rotation M (M:[1, cs_h,

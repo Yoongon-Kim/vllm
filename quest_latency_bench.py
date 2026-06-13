@@ -38,6 +38,7 @@ MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               max_num_seqs=0, model=MODEL, basis=None, cs_h=32, n_tip=16,
               use_radix=True, streaming=False, contig_projk=False, fp8_projk=False, per_layer=False,
+              indexed_attend=False,
               tp=1, mla_kv_dtype="fp8_ds_mla", mla_backend=None, mla_fkv_fp8=False):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
@@ -66,6 +67,7 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
                                   "lrosa_use_streaming_topk": streaming,
                                   "lrosa_contig_projk": contig_projk,
                                   "lrosa_fp8_projk": fp8_projk,
+                                  "lrosa_indexed_attend": indexed_attend,
                                   "lrosa_per_layer_concat": per_layer}
     elif backend == "fasa":
         idom = basis or fasa_idom_path(model)
@@ -133,6 +135,9 @@ def main():
                     help="LRoSA: store proj_K as FP8 e4m3 (implies contig); halves score read.")
     ap.add_argument("--per_layer", action="store_true",
                     help="LRoSA: per-layer CONCAT (one shared top-k/layer; needs layer_concat basis).")
+    ap.add_argument("--indexed_attend", action="store_true",
+                    help="LRoSA: gather-free fused indexed attention (no K_sel/V_sel "
+                         "buffer; ~2.3x less attention-side overhead at large batch).")
     ap.add_argument("--prefill_len", type=int, default=65536)
     ap.add_argument("--decode_len", type=int, default=128)
     ap.add_argument("--n_fac", type=int, default=256)
@@ -161,6 +166,7 @@ def main():
                     a.batch_size, a.max_num_seqs, model=a.model, basis=a.basis,
                     cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix,
                     streaming=a.streaming, contig_projk=a.contig_projk, fp8_projk=a.fp8_projk,
+                    indexed_attend=a.indexed_attend,
                     per_layer=a.per_layer, tp=a.tp, mla_kv_dtype=a.mla_kv_dtype,
                     mla_backend=a.mla_backend, mla_fkv_fp8=a.mla_fkv_fp8)
 
