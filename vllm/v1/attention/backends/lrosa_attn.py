@@ -655,6 +655,15 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             and not self.is_fasa
             and not self.per_layer_concat
         )
+        # The fused kernel's grid is num_decodes x H_kv, so it is occupancy-bound
+        # at small batch (e.g. b4 -> 32 blocks << ~148 B200 SMs) and REGRESSES
+        # vs gather+flash there; the gather buffer it removes only dominates at
+        # large batch. Microbench crossover ~R5-6, clear win >=R16. Gate on the
+        # captured batch (num_decodes is constant within a CUDA-graph) so small
+        # batches keep the well-occupied gather+flash path.
+        self.indexed_min_batch = int(
+            getattr(attn_cfg, "lrosa_indexed_min_batch", 16) or 16
+        )
         self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
         self._projk_scale: torch.Tensor | None = None  # [H_kv, cs_h] fp8 scale
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
@@ -1227,7 +1236,8 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # Only the plain qwen-like path (head<=256, set attention, no
         # sinks/softcap/alibi, steady-state non-partial); everything else keeps
         # the gather+flash path below which supports those features.
-        if (self.indexed_attend and head_size <= 256 and not partial
+        if (self.indexed_attend and num_decodes >= self.indexed_min_batch
+                and head_size <= 256 and not partial
                 and self.sinks is None and not self.logits_soft_cap
                 and self.alibi_slopes is None):
             from vllm.v1.attention.ops.triton_lrosa_indexed_attend import (
