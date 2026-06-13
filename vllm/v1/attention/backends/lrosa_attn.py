@@ -205,6 +205,13 @@ class LRoSAAttentionBackend(AttentionBackend):
         return attn_type == AttentionType.DECODER
 
     @classmethod
+    def supports_sink(cls) -> bool:
+        # gpt-oss learned attention sink: LRoSA prefill/decode route to
+        # flash_attn_varlen_func(s_aux=...), supported on FA3/4 (B200).
+        from vllm.v1.attention.backends.fa_utils import flash_attn_supports_sinks
+        return flash_attn_supports_sinks()
+
+    @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         # 64/128: GPT-OSS / Llama-Qwen-Mistral family. 256/512: Gemma 4 26B-A4B
         # (sliding layers head_dim=256, full-attention layers head_dim=512).
@@ -618,7 +625,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # the full layers' contig store hits the hybrid cache-group block mapping
         # → illegal access), so gate it to head_dim<=256. Gemma 4 keeps the
         # in-slot path (its bf16 LRoSA win comes from the 5 full layers anyway).
-        _contig_ok = head_size <= 256
+        # head_size gate relaxed to 512 to allow gemma4 full layers (head_dim
+        # 512) onto the contig/fp8 proj_K path. The projk cache is sized
+        # per-(layer,group) in _ensure_projk_cache (num_blocks from this layer's
+        # own kv_cache), so block ids stay in range per group.
+        _contig_ok = head_size <= 512
         self.fp8_projk = (
             getattr(attn_cfg, "lrosa_fp8_projk", False)
             and _contig_ok
@@ -646,6 +657,21 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self.logits_soft_cap = 0 if logits_soft_cap is None else logits_soft_cap
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        # gpt-oss learned attention sink: per-head logit added to the softmax
+        # denominator (softmax([qk; sink])). None for non-sink models
+        # (gemma/qwen) -> flash_attn s_aux=None is a no-op. B200 FA4 supports it.
+        self.sinks = kwargs.get("sinks")
+        if __import__("os").environ.get("LROSA_NO_SINK") == "1":
+            self.sinks = None  # debug: isolate sink contribution
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+        from vllm.vllm_flash_attn.flash_attn_interface import DEFAULT_FA_VERSION
+        if self.sinks is not None:
+            assert self.sinks.shape[0] == num_heads, (
+                f"sinks {tuple(self.sinks.shape)} vs num_heads {num_heads}")
+            # sink (gpt-oss) needs FA3/4 for s_aux; FA2 (the default) rejects it.
+            self._fa_version = get_flash_attn_version(has_sinks=True)
+        else:
+            self._fa_version = DEFAULT_FA_VERSION  # preserve existing LRoSA path
         # Recency-keep (env LROSA_RECENT_KEEP_W>0): force the last W cached
         # positions into the top-K budget by biasing their selection score
         # (iso-budget — W recent + (n_fac-W) content). Applies to both the LRoSA
@@ -831,6 +857,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 window_size=list(self.sliding_window),
                 block_table=attn_metadata.block_table,
                 softcap=self.logits_soft_cap,
+                s_aux=self.sinks, fa_version=self._fa_version,
             )
             return output
 
@@ -878,6 +905,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     window_size=list(self.sliding_window),
                     block_table=attn_metadata.block_table,
                     softcap=self.logits_soft_cap,
+                    s_aux=self.sinks, fa_version=self._fa_version,
                 )
                 return output
 
@@ -933,6 +961,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 window_size=list(self.sliding_window),
                 block_table=attn_metadata.block_table[num_decodes:],
                 softcap=self.logits_soft_cap,
+                s_aux=self.sinks, fa_version=self._fa_version,
             )
             return output
 
@@ -971,6 +1000,31 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         )
 
         q_decode = query[:num_decode_tokens]  # (num_decodes, H_q, head_size)
+        # Sliding-window layers: SKIP LRoSA selection and run dense windowed
+        # attention over the paged K/V (gpt-oss alternating sliding(128) layers;
+        # like gemma's head>256 unified path). LRoSA's sparse decode has no
+        # per-token sliding mask, so a sliding layer routed through selection
+        # attends the wrong keys -> reasoning collapse. window is small (128) so
+        # this is cheap.
+        if self.sliding_window != (-1, -1):
+            flash_attn_varlen_func(
+                q=q_decode,
+                k=kv_cache[..., :head_size],
+                v=kv_cache[..., head_size : 2 * head_size],
+                out=output[:num_decode_tokens],
+                cu_seqlens_q=attn_metadata.cu_seqlens_q_dec,
+                max_seqlen_q=1,
+                seqused_k=attn_metadata.seq_lens[:num_decodes],
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=list(self.sliding_window),
+                block_table=attn_metadata.block_table[:num_decodes],
+                softcap=self.logits_soft_cap,
+                s_aux=self.sinks,
+                fa_version=self._fa_version,
+            )
+            return
         # GQA group-mean: H_q → H_kv. View groups Q heads by their parent kv-head.
         # Written into persistent scratch (no allocation → CUDA-graph safe at
         # bsz>1 / mixed batches).
@@ -1040,6 +1094,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 cu_seqlens_k=cu_seqlens_k, max_seqlen_k=n_fac_eff,
                 softmax_scale=self.scale, causal=False,
                 alibi_slopes=self.alibi_slopes, softcap=self.logits_soft_cap,
+                s_aux=self.sinks, fa_version=self._fa_version,
             )
             return
 
@@ -1137,6 +1192,25 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                     recent_w=self.recent_keep_w,
                 )  # (nd, H_kv, n_fac_eff) int64 CG path; int32 fallback
 
+        n_fac_eff = top_idx.shape[-1]
+        # ---- seq_len < k_eff tail fix -----------------------------------
+        # When a request's kv_len is below the top-k width, the radix pad
+        # cycles REAL tokens into the tail slots (OOB-proof), but those
+        # duplicates distort the gathered softmax: the cycled prefix gets
+        # ~2x weight and the sink's relative mass shrinks (gpt-oss leans on
+        # sinks). Fix: compact valid (idx < seq_len) selections to the
+        # front, then attend with seqused_k = min(seq_len, k_eff) so the
+        # duplicate tail is EXCLUDED -> exact dense(+sink) over the real
+        # tokens. Long-context steady state (all seq >= k_eff) skips this
+        # (host sync is eager-only; under CG capture keep old behavior).
+        partial = False
+        if not torch.cuda.is_current_stream_capturing():
+            partial = bool((seq_lens_dec < n_fac_eff).any().item())
+        if partial:
+            invalid = top_idx.long() >= seq_lens_dec.view(num_decodes, 1, 1)
+            order = torch.argsort(invalid.to(torch.uint8), dim=-1, stable=True)
+            top_idx = torch.gather(top_idx, -1, order)
+
         K_sel, V_sel = lrosa_gather(
             kv_cache,
             block_table_dec,
@@ -1147,7 +1221,6 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             V_sel_out=attn_metadata.V_sel_buf,
         )  # (num_decodes * n_fac_eff, H_kv, head_size)
 
-        n_fac_eff = top_idx.shape[-1]
         # Pre-allocated cu_seqlens cover up to ``max_num_reqs`` decodes;
         # builder.build() already sliced them to ``num_decodes + 1`` rows.
         # On the rare path where the score-kernel had to clip n_fac because
@@ -1175,6 +1248,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             q = q_decode.view(nd, Hkv, G, d).to(torch.float32)  # GQA-grouped
             scores = torch.einsum("nhgd,nhfd->nhgf", q, K.to(torch.float32))
             scores = scores * self.scale
+            if partial:
+                # Exclude the duplicate tail (see seq_len < k_eff fix above).
+                tail = (
+                    torch.arange(nf, device=scores.device).view(1, 1, 1, nf)
+                    >= seq_lens_dec.view(nd, 1, 1, 1)
+                )
+                scores = scores.masked_fill(tail, float("-inf"))
             attn = torch.softmax(scores, dim=-1)
             out = torch.einsum("nhgf,nhfd->nhgd", attn, V.to(torch.float32))
             output[:num_decode_tokens] = out.reshape(
@@ -1182,6 +1262,33 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             ).to(output.dtype)
             return
 
+        if partial:
+            # seq<k_eff requests present: attend only the first
+            # min(seq_len, k_eff) gathered rows per request (valid-first
+            # after the compaction above). cu_seqlens_k and seqused_k are
+            # mutually exclusive in the varlen wrapper, so present K_sel as
+            # a paged cache with one n_fac_eff-sized page per request.
+            flash_attn_varlen_func(
+                q=q_decode,
+                k=K_sel.view(num_decodes, n_fac_eff, self.num_kv_heads,
+                             head_size),
+                v=V_sel.view(num_decodes, n_fac_eff, self.num_kv_heads,
+                             head_size),
+                out=output[:num_decode_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=1,
+                seqused_k=seq_lens_dec.to(torch.int32).clamp(max=n_fac_eff),
+                max_seqlen_k=n_fac_eff,
+                block_table=torch.arange(
+                    num_decodes, dtype=torch.int32,
+                    device=q_decode.device).view(num_decodes, 1),
+                softmax_scale=self.scale,
+                causal=False,  # selected K is a set, not a sequence
+                alibi_slopes=self.alibi_slopes,
+                softcap=self.logits_soft_cap,
+                s_aux=self.sinks, fa_version=self._fa_version,
+            )
+            return
         flash_attn_varlen_func(
             q=q_decode,
             k=K_sel,
@@ -1195,6 +1302,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             causal=False,  # selected K is a set, not a sequence
             alibi_slopes=self.alibi_slopes,
             softcap=self.logits_soft_cap,
+            s_aux=self.sinks, fa_version=self._fa_version,
         )
 
     def _ensure_projk_cache(
@@ -1204,13 +1312,27 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         managed kv cache's block count. Allocated on the first (eager warmup)
         forward, before CUDA-graph capture, and kept persistent + static so
         captured decode graphs see a fixed address."""
-        if self._projk_cache is None:
-            num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+        num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+        # (Re)allocate when the block count changes. The dummy warmup /
+        # flashinfer-autotune run passes a tiny placeholder kv_cache (e.g.
+        # num_blocks=2) BEFORE the real KV cache is allocated; sizing the proj_K
+        # cache from that placeholder makes the store/score kernels index a
+        # 2-block tensor with real block ids (up to num_blocks-1) → illegal
+        # access. Re-sizing on change picks up the real cache. This happens in
+        # the eager warmup forward that runs with the real cache, before CUDA
+        # graph capture, so the captured decode graphs still see a fixed
+        # (re-applied static) address. (Hybrid models hit this because their
+        # warmup uses a placeholder; non-hybrid warms up with the real cache.)
+        if self._projk_cache is None or self._projk_cache.shape[0] != num_blocks:
             pk_dtype = torch.float8_e4m3fn if self.fp8_projk else dtype
             self._projk_cache = torch.zeros(
                 num_blocks, block_size, self.num_kv_heads, self.cs_h,
                 dtype=pk_dtype, device=device,
             )
+            try:
+                torch._dynamo.mark_static_address(self._projk_cache)
+            except Exception:
+                pass
             try:
                 torch._dynamo.mark_static_address(self._projk_cache)
             except Exception:
