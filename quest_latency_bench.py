@@ -38,7 +38,7 @@ MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               max_num_seqs=0, model=MODEL, basis=None, cs_h=32, n_tip=16,
               use_radix=True, streaming=False, contig_projk=False, fp8_projk=False, per_layer=False,
-              tp=1):
+              tp=1, mla_kv_dtype="fp8_ds_mla", mla_backend=None, mla_fkv_fp8=False):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
     # serving concurrency (stresses the buffers; Quest's are tiny, LRoSA's
@@ -76,7 +76,24 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
     elif backend == "quest":
         kw["kv_cache_dtype"] = "quest"
         kw["attention_config"] = {"backend": "QUEST", "quest_token_budget": n_fac}
-    # fkv: default backend, no special kv_cache_dtype
+    elif backend == "lrosa_mla":
+        # LRoSA on an MLA model (GLM-4.7-Flash): score the latent c_KV via the
+        # calibrated rotation M -> top-k drives the FlashMLASparse attend. MLA
+        # keeps its own latent cache (no kv_cache_dtype="lrosa" override); the
+        # gathered/attended unit is the compact latent (kv_lora_rank + rope),
+        # which is the whole point of this DSA-stack comparison.
+        basis = basis or lrosa_basis_path(model, cs_h=cs_h, variant="d1")
+        kw["attention_config"] = {"lrosa_mla": True, "lrosa_basis_path": basis,
+                                  "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h}
+        kw["kv_cache_dtype"] = mla_kv_dtype
+    # fkv: default backend. For an MLA model, optionally force the same fp8
+    # latent KV as the lrosa_mla path (apples-to-apples dense vs sparse attend).
+    if backend == "fkv" and mla_fkv_fp8:
+        kw["kv_cache_dtype"] = mla_kv_dtype
+    if mla_backend:  # force a specific MLA backend (GLM head-count workaround)
+        ac = kw.get("attention_config") or {}
+        ac["backend"] = mla_backend
+        kw["attention_config"] = ac
     return LLM(**kw)
 
 
@@ -97,7 +114,7 @@ def time_generate(llm, prompts, max_tokens, reps=2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa"], required=True)
+    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa", "lrosa_mla"], required=True)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis / FASA idom .pt; default = pca bases/<tag>/...")
@@ -126,6 +143,13 @@ def main():
                          "decode static buffers).")
     ap.add_argument("--gpu_mem", type=float, default=0.85)
     ap.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
+    ap.add_argument("--mla_kv_dtype", default="fp8_ds_mla",
+                    help="lrosa_mla / fkv(--mla_fkv_fp8): MLA latent KV cache dtype.")
+    ap.add_argument("--mla_backend", default=None,
+                    help="Force a specific MLA attention backend (GLM head-count workaround).")
+    ap.add_argument("--mla_fkv_fp8", action="store_true",
+                    help="fkv on an MLA model: use the same fp8 latent KV as lrosa_mla "
+                         "(apples-to-apples dense vs sparse attend).")
     a = ap.parse_args()
 
     torch.manual_seed(0)
@@ -137,7 +161,8 @@ def main():
                     a.batch_size, a.max_num_seqs, model=a.model, basis=a.basis,
                     cs_h=a.cs_h, n_tip=a.n_tip, use_radix=not a.no_radix,
                     streaming=a.streaming, contig_projk=a.contig_projk, fp8_projk=a.fp8_projk,
-                    per_layer=a.per_layer, tp=a.tp)
+                    per_layer=a.per_layer, tp=a.tp, mla_kv_dtype=a.mla_kv_dtype,
+                    mla_backend=a.mla_backend, mla_fkv_fp8=a.mla_fkv_fp8)
 
     t_prefill = time_generate(llm, prompts, 1)
     t_full = time_generate(llm, prompts, 1 + a.decode_len)
