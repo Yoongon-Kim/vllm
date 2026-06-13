@@ -49,13 +49,15 @@ SAMPLING_PRESETS = {
     "qwen3":    {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
     "gemma":    {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
     "gpt_oss":  {"temperature": 1.0, "top_p": 1.0,  "top_k": 0},
+    # GLM-4.7-Flash official defaults: temp 1.0, top-p 0.95, max_new 131072
+    "glm":      {"temperature": 1.0, "top_p": 0.95, "top_k": 0},
     "_default": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
 }
 
 
 def preset_for(model):
     n = model.lower()
-    for key in ("qwen3", "gemma", "gpt_oss", "gpt-oss"):
+    for key in ("qwen3", "gemma", "gpt_oss", "gpt-oss", "glm"):
         if key.replace("-", "_") in n.replace("-", "_"):
             return SAMPLING_PRESETS.get(key.replace("-", "_"), SAMPLING_PRESETS["_default"])
     return SAMPLING_PRESETS["_default"]
@@ -69,7 +71,17 @@ def load_rows(ev, a):
     elif ev == "math500":
         ds = load_dataset(a.math_dataset, split=a.split or "test")
     elif ev == "gpqa":
-        ds = load_dataset(a.gpqa_dataset, a.gpqa_config, split=a.split or "train")
+        try:
+            ds = load_dataset(a.gpqa_dataset, a.gpqa_config, split=a.split or "train")
+        except Exception:
+            # GPQA is gated; fall back to the already-cached CSV on this server
+            # (load via the csv builder — same columns as the gated dataset).
+            from huggingface_hub import hf_hub_download
+
+            csv = hf_hub_download(
+                repo_id=a.gpqa_dataset, filename=f"{a.gpqa_config}.csv",
+                repo_type="dataset", local_files_only=True)
+            ds = load_dataset("csv", data_files=csv, split="train")
     else:
         raise ValueError(ev)
     rows = list(ds)

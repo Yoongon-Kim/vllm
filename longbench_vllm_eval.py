@@ -85,9 +85,10 @@ def build_llm(a):
     # seqs fit. Cap it so graphs capture and decode fits. F1 is unaffected.
     if a.max_num_seqs:
         kw["max_num_seqs"] = a.max_num_seqs
-    ov = yarn_overrides(a.model)
-    if ov:
-        kw["hf_overrides"] = ov
+    if getattr(a, "yarn", True):
+        ov = yarn_overrides(a.model)
+        if ov:
+            kw["hf_overrides"] = ov
     if a.mode in ("lrosa", "loki"):
         # loki = same LRoSA backend (proj_K = M@K) but a PCA-only basis (no
         # q-aware Stiefel): pca_loki_cs{N} instead of pca_d1_cs{N}.
@@ -219,6 +220,8 @@ def main():
     # and the deployment-relevant config). --no-fp8_projk for bf16. Ignored
     # for fkv/fasa/quest and auto-gated off for head_size>256 (e.g. Gemma 4).
     ap.add_argument("--fp8_projk", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--yarn", action=argparse.BooleanOptionalAction, default=True,
+                    help="--no-yarn disables the Qwen3 YaRN override (native rope).")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--max_num_seqs", type=int, default=0,
                     help="cap concurrent seqs (0=vllm default 1024). Bounds the "
