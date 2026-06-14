@@ -22,6 +22,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# Row-tile for the CONTIGUOUS proj_K score kernel. Coalesced reads favor a large
+# tile; tuned on B200 (cs_h=32, fp8) — 1.3-1.6x over the legacy 64 across
+# 8k-128k / batch 8-32, monotone. In-slot path keeps its own small tile.
+_CONTIG_SCORE_BLOCK_T = 512
+
 
 @triton.jit
 def _lrosa_score_kernel(
@@ -57,8 +62,13 @@ def _lrosa_score_kernel(
     # are eligible (older ones masked to -inf so they're never selected). The
     # caller passes a window >= max context for full-attention layers, making
     # ``seq_len - window`` <= 0 so the lower bound is a no-op.
-    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window)
     in_range = t_offs < max_kv_len
+    # Bound by block_table capacity too (max_kv_len == block_table.shape[1] *
+    # block_size): a transient where seq_len > max_kv_len would otherwise load
+    # block_table/cache OOB at t in [max_kv_len, seq_len). Gating in_seq by
+    # in_range keeps every load in-bounds (block_idx < max_blocks) and -inf's
+    # the unreachable tail. The scores store is already masked by in_range.
+    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window) & in_range
 
     c_offs = tl.arange(0, BLOCK_C)
     c_mask = c_offs < cs_h
@@ -135,8 +145,13 @@ def _lrosa_score_contig_kernel(
 
     t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     seq_len = tl.load(seq_lens_ptr + pid_r)
-    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window)
     in_range = t_offs < max_kv_len
+    # Bound by block_table capacity too (max_kv_len == block_table.shape[1] *
+    # block_size): a transient where seq_len > max_kv_len would otherwise load
+    # block_table/cache OOB at t in [max_kv_len, seq_len). Gating in_seq by
+    # in_range keeps every load in-bounds (block_idx < max_blocks) and -inf's
+    # the unreachable tail. The scores store is already masked by in_range.
+    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window) & in_range
 
     c_offs = tl.arange(0, BLOCK_C)
     c_mask = c_offs < cs_h
@@ -192,8 +207,8 @@ def _lrosa_score_layer_kernel(
     pid_t = tl.program_id(1)
     t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     seq_len = tl.load(seq_lens_ptr + pid_r)
-    in_seq = t_offs < seq_len
     in_range = t_offs < max_kv_len
+    in_seq = (t_offs < seq_len) & in_range  # bound by block_table capacity (see above)
 
     c_offs = tl.arange(0, BLOCK_C)
     c_mask = c_offs < cs_h_slot
@@ -359,7 +374,12 @@ def lrosa_score(
 
     if projk_cache is not None:
         BLOCK_C = triton.next_power_of_2(cs_h)
-        BLOCK_T = block_t
+        # Contiguous proj_K is coalesced, so a LARGE row tile amortizes launch
+        # and maximizes read efficiency: microbench (B200, cs_h=32, fp8) shows
+        # BLOCK_T=512 is 1.3-1.6x over the old 64 across 8k-128k / batch 8-32,
+        # monotone, no short-ctx regression. (The in-slot kernel below keeps the
+        # caller's block_t=64 — its strided read prefers a small tile.)
+        BLOCK_T = _CONTIG_SCORE_BLOCK_T
         grid = (num_reqs, H_kv, triton.cdiv(max_kv_len, BLOCK_T))
         win_eff = window if window > 0 else (max_kv_len + 1)
         _lrosa_score_contig_kernel[grid](
