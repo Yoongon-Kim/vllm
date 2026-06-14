@@ -128,6 +128,7 @@ def indexed_attend_kv(q, kv_cache, block_table, top_idx, head_size, scale, out=N
     if out is None:
         out = torch.empty_like(q)
     BLOCK_D = triton.next_power_of_2(hs)
+    BLOCK_N = 128 if hs <= 256 else 32  # head 512 (gemma full) -> small tile (smem)
     _indexed_attend_kv_kernel[(R, Hk)](
         q, kv_cache, block_table, top_idx, out,
         scale, n_fac, hs, kv_cache.shape[1],
@@ -135,7 +136,7 @@ def indexed_attend_kv(q, kv_cache, block_table, top_idx, head_size, scale, out=N
         kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
         block_table.stride(0), top_idx.stride(0), top_idx.stride(1),
         out.stride(0), out.stride(1),
-        G=G, BLOCK_N=128, BLOCK_D=BLOCK_D,
+        G=G, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
     )
     return out
 
@@ -235,7 +236,7 @@ def indexed_attend_kv_split(q, kv_cache, block_table, top_idx, head_size, scale,
     Hk = top_idx.shape[1]
     n_fac = top_idx.shape[2]
     G = Hq // Hk
-    BLOCK_N = 128
+    BLOCK_N = 128 if hs <= 256 else 32  # head 512 (gemma full) -> small tile (smem)
     BLOCK_D = triton.next_power_of_2(hs)
     max_splits = max(1, (n_fac + BLOCK_N - 1) // BLOCK_N)
     sm = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -286,7 +287,7 @@ def indexed_attend(q, kv_cache, block_table, top_idx, head_size, scale, out=None
         kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
         block_table.stride(0), top_idx.stride(0), top_idx.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_N=64, BLOCK_D=BLOCK_D,
+        BLOCK_N=(64 if hs <= 256 else 32), BLOCK_D=BLOCK_D,
     )
     return out
 
@@ -338,12 +339,26 @@ def main():
     cu_k = (cu_q * n_fac).to(torch.int32)
     scale = 1.0 / (hs ** 0.5)
 
+    G = Hq // Hk
+    HEAD_GT_256 = hs > 256  # flash caps head_dim at 256 -> use manual GQA einsum
+                            # (matches the production head>256 path, e.g. gemma full layers)
+
     def gather():
         lrosa_gather(kv_cache, block_table, top_idx, hs, K_sel_out=K_sel, V_sel_out=V_sel)
 
-    def attend():
+    def attend_flash():
         flash_attn_varlen_func(q=q, k=K_sel, v=V_sel, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                                max_seqlen_q=1, max_seqlen_k=n_fac, softmax_scale=scale, causal=False)
+
+    def attend_einsum():
+        K = K_sel.view(R, n_fac, Hk, hs).permute(0, 2, 1, 3)  # (R,Hk,nf,d)
+        V = V_sel.view(R, n_fac, Hk, hs).permute(0, 2, 1, 3)
+        qg = q.view(R, Hk, G, hs).to(torch.float32)
+        sc = torch.einsum("nhgd,nhfd->nhgf", qg, K.to(torch.float32)) * scale
+        at = torch.softmax(sc, dim=-1)
+        return torch.einsum("nhgf,nhfd->nhgd", at, V.to(torch.float32)).reshape(R, Hq, hs)
+
+    attend = attend_einsum if HEAD_GT_256 else attend_flash
 
     def both():
         gather(); attend()
@@ -361,10 +376,13 @@ def main():
     def indexed_split():
         indexed_attend_kv_split(q, kv_cache, block_table, top_idx, hs, scale, out=o_idx3)
 
-    # correctness vs (gather + varlen) reference
+    # correctness reference: einsum (exact, any head) for head>256, else flash
     gather()
-    ref = flash_attn_varlen_func(q=q, k=K_sel, v=V_sel, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-                                 max_seqlen_q=1, max_seqlen_k=n_fac, softmax_scale=scale, causal=False)
+    if HEAD_GT_256:
+        ref = attend_einsum()
+    else:
+        ref = flash_attn_varlen_func(q=q, k=K_sel, v=V_sel, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                                     max_seqlen_q=1, max_seqlen_k=n_fac, softmax_scale=scale, causal=False)
     indexed(); indexed_kv(); indexed_split()
     torch.cuda.synchronize()
     refmax = ref.float().abs().max().item() + 1e-6

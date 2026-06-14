@@ -646,10 +646,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         )
         # Gather-free indexed attention: fuse selection-gather + attend into one
         # kernel (no K_sel/V_sel buffer). The buffer scales with num_decodes ×
-        # n_fac, so removing it cuts the attention-side fixed overhead ~2.3x at
-        # large batch (the throughput operating point). Decode-time gate also
-        # requires head<=256 and no sinks/softcap/alibi/partial (else fall back
-        # to gather+flash, which handles those).
+        # n_fac, so removing it cuts the attention-side fixed overhead at large
+        # batch; for gemma full layers (head 512) it also replaces the slow
+        # manual einsum path (4.9-6.6x faster attend). Decode-time gate also
+        # requires head<=512 and no sinks/softcap/alibi/partial (else fall back
+        # to gather+flash / einsum, which handle those).
         self.indexed_attend = (
             getattr(attn_cfg, "lrosa_indexed_attend", False)
             and not self.is_fasa
@@ -1235,11 +1236,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
 
         # Gather-free fused attention: stream the selected paged slots directly
         # through an online-softmax kernel, skipping the K_sel/V_sel buffer.
-        # Only the plain qwen-like path (head<=256, set attention, no
-        # sinks/softcap/alibi, steady-state non-partial); everything else keeps
-        # the gather+flash path below which supports those features.
+        # head<=512 (covers gemma full layers, replacing the manual einsum),
+        # set attention, no sinks/softcap/alibi, steady-state non-partial;
+        # everything else keeps the gather+flash / einsum path below.
         if (self.indexed_attend and num_decodes >= self.indexed_min_batch
-                and head_size <= 256 and not partial
+                and head_size <= 512 and not partial
                 and self.sinks is None and not self.logits_soft_cap
                 and self.alibi_slopes is None):
             from vllm.v1.attention.ops.triton_lrosa_indexed_attend import (

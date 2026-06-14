@@ -23,7 +23,8 @@ Two grids:
     batch 4). S is chosen adaptively from the SM count.
 
 ``lrosa_indexed_attend`` picks v2 vs v3 by batch, so it is a net win across all
-batch sizes. Caller gates (see lrosa_attn.py): head_size<=256, set attention,
+batch sizes. Caller gates (see lrosa_attn.py): head_size<=512 (BLOCK_N shrinks
+to 32 for head 512 to fit shared memory; gemma full layers), set attention,
 no sinks/softcap/alibi, steady-state non-partial; everything else falls back to
 gather+flash. ``int64`` slot addressing handles num_blocks>~58k (long ctx).
 """
@@ -201,8 +202,10 @@ def lrosa_indexed_attend(q, kv_cache, block_table, top_idx, head_size, scale,
     Hk = top_idx.shape[1]
     n_fac = top_idx.shape[2]
     G = Hq // Hk
-    BLOCK_N = 128
     BLOCK_D = triton.next_power_of_2(hs)
+    # head 512 (gemma full layers) -> BLOCK_N*BLOCK_D fp32 tiles blow the 232KB
+    # shared-memory limit at BLOCK_N=128; shrink the tile. head<=256 keeps 128.
+    BLOCK_N = 128 if hs <= 256 else 32
     if sm_count is None:
         sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     S = indexed_split_count(R, Hk, n_fac, sm_count, BLOCK_N)
