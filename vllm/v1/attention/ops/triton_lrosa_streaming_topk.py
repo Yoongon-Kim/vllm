@@ -225,6 +225,24 @@ def lrosa_streaming_topk(
     assert (chunk_size & (chunk_size - 1)) == 0 and chunk_size > 0
     assert (block_t & (block_t - 1)) == 0 and block_t > 0
     assert (cs_h & (cs_h - 1)) == 0 and cs_h > 0
+    # Stage 1 merges the running top-N_FAC with each BLOCK_T tile via
+    # ``tl.cat(running[N_FAC], tile[BLOCK_T])`` -> ``tl.topk(.., N_FAC)``; Triton
+    # block shapes (and tl.topk inputs) must be powers of 2, so N_FAC + BLOCK_T
+    # must be a power of 2. With a pow2 N_FAC that forces BLOCK_T == N_FAC. This
+    # is fine for the LongBench regime (n_fac=256 -> block_t=256, merge 512), but
+    # the reasoning regime (n_fac=2048) would need block_t=2048 whose proj_K tile
+    # (2048 x cs_h fp32) overflows shared memory — streaming there needs a
+    # sub-tiled-accumulate redesign (and reads in-slot bf16, so it does not beat
+    # the fp8/contig score + radix path on bandwidth-rich GPUs anyway). Fail
+    # loudly here instead of crashing inside the kernel with a cryptic
+    # "Shape element 0 must be a power of 2".
+    nfbt = n_fac + block_t
+    assert (nfbt & (nfbt - 1)) == 0, (
+        f"streaming top-K needs n_fac + block_t to be a power of 2 (the stage-1 "
+        f"cat+topk width); got n_fac={n_fac} + block_t={block_t} = {nfbt}. "
+        f"Set block_t={n_fac} (smem-permitting) or use the radix/contig score "
+        f"path for this n_fac."
+    )
 
     block_size = kv_cache.shape[1]
 

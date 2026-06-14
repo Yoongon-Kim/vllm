@@ -25,6 +25,7 @@ from vllm.triton_utils import tl, triton
 # Row-tile for the CONTIGUOUS proj_K score kernel. Coalesced reads favor a large
 # tile; tuned on B200 (cs_h=32, fp8) — 1.3-1.6x over the legacy 64 across
 # 8k-128k / batch 8-32, monotone. In-slot path keeps its own small tile.
+# (num_warps swept too: the Triton default of 4 is optimal; 8/16 regress.)
 _CONTIG_SCORE_BLOCK_T = 512
 
 
