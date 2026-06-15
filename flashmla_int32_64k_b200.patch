@@ -1,0 +1,115 @@
+diff --git a/csrc/api/sparse_decode.h b/csrc/api/sparse_decode.h
+index be4b9e7..1c3d9e6 100644
+--- a/csrc/api/sparse_decode.h
++++ b/csrc/api/sparse_decode.h
+@@ -411,11 +411,11 @@ sparse_attn_decode_interface(
+         ku::get_optional_tensor_ptr<int>(extra_indices),
+         ku::get_optional_tensor_ptr<int>(extra_topk_length),
+ 
+-        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
++        q.stride(0), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
+         int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+         int64_stride_to_int(lse.stride(0)), int64_stride_to_int(lse.stride(1)),
+-        int64_stride_to_int(out.stride(0)), int64_stride_to_int(out.stride(1)), int64_stride_to_int(out.stride(2)),
++        out.stride(0), int64_stride_to_int(out.stride(1)), int64_stride_to_int(out.stride(2)),
+ 
+         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(0)) : 0,
+         have_extra_kcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
+@@ -471,7 +471,7 @@ sparse_attn_decode_interface(
+     params.o_accum = o_accum.data_ptr<float>();
+     params.stride_lse_accum_split = int64_stride_to_int(lse_accum.stride(0));
+     params.stride_lse_accum_s_q = int64_stride_to_int(lse_accum.stride(1));
+-    params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
++    params.stride_o_accum_split = o_accum.stride(0);
+     params.stride_o_accum_s_q = int64_stride_to_int(o_accum.stride(1));
+     params.stride_o_accum_h_q = int64_stride_to_int(o_accum.stride(2));
+ 
+diff --git a/csrc/params.h b/csrc/params.h
+index 4433e8d..d7bd936 100644
+--- a/csrc/params.h
++++ b/csrc/params.h
+@@ -82,11 +82,11 @@ struct SparseAttnDecodeParams {
+     int* __restrict__ extra_indices;   // [b, s_q, extra_topk]
+     int* __restrict__ extra_topk_length;  // [b], may be nullptr
+     
+-    int stride_q_b, stride_q_s_q, stride_q_h_q;
++    int64_t stride_q_b; int stride_q_s_q, stride_q_h_q;  // q.stride(0)=s_q*h_q*d_qk overflows int32 at long prefill (s_q~64k)
+     int stride_kv_block, stride_kv_row;
+     int stride_indices_b, stride_indices_s_q;
+     int stride_lse_b, stride_lse_s_q;
+-    int stride_o_b, stride_o_s_q, stride_o_h_q;
++    int64_t stride_o_b; int stride_o_s_q, stride_o_h_q;  // out.stride(0)=s_q*h_q*d_v hits 2^31 at s_q~64k
+     int stride_extra_kv_block, stride_extra_kv_row;
+     int stride_extra_indices_b, stride_extra_indices_s_q;
+     
+@@ -96,7 +96,7 @@ struct SparseAttnDecodeParams {
+     float* __restrict__ lse_accum;  // [num_splits, s_q, h_q]
+     float* __restrict__ o_accum;    // [num_splits, s_q, h_q, d_v]
+     int stride_lse_accum_split, stride_lse_accum_s_q;
+-    int stride_o_accum_split, stride_o_accum_s_q, stride_o_accum_h_q;
++    int64_t stride_o_accum_split; int stride_o_accum_s_q, stride_o_accum_h_q;  // o_accum.stride(0)=s_q*h_q*d_v hits 2^31 at s_q~64k
+     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
+     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
+     int num_sm_parts;
+@@ -108,12 +108,12 @@ struct CombineParams {
+     float* __restrict__ lse;    // [b, s_q, h_q]
+     void* __restrict__ out;   // [b, s_q, h_q, d_v]
+     int stride_lse_b, stride_lse_s_q;
+-    int stride_o_b, stride_o_s_q, stride_o_h_q;
++    int64_t stride_o_b; int stride_o_s_q, stride_o_h_q;  // out.stride(0) hits 2^31 at s_q~64k (CombineParams)
+ 
+     float* __restrict__ lse_accum;  // [num_splits, s_q, h_q]
+     float* __restrict__ o_accum;    // [num_splits, s_q, h_q, d_v]
+     int stride_lse_accum_split, stride_lse_accum_s_q;
+-    int stride_o_accum_split, stride_o_accum_s_q, stride_o_accum_h_q;
++    int64_t stride_o_accum_split; int stride_o_accum_s_q, stride_o_accum_h_q;  // o_accum.stride(0)=s_q*h_q*d_v hits 2^31 at s_q~64k
+ 
+     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
+     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
+diff --git a/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh b/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh
+index 388abc8..6ec459c 100644
+--- a/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh
++++ b/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh
+@@ -1023,7 +1023,7 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
+     if constexpr (IS_DECODE) {
+         tensor_map_o = ku::make_tensor_map(
+             {64, H_Q, D_V/64, (unsigned long)params.s_q, (unsigned long)params.b},
+-            ku::make_stride_helper<int>({params.stride_o_h_q, 64, params.stride_o_s_q, params.stride_o_b}, sizeof(bf16)),
++            ku::make_stride_helper<int64_t>({params.stride_o_h_q, 64, params.stride_o_s_q, params.stride_o_b}, sizeof(bf16)),
+             {64, H_Q/2, D_V/64, 1, 1},
+             params.out,
+             CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+@@ -1047,7 +1047,7 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
+     if constexpr (FWD_MODE == FwdMode::DecodeWithSplitKV) {
+         tensor_map_o_accum = ku::make_tensor_map(
+             {32, H_Q, D_V/32, (unsigned long)params.s_q, (unsigned long)params.num_sm_parts + params.b},
+-            ku::make_stride_helper<int>({params.stride_o_accum_h_q, 32, params.stride_o_accum_s_q, params.stride_o_accum_split}, sizeof(float)),
++            ku::make_stride_helper<int64_t>({params.stride_o_accum_h_q, 32, params.stride_o_accum_s_q, params.stride_o_accum_split}, sizeof(float)),
+             {32, H_Q/2, B_EPI_SPLITKV/32, 1, 1},
+             params.o_accum,
+             CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+diff --git a/csrc/smxx/decode/combine/combine.cu b/csrc/smxx/decode/combine/combine.cu
+index 7f23874..cdf3e93 100644
+--- a/csrc/smxx/decode/combine/combine.cu
++++ b/csrc/smxx/decode/combine/combine.cu
+@@ -21,8 +21,8 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+     // grid_shape: [batch_size, s_q, h_q/BLOCK_SIZE_M]
+     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
+     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
+-    const int batch_idx = blockIdx.x;
+-    const int s_q_idx = blockIdx.y;
++    const int s_q_idx = blockIdx.x;   // s_q in gridDim.x (max 2^31): prefill s_q can be 64k > 65535 (y/z limit)
++    const int batch_idx = blockIdx.y;
+     const int h_block_idx = blockIdx.z;
+     const int warp_idx = threadIdx.x / 32;
+     const int lane_idx = threadIdx.x % 32;
+@@ -199,7 +199,7 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
+         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+         attribute[0].val.programmaticStreamSerializationAllowed = 1;
+         cudaLaunchConfig_t combine_kernel_config = {
+-            dim3(params.b, params.s_q, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
++            dim3(params.s_q, params.b, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+             dim3(NUM_THREADS, 1, 1),
+             0,
+             params.stream,
