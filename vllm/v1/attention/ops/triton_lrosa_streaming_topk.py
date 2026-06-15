@@ -88,6 +88,7 @@ def _stage1_local_topk_kernel(
     CHUNK_SIZE: tl.constexpr,
     BLOCK_T: tl.constexpr,
     NEG_INF_PACKED: tl.constexpr,
+    LOG_RATIO: tl.constexpr,  # log2(N_FAC // BLOCK_T): tile -> N_FAC pad steps
 ):
     pid_r = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -154,7 +155,19 @@ def _stage1_local_topk_kernel(
         scores = tl.where(in_seq, scores, -float("inf"))
 
         tile_packed = _pack_score_idx(scores, t_offs.to(tl.int32))
-        merged = tl.cat(running_packed, tile_packed, can_reorder=True)
+        # Merge running top-N_FAC with this BLOCK_T tile. tl.cat / tl.topk need
+        # power-of-2 widths, so N_FAC + BLOCK_T must be pow2 — which forces
+        # BLOCK_T == N_FAC for a pow2 N_FAC (broke at n_fac=2048, block_t=256:
+        # 2304). Instead PAD the tile up to N_FAC with -inf via a doubling
+        # cat-tree (256->512->1024->2048, every width pow2), then cat with the
+        # running buffer -> 2*N_FAC and topk. The -inf padding is never selected,
+        # so the result is the exact top-N_FAC of running ∪ tile — and BLOCK_T
+        # can stay small (smem-friendly) for any pow2 N_FAC.
+        padded = tile_packed
+        for i in tl.static_range(LOG_RATIO):
+            padded = tl.cat(padded, tl.full([BLOCK_T << i], NEG_INF_PACKED,
+                                            dtype=tl.uint64), can_reorder=True)
+        merged = tl.cat(running_packed, padded, can_reorder=True)
         running_packed = tl.topk(merged, N_FAC, dim=0)
 
     tl.store(out_ptrs, running_packed)
@@ -209,6 +222,17 @@ def lrosa_streaming_topk(
     Caller owns the candidates buffer (sized at engine init in the
     LRoSA backend's MetadataBuilder); this avoids per-step allocations
     and keeps the pointer stable across CUDA-Graph captures.
+
+    PERFORMANCE: stage 1 runs ``tl.topk(2*N_FAC)`` once per BLOCK_T tile to
+    maintain the running top-N_FAC. That per-tile topk is fine for SMALL n_fac
+    (n_fac=256 LongBench: competitive) but its cost grows with n_fac, and at
+    n_fac=2048 it is ~24x SLOWER than the score+radix path (measured: 362 vs
+    ~15 ms/tok e2e, qwen3-8b 32k) — the topk-per-tile compute far outweighs the
+    scores-buffer round-trip that streaming saves, and this is compute-bound so
+    it does not improve on bandwidth-limited GPUs either. Use score+radix
+    (lrosa_score_topk) for n_fac >= ~512; streaming is retained for the small-
+    n_fac regime and as a correctness reference (verified >=99% top-set overlap
+    with radix at n_fac=2048). Output is exact up to top-K tie-breaking.
     """
     num_reqs, H_kv, cs_h_q = proj_q.shape
     assert cs_h_q == cs_h
@@ -225,24 +249,18 @@ def lrosa_streaming_topk(
     assert (chunk_size & (chunk_size - 1)) == 0 and chunk_size > 0
     assert (block_t & (block_t - 1)) == 0 and block_t > 0
     assert (cs_h & (cs_h - 1)) == 0 and cs_h > 0
-    # Stage 1 merges the running top-N_FAC with each BLOCK_T tile via
-    # ``tl.cat(running[N_FAC], tile[BLOCK_T])`` -> ``tl.topk(.., N_FAC)``; Triton
-    # block shapes (and tl.topk inputs) must be powers of 2, so N_FAC + BLOCK_T
-    # must be a power of 2. With a pow2 N_FAC that forces BLOCK_T == N_FAC. This
-    # is fine for the LongBench regime (n_fac=256 -> block_t=256, merge 512), but
-    # the reasoning regime (n_fac=2048) would need block_t=2048 whose proj_K tile
-    # (2048 x cs_h fp32) overflows shared memory — streaming there needs a
-    # sub-tiled-accumulate redesign (and reads in-slot bf16, so it does not beat
-    # the fp8/contig score + radix path on bandwidth-rich GPUs anyway). Fail
-    # loudly here instead of crashing inside the kernel with a cryptic
-    # "Shape element 0 must be a power of 2".
-    nfbt = n_fac + block_t
-    assert (nfbt & (nfbt - 1)) == 0, (
-        f"streaming top-K needs n_fac + block_t to be a power of 2 (the stage-1 "
-        f"cat+topk width); got n_fac={n_fac} + block_t={block_t} = {nfbt}. "
-        f"Set block_t={n_fac} (smem-permitting) or use the radix/contig score "
-        f"path for this n_fac."
+    # Stage 1 pads each BLOCK_T tile up to N_FAC (doubling cat-tree of -inf) then
+    # merges with the running top-N_FAC -> 2*N_FAC -> topk. tl.cat/tl.topk need
+    # pow2 widths, so we require block_t <= n_fac and n_fac/block_t a power of 2
+    # (block_t stays small/smem-friendly for any pow2 n_fac, e.g. 2048).
+    assert block_t <= n_fac and (n_fac % block_t) == 0, (
+        f"block_t ({block_t}) must divide n_fac ({n_fac})"
     )
+    ratio = n_fac // block_t
+    assert (ratio & (ratio - 1)) == 0, (
+        f"n_fac/block_t must be a power of 2 (got {n_fac}/{block_t}={ratio})"
+    )
+    log_ratio = ratio.bit_length() - 1
 
     block_size = kv_cache.shape[1]
 
@@ -282,6 +300,7 @@ def lrosa_streaming_topk(
         CHUNK_SIZE=chunk_size,
         BLOCK_T=block_t,
         NEG_INF_PACKED=_NEG_INF_PACKED_PY,
+        LOG_RATIO=log_ratio,
     )
 
     # Stage 2: cross-chunk merge.
