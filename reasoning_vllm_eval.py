@@ -176,6 +176,15 @@ def build_llm(a):
         kw["attention_config"] = {"fasa_mla": True, "lrosa_basis_path": a.basis,
                                   "lrosa_n_fac": a.n_fac, "lrosa_cs_h": a.cs_h}
         kw["kv_cache_dtype"] = a.mla_kv_dtype
+    elif a.mode == "quest_mla":
+        # Quest on an MLA model (GLM-4.7-Flash): calibration-free page-level min/max
+        # upper-bound selection over the raw key [c_KV | k_pe]; a QuestMLAIndexer keeps
+        # its own bf16 paged cache and drives the same FLASHMLA_SPARSE attend. Eager
+        # only (PyTorch min/max). n_fac = token budget, quest_page_size = page tokens.
+        kw["attention_config"] = {"quest_mla": True, "lrosa_n_fac": a.n_fac,
+                                  "quest_page_size": a.page_size}
+        kw["kv_cache_dtype"] = a.mla_kv_dtype
+        kw["enforce_eager"] = True
     elif a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
@@ -240,7 +249,7 @@ def main():
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
                     choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
-                             "fasa_mla", "seer"])
+                             "fasa_mla", "quest_mla", "seer"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
@@ -266,6 +275,8 @@ def main():
     ap.add_argument("--n_fac", type=int, default=2048)
     ap.add_argument("--cs_h", type=int, default=32)
     ap.add_argument("--n_tip", type=int, default=16)
+    ap.add_argument("--page_size", type=int, default=16,
+                    help="Quest-MLA page size in tokens (quest_page_size).")
     ap.add_argument("--basis", default=None)
     ap.add_argument("--seer_gate_path", default=None,
                     help="SeerAttention-R AttnGate adapter (attn_gate_weights.pth "

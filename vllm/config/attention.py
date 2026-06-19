@@ -152,6 +152,15 @@ class AttentionConfig:
     ``lrosa_cs_h`` (interpreted as N_tip = #dominant RoPE FCs). Mutually exclusive
     with ``lrosa_mla``."""
 
+    quest_mla: bool = False
+    """Apply Quest page-level min/max selection to an MLA model. A QuestMLAIndexer
+    keeps its own bf16 paged cache of the raw key ``[c_KV | k_pe]`` (576-d), scores
+    ``Σ_c max(q·Kmin, q·Kmax)`` per ``quest_page_size`` page with an MQA group-mean
+    query, takes the top ``lrosa_n_fac // page_size`` pages (+ trailing partial page),
+    expands to token indices and drives the same FLASHMLA_SPARSE attend. Eager only
+    (PyTorch min/max, not the fp8-dot SparseAttnIndexer). Calibration-free. Reuses
+    ``lrosa_n_fac`` (token budget). Mutually exclusive with ``lrosa_mla``/``fasa_mla``."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

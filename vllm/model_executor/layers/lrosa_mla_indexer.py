@@ -32,6 +32,153 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.utils import extract_layer_index
 
 
+class QuestMLAIndexer(nn.Module):
+    """QUEST-on-MLA token selector (page-level upper bound on the MLA key). Quest
+    scores a page p as Σ_c max(q[c]·Kmin_p[c], q[c]·Kmax_p[c]) — a min/max upper
+    bound, NOT a q·k dot product, so it CANNOT use the fp8 paged-MQA-logits kernel
+    that LRoSA/FASA reuse. Instead this keeps its OWN bf16 paged cache of the raw key
+    [c_KV | k_pe] (head_dim = kv_lora_rank + qk_rope), and at decode does an EAGER
+    page-min/max scorer per request: gather cached keys via the block table, fold into
+    page_size-token pages, score, take the top (n_fac // page_size) pages, expand to
+    token ids (+ the always-attended trailing partial page), and write topk_indices_buffer
+    for the FlashMLASparse attend. Query = group-mean over heads of [q_latent | q_pe]
+    (MQA upper bound, matching the GQA Quest port). enforce_eager required (the eager
+    gather/min-max ops break CUDA-graph capture). Prefill: when the context fits the
+    budget (reasoning's short prompt) every token attends all causal positions; longer
+    prefill falls back to per-token causal page selection. No calibration."""
+
+    def __init__(self, vllm_config, config, cache_config, fused_qkv_a_proj,
+                 kv_a_proj_with_mqa, q_b_proj, kv_a_layernorm, kv_b_proj, rotary_emb,
+                 q_lora_rank, n_fac, page_size, topk_indices_buffer, prefix=""):
+        super().__init__()
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.n_head = config.num_attention_heads
+        self.key_dim = self.kv_lora_rank + self.qk_rope_head_dim   # 576 for GLM
+        self.page_size = page_size
+        self.topk_tokens = n_fac
+        self.fused_qkv_a_proj = fused_qkv_a_proj
+        self.kv_a_proj_with_mqa = kv_a_proj_with_mqa
+        self.q_b_proj = q_b_proj
+        self.kv_a_layernorm = kv_a_layernorm
+        self.kv_b_proj = kv_b_proj
+        self.rotary_emb = rotary_emb
+        self.q_lora_rank = q_lora_rank
+        self.layer_idx = extract_layer_index(prefix)
+        self.topk_indices_buffer = topk_indices_buffer
+        # bf16 paged cache of the raw key [c_KV | k_pe] (NOT fp8 — min/max must be exact).
+        self.k_cache = DeepseekV32IndexerCache(
+            head_dim=self.key_dim, dtype=torch.bfloat16,
+            prefix=f"{prefix}.k_cache", cache_config=cache_config)
+
+    def forward(self, hidden_states, q_c, positions, rotary_emb=None):
+        from vllm.forward_context import get_forward_context
+        T = hidden_states.shape[0]
+        H = self.n_head
+        kvlr, rope_d = self.kv_lora_rank, self.qk_rope_head_dim
+        # latent c_KV + decoupled rope key (kv_a path)
+        if self.q_lora_rank is not None:
+            kv_lora = self.fused_qkv_a_proj(hidden_states)[0][..., self.q_lora_rank:]
+        else:
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+        c_kv = self.kv_a_layernorm(kv_lora[..., :kvlr])             # [T, kvlr]
+        k_pe = kv_lora[..., kvlr:].unsqueeze(1)                     # [T,1,rope]
+        q = self.q_b_proj(q_c)[0].view(T, H, self.qk_head_dim)
+        q_nope = q[..., :self.qk_nope_head_dim]
+        q_pe = q[..., self.qk_nope_head_dim:]                      # [T,H,rope]
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q_pe = q_pe.reshape(T, H, rope_d)
+        k_pe = k_pe.reshape(T, rope_d)
+        W_UK = self.kv_b_proj.weight.view(
+            H, self.qk_nope_head_dim + self.v_head_dim, kvlr)[:, :self.qk_nope_head_dim, :]
+        q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)      # [T,H,kvlr]
+        # Per-head query [T,H,key_dim]. The heads share the latent KV (MQA-on-MLA),
+        # so the Quest page bound is computed PER HEAD and reduced by max over heads
+        # (union: keep a page if ANY head wants it). Averaging the query over heads
+        # cancels opposite-sign components -> a near-zero query -> near-random pages.
+        q_h_all = torch.cat([q_latent, q_pe], dim=-1)              # [T, H, key_dim]
+        key = torch.cat([c_kv, k_pe], dim=-1)                       # [T, key_dim]
+
+        md = get_forward_context().attn_metadata
+        buf = self.topk_indices_buffer
+        if not isinstance(md, dict):
+            return buf  # profiling/dummy
+        m = md.get(self.k_cache.prefix)
+        cache = self.k_cache.kv_cache                               # [n_blk, blk, key_dim] bf16
+        buf[:T] = -1
+        if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
+            return buf
+        flat = cache.view(-1, self.key_dim)
+        flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+        # Decode: eager per-request page min/max selection.
+        if m.num_decodes > 0 and m.decode is not None:
+            bt = m.decode.block_table                              # [B, max_blk]
+            sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)  # [B]
+            blk = cache.shape[1]
+            P, K = self.page_size, self.topk_tokens
+            ar_blk = torch.arange(blk, device=bt.device)
+            ar_P = torch.arange(P, device=bt.device)
+            for r in range(m.num_decodes):
+                L = int(sl[r].item())
+                if L <= 0:
+                    continue
+                # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
+                # used ONLY to read the cached keys for the min/max (global slots).
+                if L <= K:                                        # all fit -> attend all
+                    buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
+                nblk = (L + blk - 1) // blk
+                ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots, local order
+                ks = flat[ids]                                    # [L, key_dim] (row j = local pos j)
+                # ALWAYS keep the page holding the current decode token + most-recent
+                # context (Quest keeps the local window); score only the full pages
+                # strictly before it and fill the remaining budget with the top pages.
+                last_start = ((L - 1) // P) * P
+                tail = torch.arange(last_start, L, device=bt.device)   # current/last page
+                ncand = last_start // P                                # full candidate pages
+                keep = (K - int(tail.numel())) // P                    # pages affordable after tail
+                if ncand == 0 or keep <= 0:
+                    out = torch.cat([torch.arange(0, last_start, device=bt.device), tail])[:K]
+                else:
+                    full = ks[:ncand * P].view(ncand, P, self.key_dim)
+                    kmin = full.min(1).values; kmax = full.max(1).values   # [ncand, key_dim]
+                    qh = q_h_all[r]                                        # [H, key_dim]
+                    qp = qh.clamp(min=0); qn = qh.clamp(max=0)
+                    # max(q*kmin, q*kmax) = q+*kmax + q-*kmin (per dim); sum_c -> matmul
+                    score = (qp @ kmax.t() + qn @ kmin.t()).amax(0)        # [ncand] union over heads
+                    top = score.topk(min(keep, ncand)).indices
+                    sel = (top[:, None] * P + ar_P).view(-1)               # LOCAL positions of pages
+                    out = torch.cat([tail, sel])[:K]                       # tail first -> never dropped
+                out = torch.sort(out).values                               # kernel expects ascending
+                buf[r, :out.shape[0]] = out.to(buf.dtype)
+        # Prefill: each token attends its causal context. When the causal length fits
+        # the budget (the common reasoning case: prompt <= budget) -> attend ALL causal
+        # LOCAL positions (0..i). When it overflows (long prompt + small budget, nf512
+        # only) -> streaming fallback: the K most-recent causal positions (sorted, incl
+        # self). Quest's sparsity target is the DECODE path; reasoning prompts are short
+        # so the overflow branch is rarely hit. Assumes no prefix-cache reuse (chunk
+        # covers the sequence from position 0; true for the eval).
+        if m.num_prefills > 0 and m.prefill is not None:
+            base = m.num_decode_tokens
+            K = self.topk_tokens
+            for ch in m.prefill.chunks:
+                cu = ch.cu_seq_lens.to(torch.long)                # [num_reqs+1] local cumsum
+                for j in range(ch.num_reqs):
+                    s, e = int(cu[j].item()), int(cu[j + 1].item())
+                    for i in range(e - s):
+                        tok = base + ch.token_start + s + i
+                        Lc = i + 1                                # causal length (pos 0..i)
+                        if Lc <= K:
+                            buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
+                        else:
+                            buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
+        return buf
+
+
 class FASAMLAIndexer(nn.Module):
     """FASA-on-MLA token selector (partial-RoPE recipe, OpenReview FnSgecCEwg §6 +
     DeepSeek-V2 rebuttal). MLA decouples RoPE to a small partition (k_pe); the NoPE

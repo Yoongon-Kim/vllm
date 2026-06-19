@@ -1080,6 +1080,34 @@ class DeepseekV2MLAAttention(nn.Module):
             self.indexer_rope_emb = None
             self.is_v32 = True
 
+        # Quest-on-MLA: page-level min/max upper-bound selection over the raw key
+        # [c_KV | k_pe]; eager PyTorch (the fp8-dot SparseAttnIndexer can't do min/max).
+        # Calibration-free; reuses lrosa_n_fac (budget) + quest_page_size.
+        if not self.is_v32 and getattr(
+            vllm_config.attention_config, "quest_mla", False
+        ):
+            from vllm.model_executor.layers.lrosa_mla_indexer import QuestMLAIndexer
+
+            ac = vllm_config.attention_config
+            self.indexer = QuestMLAIndexer(
+                vllm_config=vllm_config,
+                config=config,
+                cache_config=cache_config,
+                fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
+                kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
+                q_b_proj=getattr(self, "q_b_proj", None),
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                rotary_emb=self.rotary_emb,
+                q_lora_rank=self.q_lora_rank,
+                n_fac=ac.lrosa_n_fac,
+                page_size=ac.quest_page_size,
+                topk_indices_buffer=topk_indices_buffer,
+                prefix=f"{prefix}.quest_indexer",
+            )
+            self.indexer_rope_emb = None
+            self.is_v32 = True
+
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
