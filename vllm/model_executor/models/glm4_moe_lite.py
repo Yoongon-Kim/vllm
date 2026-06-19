@@ -223,7 +223,8 @@ class Glm4MoeLiteModel(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
         # LRoSA-on-MLA (appendix): no native index_topk, but we still need the
         # shared top-k buffer for the FLASHMLA_SPARSE attend driven by LRoSAMLAIndexer.
-        lrosa_mla = bool(getattr(vllm_config.attention_config, "lrosa_mla", False))
+        lrosa_mla = bool(getattr(vllm_config.attention_config, "lrosa_mla", False)) \
+            or bool(getattr(vllm_config.attention_config, "fasa_mla", False))
         if self.is_v32 or lrosa_mla:
             topk_tokens = (config.index_topk if self.is_v32
                            else vllm_config.attention_config.lrosa_n_fac)

@@ -64,8 +64,13 @@ def _fasa_score_kernel(
     seq_len = tl.load(seq_lens_ptr + pid_r)
     # Sliding-window restriction identical to LRoSA: caller passes window >=
     # max context for full attention (lower bound is then a no-op).
-    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window)
     in_range = t_offs < max_kv_len
+    # Bound by block_table capacity too (max_kv_len == block_table.shape[1] *
+    # block_size): a transient where seq_len > max_kv_len would otherwise load
+    # block_table/cache OOB at t in [max_kv_len, seq_len). Gating in_seq by
+    # in_range keeps every load in-bounds (block_idx < max_blocks) and -inf's
+    # the unreachable tail. The scores store is already masked by in_range.
+    in_seq = (t_offs < seq_len) & (t_offs >= seq_len - window) & in_range
 
     c_offs = tl.arange(0, BLOCK_C)
     c_mask = c_offs < n_ch
@@ -129,6 +134,20 @@ def fasa_score(
     block_size = kv_cache.shape[1]
     max_blocks = block_table.shape[1]
     max_kv_len = max_blocks * block_size
+    import os as _os
+    if _os.environ.get("LROSA_OOB_CHECK") == "1":
+        # Direct smoking-gun check: does the block_table region this kernel will
+        # READ (columns [0, ceil(seq_len/block_size)) per req, masked by in_seq)
+        # contain a physical block id outside the cache [0, num_blocks)? That is
+        # the only way fasa_score's main-cache read can hit unmapped memory.
+        _nbt = kv_cache.shape[0]
+        _nb = ((seq_lens + block_size - 1) // block_size).clamp(max=block_table.shape[1])
+        for _r in range(num_reqs):
+            _u = block_table[_r, : int(_nb[_r].item())]
+            if _u.numel() and (int(_u.max().item()) >= _nbt or int(_u.min().item()) < 0):
+                print(f"[OOB-GUARD] FASA req{_r} STALE block_id max={int(_u.max())} "
+                      f"min={int(_u.min())} num_blocks={_nbt} seq={int(seq_lens[_r])} "
+                      f"nb={int(_nb[_r])} bt_w={block_table.shape[1]}", flush=True)
 
     if scores_out is None:
         scores = torch.empty(

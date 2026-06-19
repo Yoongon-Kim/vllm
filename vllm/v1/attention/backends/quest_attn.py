@@ -140,6 +140,13 @@ class QuestAttentionBackend(AttentionBackend):
         return attn_type == AttentionType.DECODER
 
     @classmethod
+    def supports_sink(cls) -> bool:
+        # gpt-oss sink: QUEST prefill/decode route to flash_attn_varlen_func
+        # (s_aux on FA3/4, B200).
+        from vllm.v1.attention.backends.fa_utils import flash_attn_supports_sinks
+        return flash_attn_supports_sinks()
+
+    @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         # 256/512: Gemma 4 (sliding head_dim=256 + full head_dim=512). The
         # head>256 prefill routes through vLLM's unified_attention (FA2 caps at
@@ -378,6 +385,16 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
         self.logits_soft_cap = 0 if logits_soft_cap is None else logits_soft_cap
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        # gpt-oss attention sink (same handling as LRoSA): s_aux on FA3/4 (B200).
+        self.sinks = kwargs.get("sinks")
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+        from vllm.vllm_flash_attn.flash_attn_interface import DEFAULT_FA_VERSION
+        if self.sinks is not None:
+            assert self.sinks.shape[0] == num_heads, (
+                f"sinks {tuple(self.sinks.shape)} vs num_heads {num_heads}")
+            self._fa_version = get_flash_attn_version(has_sinks=True)
+        else:
+            self._fa_version = DEFAULT_FA_VERSION
 
     def do_kv_cache_update(
         self,
@@ -444,15 +461,23 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
                 window_size=list(self.sliding_window),
                 block_table=attn_metadata.block_table,
                 softcap=self.logits_soft_cap,
+                s_aux=self.sinks, fa_version=self._fa_version,
             )
             return output
 
         # Per-page min/max buffer (backend-managed, separate from the 2*hs
-        # per-token slot). Lazily allocated on the first forward — which runs
-        # during warmup BEFORE CUDA-graph capture — so its address is stable
-        # for graph replay (mark_static_address). Indexed by physical block id.
+        # per-token slot). Indexed by physical block id, so it must have one row
+        # per KV-cache block (kv_cache.shape[0]). Lazily (re)allocated when
+        # missing or too small: the first forward may be a profiling/dummy run
+        # with a tiny placeholder cache (e.g. shape[0]==max-cudagraph-size for a
+        # hybrid model's full-attention layers), so sizing off that first cache
+        # under-allocates and the scatter kernel writes out of bounds at real
+        # inference. Growing to the real block count converges after the first
+        # real-sized forward (which precedes CUDA-graph capture), then stays
+        # stable; mark_static_address keeps the (final) address fixed for graph
+        # replay.
         minmax = getattr(layer, "_quest_minmax", None)
-        if minmax is None:
+        if minmax is None or minmax.shape[0] < kv_cache.shape[0]:
             minmax = torch.zeros(
                 kv_cache.shape[0], self.num_kv_heads, 2 * head_size,
                 dtype=kv_cache.dtype, device=kv_cache.device)
@@ -511,6 +536,7 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
                     window_size=list(self.sliding_window),
                     block_table=bt_pf,
                     softcap=self.logits_soft_cap,
+                    s_aux=self.sinks, fa_version=self._fa_version,
                 )
             return output
 
@@ -568,6 +594,9 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             head_size, page_size)
 
         # 2. GQA group-mean query → per-kv-head, then page upper-bound score.
+        # NOTE: sliding-window layers never reach here — forward() routes them
+        # to dense windowed flash before any _sparse_decode_forward call, so
+        # self.sliding_window == (-1, -1) is guaranteed at this point.
         q_decode = query[:num_decode_tokens]  # (nd, H_q, hs)
         q_kv = q_decode.view(
             num_decodes, self.num_kv_heads, self.num_kv_groups, head_size
@@ -602,4 +631,5 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
             num_kv_groups=self.num_kv_groups,
             partial_acc=attn_metadata.partial_acc,
             partial_m=attn_metadata.partial_m,
-            partial_l=attn_metadata.partial_l)
+            partial_l=attn_metadata.partial_l,
+            sinks=self.sinks)

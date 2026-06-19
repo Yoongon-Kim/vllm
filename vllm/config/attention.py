@@ -110,7 +110,7 @@ class AttentionConfig:
     proj_K quantizes far better than FASA's K_sel; see paper). Mirrors DSA's fp8
     index logits. ~1.16x on the score kernel alone."""
 
-    lrosa_indexed_attend: bool = False
+    lrosa_indexed_attend: bool = True
     """Gather-free fused indexed attention for decode: stream the
     top-``lrosa_n_fac`` selected paged slots directly through an online-softmax
     kernel instead of materializing a contiguous K_sel/V_sel buffer and running
@@ -121,7 +121,10 @@ class AttentionConfig:
     steady-state non-partial) takes it — gemma full layers (head 512), gpt-oss
     (sinks), and the eager seq<k_eff partial tail fall back to gather+flash.
     Reads only K|V from the slot, so independent of the fp8/contig proj_K score
-    path. OFF by default."""
+    path. ON by default (2026-06-17): accuracy-identical to gather+flash (same
+    selection + attention math), faster at the throughput operating point;
+    prefill/edge cases (head>512, sinks, softcap, alibi, partial tail) auto
+    fall back to gather+flash. Pass --no-lrosa_indexed_attend to force off."""
 
     lrosa_indexed_min_batch: int = 1
     """Minimum decode batch (num_decodes) for the gather-free indexed kernel to
@@ -139,6 +142,15 @@ class AttentionConfig:
     / ``lrosa_n_fac`` / ``lrosa_cs_h`` (cs_h ≈ 25%% of the latent's K-share =
     kv_lora_rank/2; 64 for GLM-4.7-Flash's 512 latent, iso-overhead with the
     KV cache). Appendix / eager+bf16 only; FKV is plain dense MLA (this flag off)."""
+
+    fasa_mla: bool = False
+    """Apply FASA token selection to an MLA model (partial-RoPE recipe, OpenReview
+    FnSgecCEwg §6). Scores ONLY the decoupled RoPE cache (k_pe) over the calibrated
+    dominant RoPE FCs I_dom; the NoPE latent is uniformly important (used in FAC attend
+    only, not selection). A FASAMLAIndexer drives the same FLASHMLA_SPARSE attend.
+    Reuses ``lrosa_basis_path`` (-> fasa_idom_mla_*.pt), ``lrosa_n_fac``, and
+    ``lrosa_cs_h`` (interpreted as N_tip = #dominant RoPE FCs). Mutually exclusive
+    with ``lrosa_mla``."""
 
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The

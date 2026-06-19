@@ -25,7 +25,7 @@ for label in ${CTXS:-16k 32k 64k 128k}; do
     # Per-backend compile-cache dir: concurrent procs sharing one
     # torch_compile_cache race and can corrupt a kernel -> illegal access.
     CUDA_VISIBLE_DEVICES=$gpu VLLM_CACHE_ROOT=$HOME/.cache/vllm_${be} \
-      python quest_latency_bench.py \
+      python decode_latency_bench.py \
       --backend $be --model $MODEL --prefill_len $plen --decode_len $DECODE \
       --n_fac $NFAC --n_tip 16 --batch_size $BSZ --gpu_mem 0.92 \
       > $f 2>&1 &

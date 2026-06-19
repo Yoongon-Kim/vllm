@@ -428,8 +428,10 @@ def _quest_blocksparse_attn_kernel(
                              # large reasoning budgets e.g. 2048→127 pages don't
                              # blow up the kernel via constexpr unrolling)
     out_stride_r, out_stride_h,
+    sink_ptr,                # (H_q,) per-q-head learned attention sink, or unused
     BLOCK_D: tl.constexpr,
     BLOCK_P: tl.constexpr,   # >= page_size (power of 2)
+    HAS_SINK: tl.constexpr,
 ):
     r = tl.program_id(0)
     hq = tl.program_id(1)
@@ -495,6 +497,11 @@ def _quest_blocksparse_attn_kernel(
         acc = acc * alpha + tl.sum(p[:, None] * v_tile, axis=0)
         m_i = m_new
 
+    # gpt-oss attention sink: extra logit in the softmax denominator with
+    # value 0 (no acc contribution) — exp(sink - m_i) added to l_i.
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + hq).to(tl.float32)
+        l_i = l_i + tl.exp(sink - m_i)
     out = acc / l_i
     tl.store(out_ptr + r * out_stride_r + hq * out_stride_h + d,
              out.to(out_ptr.dtype.element_ty), mask=dmask)
@@ -603,8 +610,10 @@ def _quest_blocksparse_combine_kernel(
     acc_stride_r, acc_stride_h, acc_stride_s,
     ml_stride_r, ml_stride_h,
     out_stride_r, out_stride_h,
+    sink_ptr,                # (H_q,) per-q-head learned attention sink, or unused
     NUM_SPLITS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     r = tl.program_id(0)
     hq = tl.program_id(1)
@@ -624,6 +633,11 @@ def _quest_blocksparse_combine_kernel(
         sc = tl.where(ms > float("-inf"), tl.exp(ms - gm), 0.0)
         l_tot += ls * sc
         acc_tot += accs * sc
+    # gpt-oss attention sink: exp(sink - global_max) added once to the merged
+    # denominator (value 0 -> no acc contribution).
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + hq).to(tl.float32)
+        l_tot += tl.exp(sink - gm)
     out = acc_tot / l_tot
     tl.store(out_ptr + r * out_stride_r + hq * out_stride_h + d,
              out.to(out_ptr.dtype.element_ty), mask=dmask)
@@ -651,6 +665,7 @@ def quest_blocksparse_attn(
     partial_acc: torch.Tensor | None = None,  # (>=nd, H_q, NUM_SPLITS, hs) fp32
     partial_m: torch.Tensor | None = None,    # (>=nd, H_q, NUM_SPLITS) fp32
     partial_l: torch.Tensor | None = None,    # (>=nd, H_q, NUM_SPLITS) fp32
+    sinks: torch.Tensor | None = None,        # (H_q,) gpt-oss learned attn sink
 ) -> None:
     """Quest block-sparse decode attention (no gather). Writes ``output``.
 
@@ -666,6 +681,9 @@ def quest_blocksparse_attn(
     BLOCK_D = triton.next_power_of_2(head_size)
     BLOCK_P = triton.next_power_of_2(page_size)
     num_splits = quest_num_splits(page_budget)
+    has_sink = sinks is not None
+    # dummy ptr when no sink (kernel never loads it under HAS_SINK=False)
+    sink_arg = sinks if has_sink else query
 
     if num_splits <= 1 or partial_acc is None:
         _quest_blocksparse_attn_kernel[(num_decodes, H_q)](
@@ -677,8 +695,10 @@ def quest_blocksparse_attn(
             block_table.stride(0),
             page_budget,
             output.stride(0), output.stride(1),
+            sink_arg,
             BLOCK_D=BLOCK_D,
             BLOCK_P=BLOCK_P,
+            HAS_SINK=has_sink,
         )
         return
 
@@ -705,8 +725,10 @@ def quest_blocksparse_attn(
         pa.stride(0), pa.stride(1), pa.stride(2),
         pm.stride(0), pm.stride(1),
         output.stride(0), output.stride(1),
+        sink_arg,
         NUM_SPLITS=num_splits,
         BLOCK_D=BLOCK_D,
+        HAS_SINK=has_sink,
     )
 
 

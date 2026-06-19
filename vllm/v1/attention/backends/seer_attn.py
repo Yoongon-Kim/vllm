@@ -261,9 +261,9 @@ class SeerImpl(AttentionImpl[SeerMetadata]):
         # gate-block <-> page geometry
         self.pages_per_block = self.gate_block_size // _SEER_PAGE_SIZE
         self.block_budget = max(self.token_budget // self.gate_block_size, 1)
-        # selectable page columns: top blocks (+ one extra block of slack for the
-        # always-attended current partial gate-block), expanded to pages.
-        self.page_budget = (self.block_budget + 1) * self.pages_per_block
+        # selectable page columns: top blocks (+ forced-last recency block +
+        # one current partial gate-block of recent pages), expanded to pages.
+        self.page_budget = (self.block_budget + 2) * self.pages_per_block
 
         if self.gate_block_size % _SEER_PAGE_SIZE != 0:
             raise ValueError(
@@ -530,59 +530,59 @@ class SeerImpl(AttentionImpl[SeerMetadata]):
         cos, sin = self._rope(cur_pos, device, dtype)  # (nd, gh)
         qg = self._apply_rope(qg, cos, sin)  # (nd, H_kv, gh)
 
-        # 3. per-request block scoring + page-column selection
-        page_idx = torch.full(
-            (nd, self.num_kv_heads, self.page_budget), -1,
-            dtype=torch.int32, device=device)
+        # 3. block scoring + page-column selection — fully vectorized (no
+        #    per-(req, head) Python loop, no host syncs in the hot path).
+        H_kv = self.num_kv_heads
+        sl = seq_lens.to(torch.int64)                # (nd,)
+        nb = sl // bs                                # completed gate-blocks (nd,)
+        num_full = (sl - 1) // ps                    # selectable full pages (nd,)
+        max_nb = int(nb.max().item()) if nd > 0 else 0  # 1 cheap sync/step
         inv_sqrt = 1.0 / math.sqrt(self.gate_hidden)
-        for r in range(nd):
-            sl = int(seq_cpu[r].item())
-            nb = sl // bs  # completed gate-blocks
-            num_full_pages = (sl - 1) // ps
-            # always-attended pages of the current partial gate-block:
-            # [nb*ppb, num_full_pages)  (the trailing partial page is auto-added
-            # by the kernel; these are the recent full pages not in a block).
-            recent_lo = nb * ppb
-            recent_pages = list(range(recent_lo, num_full_pages))
-            sel_blocks: list[int] = []
-            if nb > 0:
-                # gather compressed-K for this req's blocks (physical-block index)
-                phys = block_table[r, 0:nb * ppb:ppb].to(torch.int64)  # (nb,)
-                kc = kc_buf[phys]  # (nb, H_kv, gate_hidden)
-                # score: (H_kv, nb)
-                attn = torch.einsum("hd,shd->hs", qg[r], kc) * inv_sqrt
-                attn = torch.softmax(attn.to(torch.float32), dim=-1)
-                # head-union top-k blocks (kernel selects per-kv-head columns; we
-                # keep per-head selection by writing columns per head below).
-                if self.sparsity_method == "threshold":
-                    keep = attn > self.threshold  # (H_kv, nb)
-                else:
-                    k = min(self.block_budget, nb)
-                    topk = attn.topk(k, dim=-1).indices  # (H_kv, k)
-                    keep = torch.zeros_like(attn, dtype=torch.bool)
-                    keep.scatter_(-1, topk, True)
-                keep[:, -1] = True  # recency: last completed block always kept
-                # expand selected blocks → page columns, per kv-head
-                for h in range(self.num_kv_heads):
-                    blk = keep[h].nonzero(as_tuple=False).flatten().tolist()
-                    pages = []
-                    for g in blk:
-                        base = g * ppb
-                        for p in range(ppb):
-                            col = base + p
-                            if col < num_full_pages:
-                                pages.append(col)
-                    pages.extend(recent_pages)
-                    pages = pages[: self.page_budget]
-                    if pages:
-                        page_idx[r, h, : len(pages)] = torch.tensor(
-                            pages, dtype=torch.int32, device=device)
+        max_pages = block_table.shape[1]
+        p_ar = torch.arange(max_pages, device=device)        # (max_pages,)
+
+        keep = None
+        if max_nb > 0:
+            # gather compressed-K at each gate-block's first physical page
+            bstart = block_table[:, ::ppb][:, :max_nb].to(torch.int64)  # (nd,max_nb)
+            kc = kc_buf[bstart]                          # (nd, max_nb, H_kv, gh)
+            attn = torch.einsum("nhd,nshd->nhs", qg, kc) * inv_sqrt  # (nd,H_kv,max_nb)
+            g_ar = torch.arange(max_nb, device=device)
+            valid_blk = g_ar[None, :] < nb[:, None]      # (nd, max_nb)
+            attn = attn.masked_fill(~valid_blk[:, None, :], float("-inf"))
+            attn = torch.softmax(attn.float(), dim=-1)
+            if self.sparsity_method == "threshold":
+                keep = attn > self.threshold
             else:
-                # no completed block → attend the recent full pages on all heads
-                pages = recent_pages[: self.page_budget]
-                if pages:
-                    page_idx[r, :, : len(pages)] = torch.tensor(
-                        pages, dtype=torch.int32, device=device)
+                kbud = min(self.block_budget, max_nb)
+                topk = attn.topk(kbud, dim=-1).indices   # (nd,H_kv,kbud)
+                keep = torch.zeros_like(attn, dtype=torch.bool)
+                keep.scatter_(-1, topk, True)
+            keep &= valid_blk[:, None, :]
+            # recency: force the last completed block (g = nb-1) per req w/ nb>0
+            last = (nb - 1).clamp(min=0)
+            keep.scatter_(
+                -1, last[:, None, None].expand(nd, H_kv, 1),
+                (nb > 0)[:, None, None].expand(nd, H_kv, 1))
+
+        # per-(req, kv-head) page-keep mask over all page columns
+        nbp = (nb * ppb)[:, None, None]              # (nd,1,1) block-region end
+        nf = num_full[:, None, None]                 # (nd,1,1)
+        pe = p_ar[None, None, :]                     # (1,1,max_pages)
+        in_recent = pe >= nbp                        # current partial-block pages
+        if keep is not None:
+            blk_of_p = (p_ar // ppb).clamp(max=max_nb - 1)   # (max_pages,)
+            bk_exp = keep[:, :, blk_of_p]            # (nd,H_kv,max_pages)
+            page_keep = ((bk_exp & (pe < nbp)) | in_recent) & (pe < nf)
+        else:
+            page_keep = in_recent & (pe < nf)        # short ctx (nb==0): dense
+        # pad selected columns ascending → fixed width; sentinel BIG → -1
+        BIG = max_pages + 1
+        p_full = p_ar.view(1, 1, -1).expand(nd, H_kv, max_pages)
+        key = torch.where(page_keep, p_full, torch.full_like(p_full, BIG))
+        sel = key.sort(dim=-1).values[:, :, : self.page_budget]
+        page_idx = torch.where(
+            sel >= BIG, torch.full_like(sel, -1), sel).to(torch.int32)
 
         # 4. block-sparse paged attention over the selected page columns (+ the
         #    always-attended trailing partial page, handled by the kernel).

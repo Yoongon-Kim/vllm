@@ -29,7 +29,7 @@ run_one(){
   IFS='|' read -r ctxbk extra label <<< "$cfg"
   read -r ctx batch backend <<< "$ctxbk"
   local port=$((23000 + idx))
-  CUDA_VISIBLE_DEVICES=$gpu VLLM_PORT=$port python quest_latency_bench.py \
+  CUDA_VISIBLE_DEVICES=$gpu VLLM_PORT=$port python decode_latency_bench.py \
     --backend $backend --model "$M" --prefill_len $ctx --decode_len 64 \
     --n_fac 2048 --cs_h 32 $extra --batch_size $batch --gpu_mem 0.88 \
     > $OUT/$label.log 2>&1

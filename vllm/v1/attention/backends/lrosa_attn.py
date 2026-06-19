@@ -1242,7 +1242,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         if (self.indexed_attend and num_decodes >= self.indexed_min_batch
                 and head_size <= 512 and not partial
                 and self.sinks is None and not self.logits_soft_cap
-                and self.alibi_slopes is None):
+                and self.alibi_slopes is None
+                # indexed kernel does tl.arange(0, G) over the GQA group, which
+                # Triton requires to be a power of 2. Qwen3-14B has G=40/8=5
+                # (non-pow2) -> fall back to gather+flash (accuracy-identical).
+                and (self.num_kv_groups & (self.num_kv_groups - 1)) == 0):
             from vllm.v1.attention.ops.triton_lrosa_indexed_attend import (
                 lrosa_indexed_attend,
             )

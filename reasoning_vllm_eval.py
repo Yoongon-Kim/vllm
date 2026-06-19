@@ -167,6 +167,15 @@ def build_llm(a):
         # (latent) KV cache. This is orthogonal to LRoSA's own bf16 proj_K cache;
         # fp8 KV is the standard MLA serving precision. Override with --mla_kv_dtype.
         kw["kv_cache_dtype"] = a.mla_kv_dtype
+    elif a.mode == "fasa_mla":
+        # FASA on an MLA model (GLM-4.7-Flash): partial-RoPE — score ONLY the
+        # decoupled RoPE cache (k_pe) over the calibrated dominant RoPE FCs
+        # (basis = fasa_idom_mla_*.pt); a FASAMLAIndexer drives the same
+        # FLASHMLA_SPARSE attend. cs_h is interpreted as N_tip (#dominant RoPE FCs).
+        assert a.basis, "fasa_mla needs --basis <fasa_idom_mla_*.pt>"
+        kw["attention_config"] = {"fasa_mla": True, "lrosa_basis_path": a.basis,
+                                  "lrosa_n_fac": a.n_fac, "lrosa_cs_h": a.cs_h}
+        kw["kv_cache_dtype"] = a.mla_kv_dtype
     elif a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
@@ -196,11 +205,20 @@ def build_llm(a):
             "seer_gate_path": a.seer_gate_path or seer_gate_path(a.model),
             "seer_token_budget": a.n_fac,
         }
-    # fkv: dense default.
-    if a.mode == "fkv" and getattr(a, "fkv_kv_fp8", False):
-        # Attend-numerics isolation control: dense attention but with the same
-        # fp8 latent KV cache the lrosa_mla path is forced to use (H=20).
-        kw["kv_cache_dtype"] = a.mla_kv_dtype
+    # fkv: dense default. For GLM-4.7-Flash (MLA) the KV cache defaults to fp8 so
+    # the FKV reference matches the lrosa_mla fp8 deployment (KV unified to fp8).
+    # Dense MLA can't use fp8_ds_mla (sparse-only) → use fp8_e4m3 (the dense fp8)
+    # via TRITON_MLA. Override with --no-fkv_kv_fp8 / --mla_kv_dtype / --mla_backend.
+    if a.mode == "fkv":
+        _is_glm_mla = "glm" in a.model.lower()
+        _want_fp8 = a.fkv_kv_fp8 if a.fkv_kv_fp8 is not None else _is_glm_mla
+        if _want_fp8:
+            _dt = a.mla_kv_dtype
+            if _dt == "fp8_ds_mla":  # dense rejects ds_mla → plain fp8 latent
+                _dt = "fp8_e4m3"
+            kw["kv_cache_dtype"] = _dt
+            if _is_glm_mla and not a.mla_backend:
+                a.mla_backend = "TRITON_MLA"
     if a.mla_backend:  # force/merge a specific MLA backend (head-count workaround)
         ac = kw.get("attention_config") or {}
         ac["backend"] = a.mla_backend
@@ -222,7 +240,7 @@ def main():
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
                     choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
-                             "seer"])
+                             "fasa_mla", "seer"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
@@ -260,9 +278,10 @@ def main():
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--max_num_seqs", type=int, default=0)
     ap.add_argument("--gpu_mem", type=float, default=0.85)
-    ap.add_argument("--fkv_kv_fp8", action="store_true",
-                    help="fkv only: use the fp8_ds_mla latent KV cache "
-                         "(attend-numerics isolation control).")
+    ap.add_argument("--fkv_kv_fp8", action=argparse.BooleanOptionalAction, default=None,
+                    help="fkv only: fp8 latent KV cache. None(default)=auto "
+                         "(fp8 for GLM-MLA, bf16 otherwise); --fkv_kv_fp8 forces fp8; "
+                         "--no-fkv_kv_fp8 forces bf16 (iso-precision vs LRoSA bf16-attend).")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top_p", type=float, default=None)
     ap.add_argument("--top_k", type=int, default=None)

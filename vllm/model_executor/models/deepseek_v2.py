@@ -1051,6 +1051,35 @@ class DeepseekV2MLAAttention(nn.Module):
             self.indexer_rope_emb = None  # LRoSAMLAIndexer uses self.rotary_emb
             self.is_v32 = True  # route the MLA layer through the sparse attend + buffer
 
+        # FASA-on-MLA (partial-RoPE): dominant-RoPE-FC token selector driving the same
+        # FLASHMLA_SPARSE attend (RoPE cache only; OpenReview FnSgecCEwg §6). Reuses
+        # lrosa_basis_path (-> fasa_idom_mla_*.pt) / lrosa_n_fac; lrosa_cs_h = N_tip.
+        if not self.is_v32 and getattr(
+            vllm_config.attention_config, "fasa_mla", False
+        ):
+            from vllm.model_executor.layers.lrosa_mla_indexer import FASAMLAIndexer
+
+            ac = vllm_config.attention_config
+            self.indexer = FASAMLAIndexer(
+                vllm_config=vllm_config,
+                config=config,
+                cache_config=cache_config,
+                fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
+                kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
+                q_b_proj=getattr(self, "q_b_proj", None),
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                rotary_emb=self.rotary_emb,
+                q_lora_rank=self.q_lora_rank,
+                basis_path=ac.lrosa_basis_path,
+                n_tip=(ac.lrosa_cs_h or 16),
+                n_fac=ac.lrosa_n_fac,
+                topk_indices_buffer=topk_indices_buffer,
+                prefix=f"{prefix}.fasa_indexer",
+            )
+            self.indexer_rope_emb = None
+            self.is_v32 = True
+
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
