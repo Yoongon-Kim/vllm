@@ -225,7 +225,8 @@ class Glm4MoeLiteModel(nn.Module):
         # shared top-k buffer for the FLASHMLA_SPARSE attend driven by LRoSAMLAIndexer.
         lrosa_mla = bool(getattr(vllm_config.attention_config, "lrosa_mla", False)) \
             or bool(getattr(vllm_config.attention_config, "fasa_mla", False)) \
-            or bool(getattr(vllm_config.attention_config, "quest_mla", False))
+            or bool(getattr(vllm_config.attention_config, "quest_mla", False)) \
+            or bool(getattr(vllm_config.attention_config, "triattn_mla", False))
         if self.is_v32 or lrosa_mla:
             topk_tokens = (config.index_topk if self.is_v32
                            else vllm_config.attention_config.lrosa_n_fac)

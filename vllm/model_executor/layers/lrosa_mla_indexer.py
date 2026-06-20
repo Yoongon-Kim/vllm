@@ -146,10 +146,13 @@ class QuestMLAIndexer(nn.Module):
                 else:
                     full = ks[:ncand * P].view(ncand, P, self.key_dim)
                     kmin = full.min(1).values; kmax = full.max(1).values   # [ncand, key_dim]
-                    qh = q_h_all[r]                                        # [H, key_dim]
-                    qp = qh.clamp(min=0); qn = qh.clamp(max=0)
-                    # max(q*kmin, q*kmax) = q+*kmax + q-*kmin (per dim); sum_c -> matmul
-                    score = (qp @ kmax.t() + qn @ kmin.t()).amax(0)        # [ncand] union over heads
+                    # Faithful Quest GQA reduction = group-mean the query to the single
+                    # (shared) KV head, then ONE max(q*kmin, q*kmax) score. MLA has one
+                    # latent KV head so the whole head set is one group -> mean over heads.
+                    # (Matches pca quest.py q_aggregation="groupmean", the paper default.)
+                    qg = q_h_all[r].mean(0)                                # [key_dim]
+                    qp = qg.clamp(min=0); qn = qg.clamp(max=0)
+                    score = qp @ kmax.t() + qn @ kmin.t()                  # [ncand]
                     top = score.topk(min(keep, ncand)).indices
                     sel = (top[:, None] * P + ar_P).view(-1)               # LOCAL positions of pages
                     out = torch.cat([tail, sel])[:K]                       # tail first -> never dropped
@@ -172,6 +175,218 @@ class QuestMLAIndexer(nn.Module):
                     for i in range(e - s):
                         tok = base + ch.token_start + s + i
                         Lc = i + 1                                # causal length (pos 0..i)
+                        if Lc <= K:
+                            buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
+                        else:
+                            buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
+        return buf
+
+
+class TriAttentionMLAIndexer(nn.Module):
+    """TriAttention-on-MLA token selector (NOVEL port — no MLA variant exists upstream).
+
+    TriAttention (frequency-domain KV pruning) scores a key purely from the RoPE'd
+    complex pairs: given per-(layer,head) calibrated query frequency statistics
+    (q_mean_complex, q_abs_mean over decode steps of the PRE-RoPE query as complex
+    pairs) and the PRE-RoPE key as complex pairs k_complex, it forms
+
+        relative = q_mean_complex * conj(k_complex)
+        phi   = atan2(Im(relative), Re(relative))          # per-pair phase
+        amp   = |q_mean_complex| * |k_complex|             # per-pair amplitude
+        extra = (q_abs_mean - |q_mean_complex|) * |k_complex|   # mean-level residual (MLR)
+
+    then for a decode at position `round_start` scores each cached key at position
+    `key_idx` over a geometric grid of offsets o ∈ {1,2,4,...} (RoPE frequency
+    aliasing probe):
+
+        delta      = round_start - key_idx
+        delta_grid = delta + offsets                       # [n_off]
+        phase      = delta_grid[:,None] * omega[None,:] + phi          # [n_off, nFC]
+        base       = Σ_FC amp * freq_scale_sq * cos(phase)             # [n_off]
+        additive   = Σ_FC extra * freq_scale_sq            # scalar (offset-independent)
+        score(o)   = base(o) + additive
+        score      = mean_o score(o)                       # offset aggregation = mean
+
+    MLA mapping (the novel part). MLA stores per token the latent c_KV (NoPE, dim
+    kv_lora_rank=512 — NO RoPE, so NOT scorable by TriAttention) plus a single
+    decoupled k_pe (qk_rope_head_dim=64 → 32 complex pairs, SHARED across heads =
+    MQA). TriAttention's score lives ENTIRELY on the RoPE'd pairs, so for MLA we
+    score PURELY on k_pe (32 pairs); omega = the k_pe rope inv_freq (32 freqs);
+    k_unrot = the PRE-RoPE k_pe (cached pre-rope so it is directly available, no
+    rope inversion). c_KV is attend-only (the FlashMLASparse attend reads the full
+    [c_KV|k_pe] of the selected tokens — TriAttention only picks WHICH tokens).
+    Per-head q_pe stats are reduced by GROUP-MEAN over the 20 heads to ONE query
+    stat per layer (the faithful MQA reduction — the same lesson as QuestMLAIndexer:
+    average the query, do NOT take per-head max).
+
+    Own bf16 paged cache stores [c_KV | k_pe_PRE_rope] (head_dim = kv_lora_rank +
+    qk_rope; pre-rope k_pe is written so k_unrot is read directly). Decode (eager,
+    per request): gather cached pre-rope k_pe for all token positions, compute
+    amp/phi/extra, score every cached token with round_start = current decode
+    position, take top-n_fac, ALWAYS keep the current/last token, write ascending-
+    sorted LOCAL positions (0..L-1) to topk_indices_buffer (FlashMLASparse converts
+    local→global and REQUIRES ascending order). Prefill: prompt ≤ budget attends all
+    causal; overflow falls back to the recent window (same stack-wide limit as
+    Quest/FASA). Budget must be a multiple of 128 (512/1024/2048). enforce_eager
+    required. Stats from triattn_stats_mla_<tag>.pt (calibrate.py
+    _compute_triattn_stats_mla)."""
+
+    def __init__(self, vllm_config, config, cache_config, fused_qkv_a_proj,
+                 kv_a_proj_with_mqa, q_b_proj, kv_a_layernorm, kv_b_proj, rotary_emb,
+                 q_lora_rank, basis_path, n_fac, topk_indices_buffer, prefix=""):
+        super().__init__()
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+        from vllm.model_executor.layers.triattention_utils import (
+            build_geometric_offsets,
+        )
+
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.n_head = config.num_attention_heads
+        self.key_dim = self.kv_lora_rank + self.qk_rope_head_dim   # 576 for GLM
+        self.nFC = self.qk_rope_head_dim // 2                       # 32 complex pairs
+        self.topk_tokens = n_fac
+        self.fused_qkv_a_proj = fused_qkv_a_proj
+        self.kv_a_proj_with_mqa = kv_a_proj_with_mqa
+        self.q_b_proj = q_b_proj
+        self.kv_a_layernorm = kv_a_layernorm
+        self.kv_b_proj = kv_b_proj
+        # NOTE: kv_a_layernorm / q_b_proj / kv_b_proj are kept for parity with the
+        # other MLA indexers (the wrapper passes them) but TriAttention's MLA score
+        # uses ONLY the pre-rope k_pe + the calibrated query stats — no q/k projection
+        # is needed at decode (the query stats are baked in at calibration). c_KV is
+        # cached for the attend only.
+        self.rotary_emb = rotary_emb
+        self.q_lora_rank = q_lora_rank
+        self.layer_idx = extract_layer_index(prefix)
+        self.topk_indices_buffer = topk_indices_buffer
+        # offset-grid aggregation; "mean" matches the reference port default.
+        self.aggregation = os.environ.get("TRIATTN_MLA_AGG", "mean")
+
+        # Load calibrated TriAttention stats for this layer (group-meaned over heads
+        # to a single query at calibration time). The .pt holds per-layer
+        # q_mean_complex [nFC] (complex) + q_abs_mean [nFC] (real) + metadata with
+        # omega [nFC], freq_scale [nFC], rope_dim, offset_max_length.
+        ckpt = torch.load(basis_path, map_location="cpu", weights_only=False)
+        meta = ckpt["metadata"]
+        # RoPE complex-pairing style — MUST match the calibration that produced the
+        # stats (and the model's RoPE convention). GLM-4.7-Flash has
+        # rope_interleave=True -> style="interleaved" (pairs (x0,x1),(x2,x3),...);
+        # the calibration de-interleaves identically before forming complex pairs.
+        self.rope_style = meta.get("rope_style", "half")
+        stats = ckpt["stats"][self.layer_idx]                       # per-layer dict
+        q_mc = torch.complex(stats["q_mean_real"].float(),
+                             stats["q_mean_imag"].float())          # [nFC]
+        q_am = stats["q_abs_mean"].float()                          # [nFC]
+        omega = torch.as_tensor(meta["omega"], dtype=torch.float32) # [nFC] rope inv_freq
+        freq_scale = torch.as_tensor(meta["freq_scale"], dtype=torch.float32)  # [nFC]
+        freq_scale_sq = freq_scale.pow(2)
+        off_max = int(meta.get("offset_max_length", 512))
+        _dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        offsets = build_geometric_offsets(off_max, torch.device(_dev))  # [n_off]
+        if q_mc.shape[-1] != self.nFC or omega.shape[-1] != self.nFC:
+            raise RuntimeError(
+                f"TriAttention-MLA stats nFC mismatch: q_mean_complex {tuple(q_mc.shape)}, "
+                f"omega {tuple(omega.shape)}, expected nFC={self.nFC} "
+                f"(qk_rope_head_dim={self.qk_rope_head_dim}).")
+        # Non-persistent on-device buffers (graph-capture safe; vLLM builds on GPU).
+        self.register_buffer("q_mean_real", q_mc.real.to(_dev), persistent=False)
+        self.register_buffer("q_mean_imag", q_mc.imag.to(_dev), persistent=False)
+        self.register_buffer("q_abs_mean", q_am.to(_dev), persistent=False)
+        self.register_buffer("omega", omega.to(_dev), persistent=False)
+        self.register_buffer("freq_scale_sq", freq_scale_sq.to(_dev), persistent=False)
+        self.register_buffer("offsets", offsets.to(_dev), persistent=False)
+        for b in ("q_mean_real", "q_mean_imag", "q_abs_mean", "omega",
+                  "freq_scale_sq", "offsets"):
+            torch._dynamo.mark_static_address(getattr(self, b))
+
+        # bf16 paged cache of [c_KV | k_pe_PRE_rope] (NOT fp8 — frequency score must
+        # be exact; mirrors QuestMLAIndexer's own bf16 cache).
+        self.k_cache = DeepseekV32IndexerCache(
+            head_dim=self.key_dim, dtype=torch.bfloat16,
+            prefix=f"{prefix}.k_cache", cache_config=cache_config)
+
+    def forward(self, hidden_states, q_c, positions, rotary_emb=None):
+        from vllm.model_executor.layers.triattention_utils import (
+            compute_frequency_statistics_from_means, score_keys_for_round,
+        )
+        T = hidden_states.shape[0]
+        kvlr, rope_d = self.kv_lora_rank, self.qk_rope_head_dim
+        # latent c_KV + decoupled rope key (kv_a path). k_pe is taken PRE-rope so the
+        # cached value is exactly TriAttention's k_unrot (no rope inversion needed).
+        if self.q_lora_rank is not None:
+            kv_lora = self.fused_qkv_a_proj(hidden_states)[0][..., self.q_lora_rank:]
+        else:
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+        c_kv = self.kv_a_layernorm(kv_lora[..., :kvlr])             # [T, kvlr]
+        k_pe_pre = kv_lora[..., kvlr:]                              # [T, rope] PRE-rope
+        key = torch.cat([c_kv, k_pe_pre], dim=-1)                  # [T, key_dim]
+
+        md = get_forward_context().attn_metadata
+        buf = self.topk_indices_buffer
+        if not isinstance(md, dict):
+            return buf  # profiling/dummy
+        m = md.get(self.k_cache.prefix)
+        cache = self.k_cache.kv_cache                               # [n_blk, blk, key_dim]
+        buf[:T] = -1
+        if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
+            return buf
+        flat = cache.view(-1, self.key_dim)
+        flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+
+        # Precompute the query-side complex stat once (per-layer, group-meaned at
+        # calibration → already a single query). q_mean_complex / q_abs_mean / omega /
+        # freq_scale_sq / offsets are calibrated buffers.
+        q_mean_complex = torch.complex(self.q_mean_real, self.q_mean_imag)  # [nFC]
+
+        # Decode: eager per-request TriAttention frequency scoring.
+        if m.num_decodes > 0 and m.decode is not None:
+            bt = m.decode.block_table                              # [B, max_blk]
+            sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)
+            blk = cache.shape[1]
+            K = self.topk_tokens
+            ar_blk = torch.arange(blk, device=bt.device)
+            for r in range(m.num_decodes):
+                L = int(sl[r].item())
+                if L <= 0:
+                    continue
+                # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
+                # used ONLY to read the cached pre-rope k_pe (global slots).
+                if L <= K:                                        # all fit -> attend all
+                    buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
+                nblk = (L + blk - 1) // blk
+                ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots
+                k_pe = flat[ids, kvlr:].float()                   # [L, rope] pre-rope k_pe
+                # amp/phi/extra from the calibrated query stat + this request's keys.
+                amp, phi, extra = compute_frequency_statistics_from_means(
+                    q_mean_complex, self.q_abs_mean, k_pe, style=self.rope_style)
+                # round_start = current decode position = L-1 (0-indexed last token).
+                key_idx = torch.arange(L, device=bt.device)
+                score = score_keys_for_round(
+                    key_idx, L - 1, amp, phi, self.omega, extra,
+                    self.offsets, self.aggregation, self.freq_scale_sq)  # [L]
+                # ALWAYS keep the current/last token (self-attention); fill the rest
+                # of the budget with the top-scoring tokens. Bias self up so it is in.
+                score[L - 1] = float("inf")
+                top = score.topk(min(K, L)).indices               # LOCAL positions
+                out = torch.sort(top).values                      # kernel needs ascending
+                buf[r, :out.shape[0]] = out.to(buf.dtype)
+        # Prefill: each token attends its causal context. Prompt <= budget (the common
+        # reasoning case) -> attend ALL causal LOCAL positions. Overflow (long prompt +
+        # small budget) -> recent-window fallback (same stack-wide limit as Quest/FASA).
+        if m.num_prefills > 0 and m.prefill is not None:
+            base = m.num_decode_tokens
+            K = self.topk_tokens
+            for ch in m.prefill.chunks:
+                cu = ch.cu_seq_lens.to(torch.long)
+                for j in range(ch.num_reqs):
+                    s, e = int(cu[j].item()), int(cu[j + 1].item())
+                    for i in range(e - s):
+                        tok = base + ch.token_start + s + i
+                        Lc = i + 1
                         if Lc <= K:
                             buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
                         else:

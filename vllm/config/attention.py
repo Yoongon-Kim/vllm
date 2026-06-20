@@ -161,6 +161,18 @@ class AttentionConfig:
     (PyTorch min/max, not the fp8-dot SparseAttnIndexer). Calibration-free. Reuses
     ``lrosa_n_fac`` (token budget). Mutually exclusive with ``lrosa_mla``/``fasa_mla``."""
 
+    triattn_mla: bool = False
+    """Apply TriAttention frequency-domain token selection to an MLA model
+    (GLM-4.7-Flash). NOVEL port (TriAttention has no upstream MLA variant): score
+    PURELY on the decoupled RoPE cache k_pe's complex pairs using per-layer
+    calibrated query frequency stats (q_mean_complex, q_abs_mean — group-meaned
+    over heads to one query per layer, the MQA reduction). The NoPE latent c_KV has
+    no RoPE so is attend-only. A TriAttentionMLAIndexer keeps its own bf16 paged
+    cache of [c_KV | k_pe_PRE_rope] and drives the same FLASHMLA_SPARSE attend.
+    Eager only (PyTorch cos/atan2 frequency scoring). Reuses ``lrosa_basis_path``
+    (-> triattn_stats_mla_*.pt) and ``lrosa_n_fac`` (token budget). Mutually
+    exclusive with ``lrosa_mla``/``fasa_mla``/``quest_mla``."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

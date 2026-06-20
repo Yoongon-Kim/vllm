@@ -185,6 +185,17 @@ def build_llm(a):
                                   "quest_page_size": a.page_size}
         kw["kv_cache_dtype"] = a.mla_kv_dtype
         kw["enforce_eager"] = True
+    elif a.mode == "triattn_mla":
+        # TriAttention on an MLA model (GLM-4.7-Flash): NOVEL port. Frequency-domain
+        # selection on the decoupled RoPE cache k_pe via per-layer calibrated query
+        # frequency stats (basis = triattn_stats_mla_*.pt). A TriAttentionMLAIndexer
+        # keeps its own bf16 paged cache of [c_KV|k_pe_pre_rope] and drives the same
+        # FLASHMLA_SPARSE attend. Eager only (PyTorch cos/atan2 scoring).
+        assert a.basis, "triattn_mla needs --basis <triattn_stats_mla_*.pt>"
+        kw["attention_config"] = {"triattn_mla": True, "lrosa_basis_path": a.basis,
+                                  "lrosa_n_fac": a.n_fac}
+        kw["kv_cache_dtype"] = a.mla_kv_dtype
+        kw["enforce_eager"] = True
     elif a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
@@ -249,7 +260,7 @@ def main():
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
                     choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
-                             "fasa_mla", "quest_mla", "seer"])
+                             "fasa_mla", "quest_mla", "triattn_mla", "seer"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
