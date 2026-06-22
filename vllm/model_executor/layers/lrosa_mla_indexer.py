@@ -70,7 +70,12 @@ def quest_mla_select(
     if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
         return buf
     flat = cache.view(-1, key_dim)
-    flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+    # key may be cudagraph-padded beyond the real token count (PIECEWISE pads
+    # the decode batch up to a captured size, e.g. 7->8), but slot_mapping holds
+    # only the real tokens. Insert exactly the real tokens (key[:n]); without
+    # this the assignment shape-mismatches (key [T_pad] vs slot_mapping [T_real]).
+    n_ins = min(T, m.slot_mapping.shape[0])
+    flat[m.slot_mapping[:n_ins]] = key[:n_ins].to(flat.dtype)   # insert current keys
     # Decode: eager per-request page min/max selection.
     if m.num_decodes > 0 and m.decode is not None:
         bt = m.decode.block_table                              # [B, max_blk]
@@ -280,7 +285,12 @@ def triattn_mla_select(
     if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
         return buf
     flat = cache.view(-1, key_dim)
-    flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+    # key may be cudagraph-padded beyond the real token count (PIECEWISE pads
+    # the decode batch up to a captured size, e.g. 7->8), but slot_mapping holds
+    # only the real tokens. Insert exactly the real tokens (key[:n]); without
+    # this the assignment shape-mismatches (key [T_pad] vs slot_mapping [T_real]).
+    n_ins = min(T, m.slot_mapping.shape[0])
+    flat[m.slot_mapping[:n_ins]] = key[:n_ins].to(flat.dtype)   # insert current keys
     q_mean_complex = torch.complex(q_mean_real, q_mean_imag)   # [nFC]
     kvlr = kv_lora_rank
     K = topk_tokens
