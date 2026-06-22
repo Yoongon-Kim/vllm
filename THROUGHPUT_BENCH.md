@@ -13,6 +13,34 @@ comparison.
 
 ---
 
+## Status / what changed (read this first)
+
+_Last updated 2026-06-22._
+
+- **Use `MEM_FAIR_MAX_BATCH`, not the raw `MAX_BATCH`, to compare capacity across
+  methods.** vLLM sizes `num_blocks` (max batch) from the per-token KV slot
+  ONLY, so methods with a separate side-buffer that is NOT in the slot —
+  **Quest** (`_quest_minmax`), **fp8/contig LRoSA proj_K** (`_projk_cache`),
+  **Seer** (gate cache) — have that memory eat `gpu_mem` headroom instead of
+  reducing `num_blocks`. Their raw `MAX_BATCH` is therefore **over-stated** (e.g.
+  Quest's raw `MAX_BATCH` ≈ FKV's even though Quest uses more HBM). bf16 LRoSA
+  proj_K is in-slot, so its `MAX_BATCH` is already fair.
+- `sweep_max_batch_throughput.sh` now prints `SIDE_BUFFER_OVERHEAD_PCT` +
+  `MEM_FAIR_MAX_BATCH = MAX_BATCH × slot/(slot+side_buffer)` (see §5). Overheads
+  are symmetric where expected: Quest minmax **+5.88%** ≈ fp8-LRoSA proj_K
+  **+5.88%**; FKV / FASA / bf16-LRoSA **0%**; Seer ≈ **33%**.
+- New sweep env: `FP8_PROJK=1` (LRoSA fp8 contig proj_K), `HEAD_SIZE` /
+  `PAGE_SIZE` (default 128 / 16 for Qwen3-8B).
+- **vLLM's engine `num_blocks` is NOT modified** — this is a measurement-level
+  correction (the bench reports the fair number). Making the engine itself
+  size `num_blocks` correctly needs side-buffers carved from the raw KV
+  allocation (`page_size_padded` + strided view) — a riskier per-backend
+  refactor, deliberately deferred (the strided-view path is MLA-shape-only).
+  Run the sweep at moderate `gpu_mem` (0.85–0.9) so the side-buffer sits in
+  headroom and the fair scaling is clean.
+
+---
+
 ## 0. What gets measured
 
 `decode_latency_bench.py` runs two timed `generate()`s on `B` identical-length
