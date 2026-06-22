@@ -41,6 +41,10 @@ GPU=${GPU:-0}
 MODEL=${MODEL:-Qwen/Qwen3-8B}
 NFAC=${NFAC:-2048}; CS_H=${CS_H:-32}; N_TIP=${N_TIP:-16}
 DECODE=${DECODE:-128}
+# LRoSA deployment default = fp8 proj_K (the contig fp8 cache: half the proj_K
+# HBM of bf16, the storage-efficient serving config) -> default it ON for the
+# GQA lrosa backend. Pass FP8_PROJK=0 to measure the bf16 in-slot variant.
+if [ "$BACKEND" = "lrosa" ]; then FP8_PROJK=${FP8_PROJK:-1}; else FP8_PROJK=${FP8_PROJK:-0}; fi
 GPU_MEM=${GPU_MEM:-0.9}
 BSZ_START=${BSZ_START:-1}; MAX_BSZ=${MAX_BSZ:-512}
 PY=${PY:-/home/snu_open/miniforge3/envs/vllm/bin/python}
@@ -66,10 +70,10 @@ extra=()
 [ -n "${MLA_BACKEND:-}" ] && extra+=(--mla_backend "$MLA_BACKEND")
 [ "${CHUNKED_PREFILL:-0}" = "1" ] && extra+=(--chunked_prefill)
 [ "${MLA_FKV_FP8:-0}" = "1" ] && extra+=(--mla_fkv_fp8)
-[ "${FP8_PROJK:-0}" = "1" ] && extra+=(--fp8_projk)   # LRoSA proj_K in a SEPARATE fp8 cache
+[ "$FP8_PROJK" = "1" ] && extra+=(--fp8_projk)   # LRoSA proj_K in a SEPARATE fp8 cache (default for lrosa)
 
 summary="$OUT/SUMMARY_${tag}.txt"; : > "$summary"
-echo "# sweep $MODEL backend=$BACKEND ctx=$CTX nfac=$NFAC decode=$DECODE gpu_mem=$GPU_MEM gpu=$GPU" | tee "$summary"
+echo "# sweep $MODEL backend=$BACKEND ctx=$CTX nfac=$NFAC decode=$DECODE gpu_mem=$GPU_MEM fp8_projk=$FP8_PROJK gpu=$GPU" | tee "$summary"
 echo "# bsz   decode_ms/tok   per_stream_tok/s   AGG_tok/s(throughput)   status" | tee -a "$summary"
 
 # Run one batch_size and emit its summary row. $1 = bsz.
@@ -136,7 +140,7 @@ echo "PEAK_THROUGHPUT_TOK_S=$best_tput @ bsz=$best_bsz  (within the concurrent r
 # i.e. what fits once the side-buffer is charged like the slot.
 HEAD_SIZE=${HEAD_SIZE:-128}; PAGE_SIZE=${PAGE_SIZE:-16}
 read -r ov fair < <(BE="$BACKEND" HS="$HEAD_SIZE" CS="$CS_H" PS="$PAGE_SIZE" \
-    FP8="${FP8_PROJK:-0}" MAXOK="$conc_max" python3 -c '
+    FP8="$FP8_PROJK" MAXOK="$conc_max" python3 -c '
 import os
 be=os.environ["BE"]; hs=int(os.environ["HS"]); cs=int(os.environ["CS"])
 ps=int(os.environ["PS"]); fp8=os.environ["FP8"]=="1"; mx=int(os.environ["MAXOK"])

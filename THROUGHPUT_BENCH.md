@@ -39,8 +39,12 @@ _Last updated 2026-06-22._
   `MEM_FAIR_CONCURRENT_MAX_BATCH = CONCURRENT_MAX_BATCH × slot/(slot+side_buffer)`
   (see §5). Overheads are symmetric where expected: Quest minmax **+5.88%** ≈
   fp8-LRoSA proj_K **+5.88%**; FKV / FASA / bf16-LRoSA **0%**; Seer ≈ **33%**.
-- New sweep env: `FP8_PROJK=1` (LRoSA fp8 contig proj_K), `HEAD_SIZE` /
-  `PAGE_SIZE` (default 128 / 16 for Qwen3-8B).
+- **LRoSA is benchmarked with fp8 proj_K by DEFAULT** (`BACKEND=lrosa` sets
+  `FP8_PROJK=1` unless overridden) — the storage-efficient deployment config
+  (separate fp8 contig proj_K cache, half the bf16 HBM). Pass `FP8_PROJK=0` for
+  the bf16 in-slot variant. Other backends default `FP8_PROJK=0`.
+- Sweep env: `FP8_PROJK` (above), `HEAD_SIZE` / `PAGE_SIZE` (default 128 / 16
+  for Qwen3-8B).
 - **vLLM's engine `num_blocks` is NOT modified** — this is a measurement-level
   correction (the bench reports the fair number). Making the engine itself
   size `num_blocks` correctly needs side-buffers carved from the raw KV
@@ -146,8 +150,15 @@ capacity, so an OOM sweep would over-state the concurrent max.)
 
 ### 4a. GQA models (Qwen3-8B / Llama-3.1-8B): fkv / lrosa / fasa / quest
 
+**LRoSA is benchmarked with fp8 proj_K by default** (`FP8_PROJK` defaults to 1
+for `BACKEND=lrosa`) — that is the storage-efficient deployment config (the
+proj_K lives in a separate fp8 contig cache, half the HBM of bf16). Pass
+`FP8_PROJK=0` only for the bf16 in-slot variant. (fp8 proj_K is a separate,
+uncounted side-buffer → its +5.88% shows up in `MEM_FAIR_CONCURRENT_MAX_BATCH`,
+unlike bf16 in-slot which is already counted.)
+
 ```bash
-# one (backend, context) sweep on GPU 0:
+# one (backend, context) sweep on GPU 0 (lrosa -> fp8 proj_K by default):
 GPU=0 BACKEND=lrosa CTX=65536 MODEL=Qwen/Qwen3-8B NFAC=2048 \
   bash sweep_max_batch_throughput.sh
 # lrosa/fasa basis auto-resolves to PCA_REPO/bases/qwen3_8b/...; or pass BASIS=.
