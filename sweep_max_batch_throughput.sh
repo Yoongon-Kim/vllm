@@ -66,6 +66,7 @@ extra=()
 [ -n "${MLA_BACKEND:-}" ] && extra+=(--mla_backend "$MLA_BACKEND")
 [ "${CHUNKED_PREFILL:-0}" = "1" ] && extra+=(--chunked_prefill)
 [ "${MLA_FKV_FP8:-0}" = "1" ] && extra+=(--mla_fkv_fp8)
+[ "${FP8_PROJK:-0}" = "1" ] && extra+=(--fp8_projk)   # LRoSA proj_K in a SEPARATE fp8 cache
 
 summary="$OUT/SUMMARY_${tag}.txt"; : > "$summary"
 echo "# sweep $MODEL backend=$BACKEND ctx=$CTX nfac=$NFAC decode=$DECODE gpu_mem=$GPU_MEM gpu=$GPU" | tee "$summary"
@@ -101,4 +102,31 @@ done
 
 echo "----" | tee -a "$summary"
 echo "MAX_BATCH=$max_ok  PEAK_THROUGHPUT_TOK_S=$best_tput @ bsz=$best_bsz" | tee -a "$summary"
+
+# --- Memory-fair max batch -------------------------------------------------
+# vLLM sizes num_blocks (= max batch capacity) from the per-token KV SLOT only.
+# Methods with an UNCOUNTED separate side-buffer (Quest page min/max; LRoSA fp8
+# proj_K contig cache; Seer gate cache) consume extra HBM that is NOT in the
+# slot -> it silently eats gpu_mem headroom, so their empirical MAX_BATCH is
+# OVER-stated vs FKV (and vs in-slot bf16 LRoSA proj_K, which IS counted).
+# Report the iso-memory-fair max batch = MAX_BATCH * slot/(slot + side-buffer),
+# i.e. what fits once the side-buffer is charged like the slot. bf16 LRoSA
+# proj_K is in-slot (already counted) -> overhead 0 here.
+HEAD_SIZE=${HEAD_SIZE:-128}; PAGE_SIZE=${PAGE_SIZE:-16}
+read -r ov fair < <(BE="$BACKEND" HS="$HEAD_SIZE" CS="$CS_H" PS="$PAGE_SIZE" \
+    FP8="${FP8_PROJK:-0}" MAXOK="$max_ok" python3 -c '
+import os
+be=os.environ["BE"]; hs=int(os.environ["HS"]); cs=int(os.environ["CS"])
+ps=int(os.environ["PS"]); fp8=os.environ["FP8"]=="1"; mx=int(os.environ["MAXOK"])
+slot_b = 2*hs*2                       # K+V, bf16 (2 bytes)
+# UNCOUNTED separate side-buffer bytes per token (0 if in-slot/none):
+if be=="quest":       extra_b = (2*hs/ps)*2          # per-page minmax (bf16), amortized/token
+elif be=="lrosa" and fp8: extra_b = cs*1             # fp8 proj_K (1 byte), separate contig cache
+elif be=="lrosa":     extra_b = 0                    # bf16 proj_K is IN slot -> already counted
+elif be=="seer":      extra_b = 128*2                # gate hidden (128), bf16, per token
+else:                 extra_b = 0                    # fkv / fasa / lrosa_mla(see note)
+f = slot_b/(slot_b+extra_b) if (slot_b+extra_b)>0 else 1.0
+print(f"{(1-f)*100:.2f}", int(mx*f))
+')
+echo "SIDE_BUFFER_OVERHEAD_PCT=$ov  MEM_FAIR_MAX_BATCH=$fair  (= MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)" | tee -a "$summary"
 echo "(full per-bsz logs in $OUT/${tag}_b*.log; summary -> $summary)"

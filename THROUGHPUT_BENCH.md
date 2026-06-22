@@ -166,6 +166,7 @@ Each sweep writes `SUMMARY_<tag>.txt`:
 128     -               -                  -                       OOM (stop)
 ----
 MAX_BATCH=64  PEAK_THROUGHPUT_TOK_S=2275.0 @ bsz=64
+SIDE_BUFFER_OVERHEAD_PCT=5.88  MEM_FAIR_MAX_BATCH=60  (= MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)
 ```
 
 - **Max batch** = last `OK` row's `bsz`.
@@ -174,6 +175,36 @@ MAX_BATCH=64  PEAK_THROUGHPUT_TOK_S=2275.0 @ bsz=64
   at the same context (and/or compare `AGG_TOK_S` at a fixed batch).
 - A `FAILED(non-OOM)` row → read its `*_b<bsz>.log` (could be the FKV-fp8 CUBLAS
   bug, a kernel/cache race — ensure unique `VLLM_CACHE_ROOT` — or a config error).
+
+### Max-batch fairness — count the side-buffers (`MEM_FAIR_MAX_BATCH`)
+
+vLLM sizes `num_blocks` (≈ max batch capacity) **only from the per-token KV
+slot** (`real_page_size_bytes`). But several methods keep an extra buffer that
+is NOT in that slot:
+
+| method | side-buffer | in slot? | counted in `num_blocks`? |
+|---|---|---|---|
+| FKV / FASA | none | — | — (max batch is the dense ceiling) |
+| **LRoSA bf16** proj_K | `[…,cs_h]` per token | **in slot** | ✅ yes → `MAX_BATCH` already fair |
+| **LRoSA fp8** proj_K (contig) | separate fp8 cache | no | ❌ eats headroom |
+| **Quest** | `_quest_minmax` per page | no | ❌ eats headroom |
+| **Seer** | `_seer_kc` gate cache | no | ❌ eats headroom |
+
+So for Quest / fp8-LRoSA / Seer the empirical `MAX_BATCH` is **over-stated** —
+the side-buffer fits in `gpu_mem` headroom (1−gpu_mem) instead of reducing
+`num_blocks`. That is why **Quest's raw MAX_BATCH ≈ FKV's** even though Quest
+uses more HBM. `MEM_FAIR_MAX_BATCH` charges the side-buffer like the slot
+(`MAX_BATCH × slot/(slot+side_buffer)`) so the comparison is iso-memory.
+Notably Quest's minmax (`+5.88%`) ≈ fp8-LRoSA proj_K (`+5.88%`) — same real
+overhead, now reported consistently. **Use `MEM_FAIR_MAX_BATCH` (not raw
+`MAX_BATCH`) when comparing capacity across methods.** Set `HEAD_SIZE` /
+`PAGE_SIZE` if not the Qwen3-8B defaults (128 / 16).
+
+> Doing this in the engine instead (so vLLM's own `num_blocks` is correct)
+> needs the side-buffers carved from the raw KV allocation via
+> `page_size_padded` + a strided view — a real per-backend refactor (the
+> strided-view path is currently MLA-shape-only). The measurement-level
+> `MEM_FAIR_MAX_BATCH` gives the same fair number without that risk.
 
 ---
 
