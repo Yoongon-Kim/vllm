@@ -101,6 +101,12 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         ac = kw.get("attention_config") or {}
         ac["backend"] = mla_backend
         kw["attention_config"] = ac
+    if kw.get("kv_cache_dtype") in ("lrosa", "fasa", "quest", "seer"):
+        # Hybrid models (Gemma 4, Ministral): window-bound the sliding layers'
+        # KV cache instead of the combined-slot full-length cache — output-
+        # invariant, only cuts KV memory / raises max batch. No-op for full-
+        # attention models. Essential for a fair sparse-vs-FKV max-batch number.
+        kw["kv_cache_dtype_skip_layers"] = ["sliding_window"]
     return LLM(**kw)
 
 

@@ -1029,22 +1029,32 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = max(page_sizes)
+    # Unify to the LEAST COMMON MULTIPLE of the distinct page sizes (not just the
+    # max). Every layer then scales its block_size up by target/page, so the
+    # unified page size is divisible for all — no slot waste, only coarser block
+    # granularity. When the pages are already mutually divisible (the common
+    # case, e.g. standard full=1024 + sliding=512), LCM == max, so this is a
+    # no-op vs the old max-only logic. It additionally handles non-divisible
+    # mixes, e.g. an LRoSA combined slot (2*hd + proj_K, e.g. 1088B) alongside a
+    # standard sliding-window slot (512B): old code raised NotImplementedError;
+    # now they unify (LCM=8704 -> full block*8, sliding block*17), letting the
+    # sliding layers stay window-bounded instead of forced to full-length.
+    from math import gcd
+
+    target = 1
+    for ps in page_sizes:
+        target = target * ps // gcd(target, ps)
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        page = layer_spec.page_size_bytes
+        if page == target:
             new_kv_cache_spec[layer_name] = layer_spec
         else:
-            layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
-                )
-            ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
+            ratio = target // page
+            new_spec = replace(layer_spec, block_size=layer_spec.block_size * ratio)
+            assert new_spec.page_size_bytes == target, (
+                f"page-size unification failed: {new_spec.page_size_bytes} != {target}"
+            )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 

@@ -52,6 +52,27 @@ _Last updated 2026-06-22._
   refactor, deliberately deferred (the strided-view path is MLA-shape-only).
   Run the sweep at moderate `gpu_mem` (0.85–0.9) so the side-buffer sits in
   headroom and the fair scaling is clean.
+- **Hybrid models (Gemma 4, Ministral) now window-bound their sliding layers
+  under sparse backends — REQUIRES pulling this commit on the bench server.**
+  Previously LRoSA/FASA/Quest/Seer stored ALL layers at full context length,
+  including the 25/30 *sliding* layers, while FKV window-bounds them
+  (`SlidingWindowSpec`). So the sparse-vs-FKV max-batch on Gemma was badly
+  unfair — FKV looked ~2–6× better purely from the sliding-cache artifact, not
+  from any real LRoSA cost. **Fixed:** the eval/bench set
+  `kv_cache_dtype_skip_layers=["sliding_window"]` for GQA sparse backends,
+  routing the sliding layers to the standard FlashAttention backend +
+  window-bounded `SlidingWindowSpec`. Verified on Gemma-4-26B LRoSA @32k:
+  `CONCURRENT_MAX_BATCH` concurrency **6.97× → 13.28×** (~1.9×, larger at longer
+  ctx), and the decode **output is bit-identical** (same flash window kernel) →
+  accuracy unchanged, existing Gemma accuracy numbers stay valid. Two vLLM-core
+  changes back it (pure Python, **no `_C` rebuild** — just `git pull`):
+  `vllm/v1/attention/selector.py` forced-backend fallback (a skipped layer whose
+  dtype the forced sparse backend rejects auto-selects the standard backend) +
+  `vllm/v1/core/kv_cache_utils.py` LCM page-size unification (the LRoSA
+  combined-slot page 1088 B isn't divisible by the sliding 512 B; the old
+  max-only logic raised `NotImplementedError`). No-op for full-attention models
+  (Qwen3 / Llama) and for MLA (GLM) — the skip only fires on `sliding_window`
+  GQA layers, so existing non-Gemma numbers are unaffected.
 
 ---
 

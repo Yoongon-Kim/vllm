@@ -95,11 +95,28 @@ def get_attn_backend(
         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
 
-    return _cached_get_attn_backend(
-        backend=vllm_config.attention_config.backend,
-        attn_selector_config=attn_selector_config,
-        num_heads=num_heads,
-    )
+    forced_backend = vllm_config.attention_config.backend
+    try:
+        return _cached_get_attn_backend(
+            backend=forced_backend,
+            attn_selector_config=attn_selector_config,
+            num_heads=num_heads,
+        )
+    except ValueError as e:
+        # A forced sparse backend (LROSA/QUEST/SEER/...) only supports its own
+        # kv_cache_dtype. For hybrid models, layers excluded via
+        # kv_cache_dtype_skip_layers (e.g. Gemma 4 sliding layers -> "auto") are
+        # incompatible with the forced backend. Instead of hard-failing, fall
+        # back to auto-selection so those layers use the standard backend +
+        # window-bounded SlidingWindowSpec (the full layers keep the forced
+        # sparse backend). No regression: this path otherwise raised.
+        if forced_backend is not None and "kv_cache_dtype not supported" in str(e):
+            return _cached_get_attn_backend(
+                backend=None,
+                attn_selector_config=attn_selector_config,
+                num_heads=num_heads,
+            )
+        raise
 
 
 @cache

@@ -258,6 +258,16 @@ def build_llm(a):
         ac = kw.get("attention_config") or {}
         ac["backend"] = a.mla_backend
         kw["attention_config"] = ac
+    if kw.get("kv_cache_dtype") in ("lrosa", "fasa", "quest", "seer"):
+        # Hybrid models (Gemma 4, Ministral): window-bound the sliding layers.
+        # Under a sparse GQA backend the sliding layers otherwise land in the
+        # combined-slot FULL-length cache; skipping them sends them to the
+        # standard FlashAttention backend + window-bounded SlidingWindowSpec.
+        # No-op for full-attention models (nothing to skip) and OUTPUT-INVARIANT
+        # for hybrid ones (sliding attention is windowed either way) — this only
+        # cuts KV memory / raises max batch. Needs the selector forced-backend
+        # fallback + LCM page-size unification (vLLM core).
+        kw["kv_cache_dtype_skip_layers"] = ["sliding_window"]
     return LLM(**kw)
 
 

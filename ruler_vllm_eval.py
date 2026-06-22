@@ -145,6 +145,12 @@ def build_llm(a, max_model_len):
         ac = kw.get("attention_config") or {}
         ac["backend"] = a.mla_backend
         kw["attention_config"] = ac
+    if kw.get("kv_cache_dtype") in ("lrosa", "fasa", "quest", "seer"):
+        # Hybrid models (Gemma 4, Ministral): window-bound the sliding layers'
+        # KV cache instead of the combined-slot full-length cache. Output-
+        # invariant (sliding attention is windowed either way); only cuts KV
+        # memory / raises max batch. No-op for full-attention models.
+        kw["kv_cache_dtype_skip_layers"] = ["sliding_window"]
     return LLM(**kw)
 
 
