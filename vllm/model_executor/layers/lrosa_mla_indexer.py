@@ -30,6 +30,134 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
+
+
+def quest_mla_select(
+    q_h_all: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    topk_indices_buffer: torch.Tensor,
+    page_size: int,
+    topk_tokens: int,
+    key_dim: int,
+) -> torch.Tensor:
+    """Quest page min/max selection, wrapped as a custom op.
+
+    This is registered as a `splitting_ops` boundary (like
+    `vllm::sparse_attn_indexer`) so inductor treats it as opaque and runs it
+    EAGER between captured cudagraph pieces. The body is dynamic (`.item()`
+    host-syncs, per-request Python loop, data-dependent shapes) and would be
+    mis-compiled if traced — hence the custom op. Mutates `kv_cache` (inserts
+    the current keys) and `topk_indices_buffer` (writes the selected LOCAL
+    positions). Mirrors the eager forward exactly.
+    """
+    md = get_forward_context().attn_metadata
+    buf = topk_indices_buffer
+    T = key.shape[0]
+    if not isinstance(md, dict):
+        return buf  # profiling/dummy
+    m = md.get(_resolve_layer_name(k_cache_prefix))
+    cache = kv_cache                                           # [n_blk, blk, key_dim] bf16
+    buf[:T] = -1
+    if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
+        return buf
+    flat = cache.view(-1, key_dim)
+    flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+    # Decode: eager per-request page min/max selection.
+    if m.num_decodes > 0 and m.decode is not None:
+        bt = m.decode.block_table                              # [B, max_blk]
+        sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)  # [B]
+        blk = cache.shape[1]
+        P, K = page_size, topk_tokens
+        ar_blk = torch.arange(blk, device=bt.device)
+        ar_P = torch.arange(P, device=bt.device)
+        for r in range(m.num_decodes):
+            L = int(sl[r].item())
+            if L <= 0:
+                continue
+            # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
+            # used ONLY to read the cached keys for the min/max (global slots).
+            if L <= K:                                        # all fit -> attend all
+                buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
+            nblk = (L + blk - 1) // blk
+            ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots, local order
+            ks = flat[ids]                                    # [L, key_dim] (row j = local pos j)
+            # ALWAYS keep the page holding the current decode token + most-recent
+            # context (Quest keeps the local window); score only the full pages
+            # strictly before it and fill the remaining budget with the top pages.
+            last_start = ((L - 1) // P) * P
+            tail = torch.arange(last_start, L, device=bt.device)   # current/last page
+            ncand = last_start // P                                # full candidate pages
+            keep = (K - int(tail.numel())) // P                    # pages affordable after tail
+            if ncand == 0 or keep <= 0:
+                out = torch.cat([torch.arange(0, last_start, device=bt.device), tail])[:K]
+            else:
+                full = ks[:ncand * P].view(ncand, P, key_dim)
+                kmin = full.min(1).values; kmax = full.max(1).values   # [ncand, key_dim]
+                # Faithful Quest GQA reduction = group-mean the query to the single
+                # (shared) KV head, then ONE max(q*kmin, q*kmax) score. MLA has one
+                # latent KV head so the whole head set is one group -> mean over heads.
+                # (Matches pca quest.py q_aggregation="groupmean", the paper default.)
+                qg = q_h_all[r].mean(0)                                # [key_dim]
+                qp = qg.clamp(min=0); qn = qg.clamp(max=0)
+                score = qp @ kmax.t() + qn @ kmin.t()                  # [ncand]
+                top = score.topk(min(keep, ncand)).indices
+                sel = (top[:, None] * P + ar_P).view(-1)               # LOCAL positions of pages
+                out = torch.cat([tail, sel])[:K]                       # tail first -> never dropped
+            out = torch.sort(out).values                               # kernel expects ascending
+            buf[r, :out.shape[0]] = out.to(buf.dtype)
+    # Prefill: each token attends its causal context. When the causal length fits
+    # the budget (the common reasoning case: prompt <= budget) -> attend ALL causal
+    # LOCAL positions (0..i). When it overflows (long prompt + small budget, nf512
+    # only) -> streaming fallback: the K most-recent causal positions (sorted, incl
+    # self). Quest's sparsity target is the DECODE path; reasoning prompts are short
+    # so the overflow branch is rarely hit. Assumes no prefix-cache reuse (chunk
+    # covers the sequence from position 0; true for the eval).
+    if m.num_prefills > 0 and m.prefill is not None:
+        base = m.num_decode_tokens
+        K = topk_tokens
+        for ch in m.prefill.chunks:
+            cu = ch.cu_seq_lens.to(torch.long)                # [num_reqs+1] local cumsum
+            for j in range(ch.num_reqs):
+                s, e = int(cu[j].item()), int(cu[j + 1].item())
+                for i in range(e - s):
+                    tok = base + ch.token_start + s + i
+                    Lc = i + 1                                # causal length (pos 0..i)
+                    if Lc <= K:
+                        buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
+                    else:
+                        buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
+    return buf
+
+
+def quest_mla_select_fake(
+    q_h_all: torch.Tensor,
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    topk_indices_buffer: torch.Tensor,
+    page_size: int,
+    topk_tokens: int,
+    key_dim: int,
+) -> torch.Tensor:
+    return topk_indices_buffer
+
+
+direct_register_custom_op(
+    op_name="quest_mla_select",
+    op_func=quest_mla_select,
+    mutates_args=["kv_cache", "topk_indices_buffer"],
+    fake_impl=quest_mla_select_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 class QuestMLAIndexer(nn.Module):
@@ -104,82 +232,135 @@ class QuestMLAIndexer(nn.Module):
         q_h_all = torch.cat([q_latent, q_pe], dim=-1)              # [T, H, key_dim]
         key = torch.cat([c_kv, k_pe], dim=-1)                       # [T, key_dim]
 
-        md = get_forward_context().attn_metadata
-        buf = self.topk_indices_buffer
-        if not isinstance(md, dict):
-            return buf  # profiling/dummy
-        m = md.get(self.k_cache.prefix)
-        cache = self.k_cache.kv_cache                               # [n_blk, blk, key_dim] bf16
-        buf[:T] = -1
-        if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
-            return buf
-        flat = cache.view(-1, self.key_dim)
-        flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
-        # Decode: eager per-request page min/max selection.
-        if m.num_decodes > 0 and m.decode is not None:
-            bt = m.decode.block_table                              # [B, max_blk]
-            sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)  # [B]
-            blk = cache.shape[1]
-            P, K = self.page_size, self.topk_tokens
-            ar_blk = torch.arange(blk, device=bt.device)
-            ar_P = torch.arange(P, device=bt.device)
-            for r in range(m.num_decodes):
-                L = int(sl[r].item())
-                if L <= 0:
-                    continue
-                # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
-                # used ONLY to read the cached keys for the min/max (global slots).
-                if L <= K:                                        # all fit -> attend all
-                    buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
-                nblk = (L + blk - 1) // blk
-                ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots, local order
-                ks = flat[ids]                                    # [L, key_dim] (row j = local pos j)
-                # ALWAYS keep the page holding the current decode token + most-recent
-                # context (Quest keeps the local window); score only the full pages
-                # strictly before it and fill the remaining budget with the top pages.
-                last_start = ((L - 1) // P) * P
-                tail = torch.arange(last_start, L, device=bt.device)   # current/last page
-                ncand = last_start // P                                # full candidate pages
-                keep = (K - int(tail.numel())) // P                    # pages affordable after tail
-                if ncand == 0 or keep <= 0:
-                    out = torch.cat([torch.arange(0, last_start, device=bt.device), tail])[:K]
-                else:
-                    full = ks[:ncand * P].view(ncand, P, self.key_dim)
-                    kmin = full.min(1).values; kmax = full.max(1).values   # [ncand, key_dim]
-                    # Faithful Quest GQA reduction = group-mean the query to the single
-                    # (shared) KV head, then ONE max(q*kmin, q*kmax) score. MLA has one
-                    # latent KV head so the whole head set is one group -> mean over heads.
-                    # (Matches pca quest.py q_aggregation="groupmean", the paper default.)
-                    qg = q_h_all[r].mean(0)                                # [key_dim]
-                    qp = qg.clamp(min=0); qn = qg.clamp(max=0)
-                    score = qp @ kmax.t() + qn @ kmin.t()                  # [ncand]
-                    top = score.topk(min(keep, ncand)).indices
-                    sel = (top[:, None] * P + ar_P).view(-1)               # LOCAL positions of pages
-                    out = torch.cat([tail, sel])[:K]                       # tail first -> never dropped
-                out = torch.sort(out).values                               # kernel expects ascending
-                buf[r, :out.shape[0]] = out.to(buf.dtype)
-        # Prefill: each token attends its causal context. When the causal length fits
-        # the budget (the common reasoning case: prompt <= budget) -> attend ALL causal
-        # LOCAL positions (0..i). When it overflows (long prompt + small budget, nf512
-        # only) -> streaming fallback: the K most-recent causal positions (sorted, incl
-        # self). Quest's sparsity target is the DECODE path; reasoning prompts are short
-        # so the overflow branch is rarely hit. Assumes no prefix-cache reuse (chunk
-        # covers the sequence from position 0; true for the eval).
-        if m.num_prefills > 0 and m.prefill is not None:
-            base = m.num_decode_tokens
-            K = self.topk_tokens
-            for ch in m.prefill.chunks:
-                cu = ch.cu_seq_lens.to(torch.long)                # [num_reqs+1] local cumsum
-                for j in range(ch.num_reqs):
-                    s, e = int(cu[j].item()), int(cu[j + 1].item())
-                    for i in range(e - s):
-                        tok = base + ch.token_start + s + i
-                        Lc = i + 1                                # causal length (pos 0..i)
-                        if Lc <= K:
-                            buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
-                        else:
-                            buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
+        # Dynamic page min/max selection runs in a registered custom op (a
+        # splitting_ops boundary) so it executes EAGER and is never traced by
+        # inductor; the projections above are compiled. See quest_mla_select.
+        return torch.ops.vllm.quest_mla_select(
+            q_h_all, key, self.k_cache.kv_cache,
+            _encode_layer_name(self.k_cache.prefix),
+            self.topk_indices_buffer, self.page_size, self.topk_tokens,
+            self.key_dim)
+
+
+def triattn_mla_select(
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    topk_indices_buffer: torch.Tensor,
+    q_mean_real: torch.Tensor,
+    q_mean_imag: torch.Tensor,
+    q_abs_mean: torch.Tensor,
+    omega: torch.Tensor,
+    offsets: torch.Tensor,
+    freq_scale_sq: torch.Tensor,
+    rope_style: str,
+    aggregation: str,
+    topk_tokens: int,
+    key_dim: int,
+    kv_lora_rank: int,
+) -> torch.Tensor:
+    """TriAttention frequency-domain selection, wrapped as a custom op.
+
+    Same role as `quest_mla_select`: a `splitting_ops` boundary so the dynamic
+    eager scoring (`.item()` host-syncs, per-request loop, cos/atan2) is NOT
+    traced by inductor — runs eager between captured PIECEWISE cudagraph pieces.
+    Mutates `kv_cache` (inserts PRE-rope keys) and `topk_indices_buffer`.
+    """
+    from vllm.model_executor.layers.triattention_utils import (
+        compute_frequency_statistics_from_means, score_keys_for_round,
+    )
+    md = get_forward_context().attn_metadata
+    buf = topk_indices_buffer
+    T = key.shape[0]
+    if not isinstance(md, dict):
+        return buf  # profiling/dummy
+    m = md.get(_resolve_layer_name(k_cache_prefix))
+    cache = kv_cache                                           # [n_blk, blk, key_dim]
+    buf[:T] = -1
+    if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
         return buf
+    flat = cache.view(-1, key_dim)
+    flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
+    q_mean_complex = torch.complex(q_mean_real, q_mean_imag)   # [nFC]
+    kvlr = kv_lora_rank
+    K = topk_tokens
+    # Decode: eager per-request TriAttention frequency scoring.
+    if m.num_decodes > 0 and m.decode is not None:
+        bt = m.decode.block_table                              # [B, max_blk]
+        sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)
+        blk = cache.shape[1]
+        ar_blk = torch.arange(blk, device=bt.device)
+        for r in range(m.num_decodes):
+            L = int(sl[r].item())
+            if L <= 0:
+                continue
+            # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
+            # used ONLY to read the cached pre-rope k_pe (global slots).
+            if L <= K:                                        # all fit -> attend all
+                buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
+            nblk = (L + blk - 1) // blk
+            ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots
+            k_pe = flat[ids, kvlr:].float()                   # [L, rope] pre-rope k_pe
+            # amp/phi/extra from the calibrated query stat + this request's keys.
+            amp, phi, extra = compute_frequency_statistics_from_means(
+                q_mean_complex, q_abs_mean, k_pe, style=rope_style)
+            # round_start = current decode position = L-1 (0-indexed last token).
+            key_idx = torch.arange(L, device=bt.device)
+            score = score_keys_for_round(
+                key_idx, L - 1, amp, phi, omega, extra,
+                offsets, aggregation, freq_scale_sq)           # [L]
+            # ALWAYS keep the current/last token (self-attention); fill the rest
+            # of the budget with the top-scoring tokens. Bias self up so it is in.
+            score[L - 1] = float("inf")
+            top = score.topk(min(K, L)).indices               # LOCAL positions
+            out = torch.sort(top).values                      # kernel needs ascending
+            buf[r, :out.shape[0]] = out.to(buf.dtype)
+    # Prefill: each token attends its causal context. Prompt <= budget (the common
+    # reasoning case) -> attend ALL causal LOCAL positions. Overflow (long prompt +
+    # small budget) -> recent-window fallback (same stack-wide limit as Quest/FASA).
+    if m.num_prefills > 0 and m.prefill is not None:
+        base = m.num_decode_tokens
+        for ch in m.prefill.chunks:
+            cu = ch.cu_seq_lens.to(torch.long)
+            for j in range(ch.num_reqs):
+                s, e = int(cu[j].item()), int(cu[j + 1].item())
+                for i in range(e - s):
+                    tok = base + ch.token_start + s + i
+                    Lc = i + 1
+                    if Lc <= K:
+                        buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
+                    else:
+                        buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
+    return buf
+
+
+def triattn_mla_select_fake(
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_prefix: LayerNameType,
+    topk_indices_buffer: torch.Tensor,
+    q_mean_real: torch.Tensor,
+    q_mean_imag: torch.Tensor,
+    q_abs_mean: torch.Tensor,
+    omega: torch.Tensor,
+    offsets: torch.Tensor,
+    freq_scale_sq: torch.Tensor,
+    rope_style: str,
+    aggregation: str,
+    topk_tokens: int,
+    key_dim: int,
+    kv_lora_rank: int,
+) -> torch.Tensor:
+    return topk_indices_buffer
+
+
+direct_register_custom_op(
+    op_name="triattn_mla_select",
+    op_func=triattn_mla_select,
+    mutates_args=["kv_cache", "topk_indices_buffer"],
+    fake_impl=triattn_mla_select_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 class TriAttentionMLAIndexer(nn.Module):
@@ -310,11 +491,7 @@ class TriAttentionMLAIndexer(nn.Module):
             prefix=f"{prefix}.k_cache", cache_config=cache_config)
 
     def forward(self, hidden_states, q_c, positions, rotary_emb=None):
-        from vllm.model_executor.layers.triattention_utils import (
-            compute_frequency_statistics_from_means, score_keys_for_round,
-        )
-        T = hidden_states.shape[0]
-        kvlr, rope_d = self.kv_lora_rank, self.qk_rope_head_dim
+        kvlr = self.kv_lora_rank
         # latent c_KV + decoupled rope key (kv_a path). k_pe is taken PRE-rope so the
         # cached value is exactly TriAttention's k_unrot (no rope inversion needed).
         if self.q_lora_rank is not None:
@@ -325,73 +502,15 @@ class TriAttentionMLAIndexer(nn.Module):
         k_pe_pre = kv_lora[..., kvlr:]                              # [T, rope] PRE-rope
         key = torch.cat([c_kv, k_pe_pre], dim=-1)                  # [T, key_dim]
 
-        md = get_forward_context().attn_metadata
-        buf = self.topk_indices_buffer
-        if not isinstance(md, dict):
-            return buf  # profiling/dummy
-        m = md.get(self.k_cache.prefix)
-        cache = self.k_cache.kv_cache                               # [n_blk, blk, key_dim]
-        buf[:T] = -1
-        if m is None or cache is None or (hasattr(cache, "numel") and cache.numel() == 0):
-            return buf
-        flat = cache.view(-1, self.key_dim)
-        flat[m.slot_mapping[:T]] = key.to(flat.dtype)               # insert current keys
-
-        # Precompute the query-side complex stat once (per-layer, group-meaned at
-        # calibration → already a single query). q_mean_complex / q_abs_mean / omega /
-        # freq_scale_sq / offsets are calibrated buffers.
-        q_mean_complex = torch.complex(self.q_mean_real, self.q_mean_imag)  # [nFC]
-
-        # Decode: eager per-request TriAttention frequency scoring.
-        if m.num_decodes > 0 and m.decode is not None:
-            bt = m.decode.block_table                              # [B, max_blk]
-            sl = m.decode.seq_lens.view(m.num_decodes, -1)[:, -1].to(torch.long)
-            blk = cache.shape[1]
-            K = self.topk_tokens
-            ar_blk = torch.arange(blk, device=bt.device)
-            for r in range(m.num_decodes):
-                L = int(sl[r].item())
-                if L <= 0:
-                    continue
-                # FlashMLASparse expects LOCAL positions (0..L-1); the block table is
-                # used ONLY to read the cached pre-rope k_pe (global slots).
-                if L <= K:                                        # all fit -> attend all
-                    buf[r, :L] = torch.arange(L, device=bt.device).to(buf.dtype); continue
-                nblk = (L + blk - 1) // blk
-                ids = (bt[r, :nblk, None] * blk + ar_blk).view(-1)[:L]   # global slots
-                k_pe = flat[ids, kvlr:].float()                   # [L, rope] pre-rope k_pe
-                # amp/phi/extra from the calibrated query stat + this request's keys.
-                amp, phi, extra = compute_frequency_statistics_from_means(
-                    q_mean_complex, self.q_abs_mean, k_pe, style=self.rope_style)
-                # round_start = current decode position = L-1 (0-indexed last token).
-                key_idx = torch.arange(L, device=bt.device)
-                score = score_keys_for_round(
-                    key_idx, L - 1, amp, phi, self.omega, extra,
-                    self.offsets, self.aggregation, self.freq_scale_sq)  # [L]
-                # ALWAYS keep the current/last token (self-attention); fill the rest
-                # of the budget with the top-scoring tokens. Bias self up so it is in.
-                score[L - 1] = float("inf")
-                top = score.topk(min(K, L)).indices               # LOCAL positions
-                out = torch.sort(top).values                      # kernel needs ascending
-                buf[r, :out.shape[0]] = out.to(buf.dtype)
-        # Prefill: each token attends its causal context. Prompt <= budget (the common
-        # reasoning case) -> attend ALL causal LOCAL positions. Overflow (long prompt +
-        # small budget) -> recent-window fallback (same stack-wide limit as Quest/FASA).
-        if m.num_prefills > 0 and m.prefill is not None:
-            base = m.num_decode_tokens
-            K = self.topk_tokens
-            for ch in m.prefill.chunks:
-                cu = ch.cu_seq_lens.to(torch.long)
-                for j in range(ch.num_reqs):
-                    s, e = int(cu[j].item()), int(cu[j + 1].item())
-                    for i in range(e - s):
-                        tok = base + ch.token_start + s + i
-                        Lc = i + 1
-                        if Lc <= K:
-                            buf[tok, :Lc] = torch.arange(Lc, device=buf.device).to(buf.dtype)
-                        else:
-                            buf[tok, :K] = torch.arange(Lc - K, Lc, device=buf.device).to(buf.dtype)
-        return buf
+        # Dynamic frequency selection runs in a registered custom op (a
+        # splitting_ops boundary) so it executes EAGER and is never traced by
+        # inductor; the projections above are compiled. See triattn_mla_select.
+        return torch.ops.vllm.triattn_mla_select(
+            key, self.k_cache.kv_cache, _encode_layer_name(self.k_cache.prefix),
+            self.topk_indices_buffer,
+            self.q_mean_real, self.q_mean_imag, self.q_abs_mean, self.omega,
+            self.offsets, self.freq_scale_sq, self.rope_style, self.aggregation,
+            self.topk_tokens, self.key_dim, self.kv_lora_rank)
 
 
 class FASAMLAIndexer(nn.Module):

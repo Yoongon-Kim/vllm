@@ -759,6 +759,11 @@ class CompilationConfig:
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
+        # LRoSA appendix: eager PyTorch MLA indexers (Quest/TriAttention min-max
+        # & frequency selection). Opaque splitting boundaries so PIECEWISE
+        # cudagraph captures the MoE body while these run eager.
+        "vllm::quest_mla_select",
+        "vllm::triattn_mla_select",
     ]
 
     def compute_hash(self) -> str:

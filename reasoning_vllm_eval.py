@@ -184,7 +184,19 @@ def build_llm(a):
         kw["attention_config"] = {"quest_mla": True, "lrosa_n_fac": a.n_fac,
                                   "quest_page_size": a.page_size}
         kw["kv_cache_dtype"] = a.mla_kv_dtype
-        kw["enforce_eager"] = True
+        # The eager PyTorch min/max indexer is invoked INSIDE the opaque MLA
+        # attention op, so PIECEWISE cudagraph can still capture the (47-layer
+        # MoE) model body while only the indexer runs eager. --mla_graph drops
+        # the forced-eager default to enable that. Default stays eager (safe).
+        # MUST force cudagraph_mode=PIECEWISE: the V1 default FULL_AND_PIECEWISE
+        # captures the WHOLE decode step (incl. the indexer's .item()/dynamic
+        # page loop) into a FULL graph, freezing topk at capture-time -> garbage
+        # ("php" repetition). PIECEWISE keeps the attention op (indexer) as an
+        # eager split point, capturing only the MoE/MLP/norm pieces.
+        if not a.mla_graph:
+            kw["enforce_eager"] = True
+        else:
+            kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
     elif a.mode == "triattn_mla":
         # TriAttention on an MLA model (GLM-4.7-Flash): NOVEL port. Frequency-domain
         # selection on the decoupled RoPE cache k_pe via per-layer calibrated query
@@ -195,7 +207,10 @@ def build_llm(a):
         kw["attention_config"] = {"triattn_mla": True, "lrosa_basis_path": a.basis,
                                   "lrosa_n_fac": a.n_fac}
         kw["kv_cache_dtype"] = a.mla_kv_dtype
-        kw["enforce_eager"] = True
+        if not a.mla_graph:  # see quest_mla note above
+            kw["enforce_eager"] = True
+        else:
+            kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
     elif a.mode in ("lrosa", "loki"):
         variant = "loki" if a.mode == "loki" else "d1"
         basis = a.basis or lrosa_basis_path(a.model, cs_h=a.cs_h, variant=variant)
@@ -298,6 +313,16 @@ def main():
     # auto-gated off for head_size>256 (e.g. Gemma 4 -> effectively bf16).
     ap.add_argument("--fp8_projk", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--mla_graph", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="(default on) Run quest_mla/triattn_mla with PIECEWISE "
+                         "cudagraph instead of forced enforce_eager. Their eager "
+                         "PyTorch indexers are registered custom ops "
+                         "(vllm::quest_mla_select / triattn_mla_select) on the "
+                         "splitting_ops boundary, so the MoE model body is "
+                         "compiled+captured while the indexer runs eager -> ~2x "
+                         "decode speedup, verified coherent (== eager output). "
+                         "Pass --no-mla_graph to fall back to full eager.")
     ap.add_argument("--max_num_seqs", type=int, default=0)
     ap.add_argument("--gpu_mem", type=float, default=0.85)
     ap.add_argument("--fkv_kv_fp8", action=argparse.BooleanOptionalAction, default=None,
