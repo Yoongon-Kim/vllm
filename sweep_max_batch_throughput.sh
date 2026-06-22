@@ -72,49 +72,71 @@ summary="$OUT/SUMMARY_${tag}.txt"; : > "$summary"
 echo "# sweep $MODEL backend=$BACKEND ctx=$CTX nfac=$NFAC decode=$DECODE gpu_mem=$GPU_MEM gpu=$GPU" | tee "$summary"
 echo "# bsz   decode_ms/tok   per_stream_tok/s   AGG_tok/s(throughput)   status" | tee -a "$summary"
 
-best_bsz=0; best_tput=0; max_ok=0; bsz=$BSZ_START
-while [ "$bsz" -le "$MAX_BSZ" ]; do
-  log="$OUT/${tag}_b${bsz}.log"
+# Run one batch_size and emit its summary row. $1 = bsz.
+run_bsz() {
+  local bsz=$1 log="$OUT/${tag}_b${1}.log"
   CUDA_VISIBLE_DEVICES=$GPU "$PY" decode_latency_bench.py \
     --backend "$BACKEND" --model "$MODEL" --prefill_len "$CTX" --decode_len "$DECODE" \
     --n_fac "$NFAC" --batch_size "$bsz" --gpu_mem "$GPU_MEM" "${extra[@]}" \
     > "$log" 2>&1
-  rc=$?
-  line=$(grep -hE "DECODE_MS_PER_TOK" "$log" 2>/dev/null | tail -1)
+  local line; line=$(grep -hE "DECODE_MS_PER_TOK" "$log" 2>/dev/null | tail -1)
   if [ -n "$line" ]; then
-    ms=$(echo "$line"   | grep -oE "DECODE_MS_PER_TOK=[0-9.]+" | cut -d= -f2)
-    pst=$(echo "$line"  | grep -oE "PER_STREAM_TOK_S=[0-9.]+" | cut -d= -f2)
-    agg=$(echo "$line"  | grep -oE "AGG_TOK_S=[0-9.]+"        | cut -d= -f2)
+    local ms pst agg
+    ms=$(echo "$line"  | grep -oE "DECODE_MS_PER_TOK=[0-9.]+" | cut -d= -f2)
+    pst=$(echo "$line" | grep -oE "PER_STREAM_TOK_S=[0-9.]+" | cut -d= -f2)
+    agg=$(echo "$line" | grep -oE "AGG_TOK_S=[0-9.]+"        | cut -d= -f2)
     printf "%-6s %-15s %-18s %-22s OK\n" "$bsz" "$ms" "$pst" "$agg" | tee -a "$summary"
-    max_ok=$bsz
     awk "BEGIN{exit !($agg > $best_tput)}" && { best_tput=$agg; best_bsz=$bsz; }
-  else
-    if grep -qiE "out of memory|OutOfMemory|CUDA error|CUDA out of memory|HIP out of memory" "$log"; then
-      printf "%-6s %-15s %-18s %-22s OOM (stop)\n" "$bsz" "-" "-" "-" | tee -a "$summary"
-      break
-    else
-      printf "%-6s %-15s %-18s %-22s FAILED(non-OOM, see %s)\n" "$bsz" "-" "-" "-" "$log" | tee -a "$summary"
-      break
-    fi
+    LAST_KVTOK=$(grep -oE "GPU KV cache size: [0-9,]+ tokens" "$log" 2>/dev/null | grep -oE "[0-9,]+" | tr -d ',' | head -1)
+    return 0
   fi
-  bsz=$((bsz * 2))
-done
+  if grep -qiE "out of memory|OutOfMemory|CUDA error|HIP out of memory" "$log"; then
+    printf "%-6s %-15s %-18s %-22s OOM\n" "$bsz" "-" "-" "-" | tee -a "$summary"
+  else
+    printf "%-6s %-15s %-18s %-22s FAILED(non-OOM, see %s)\n" "$bsz" "-" "-" "-" "$log" | tee -a "$summary"
+  fi
+  return 1
+}
+
+# Concurrent max batch is the KV-pool capacity, NOT an OOM sweep: vLLM
+# QUEUES/PREEMPTS requests that exceed the KV pool, so generate() still
+# completes at batch >> capacity (no OOM) — an OOM-doubling sweep therefore
+# measures the preemption/activation ceiling, not what fits CONCURRENTLY
+# (badly over-stated at long ctx, where capacity is single digits). Instead:
+# probe with batch=1, read the engine's "GPU KV cache size: N tokens", and
+# CONCURRENT_MAX_BATCH = floor(N / (ctx + decode)). Throughput is then measured
+# only at batches that actually fit (<= concurrent max); beyond that the timing
+# reflects preemption, not concurrency.
+best_bsz=0; best_tput=0; LAST_KVTOK=""
+run_bsz "$BSZ_START" || true
+kvtok=${LAST_KVTOK:-0}
+per_req=$(( CTX + DECODE ))
+conc_max=0
+[ "${kvtok:-0}" -gt 0 ] && conc_max=$(( kvtok / per_req ))
+echo "# GPU_KV_CACHE_TOKENS=$kvtok  per_request=$per_req  -> CONCURRENT_MAX_BATCH=$conc_max" | tee -a "$summary"
+
+# Throughput at fitting batches: powers of 2 in (BSZ_START, min(conc_max,MAX_BSZ)]
+# plus conc_max itself (the true capacity point).
+cap=$conc_max; [ "$MAX_BSZ" -lt "$cap" ] && cap=$MAX_BSZ
+b=$(( BSZ_START * 2 ))
+while [ "$b" -lt "$cap" ]; do run_bsz "$b" || break; b=$(( b * 2 )); done
+[ "$cap" -gt "$BSZ_START" ] && run_bsz "$cap" || true
 
 echo "----" | tee -a "$summary"
-echo "MAX_BATCH=$max_ok  PEAK_THROUGHPUT_TOK_S=$best_tput @ bsz=$best_bsz" | tee -a "$summary"
+echo "CONCURRENT_MAX_BATCH=$conc_max  (KV-fit, preemption-independent)" | tee -a "$summary"
+echo "PEAK_THROUGHPUT_TOK_S=$best_tput @ bsz=$best_bsz  (within the concurrent regime)" | tee -a "$summary"
 
-# --- Memory-fair max batch -------------------------------------------------
-# vLLM sizes num_blocks (= max batch capacity) from the per-token KV SLOT only.
-# Methods with an UNCOUNTED separate side-buffer (Quest page min/max; LRoSA fp8
-# proj_K contig cache; Seer gate cache) consume extra HBM that is NOT in the
-# slot -> it silently eats gpu_mem headroom, so their empirical MAX_BATCH is
-# OVER-stated vs FKV (and vs in-slot bf16 LRoSA proj_K, which IS counted).
-# Report the iso-memory-fair max batch = MAX_BATCH * slot/(slot + side-buffer),
-# i.e. what fits once the side-buffer is charged like the slot. bf16 LRoSA
-# proj_K is in-slot (already counted) -> overhead 0 here.
+# --- Memory-fair concurrent max batch --------------------------------------
+# CONCURRENT_MAX_BATCH above comes from the KV pool, which vLLM sizes from the
+# per-token KV SLOT only. Methods with an UNCOUNTED separate side-buffer (Quest
+# page min/max; LRoSA fp8 proj_K contig cache; Seer gate cache) consume extra
+# HBM NOT in the slot -> it eats gpu_mem headroom, so their CONCURRENT_MAX_BATCH
+# is OVER-stated vs FKV (and vs in-slot bf16 LRoSA proj_K, which IS counted).
+# Report the iso-memory-fair value = CONCURRENT_MAX_BATCH * slot/(slot+side),
+# i.e. what fits once the side-buffer is charged like the slot.
 HEAD_SIZE=${HEAD_SIZE:-128}; PAGE_SIZE=${PAGE_SIZE:-16}
 read -r ov fair < <(BE="$BACKEND" HS="$HEAD_SIZE" CS="$CS_H" PS="$PAGE_SIZE" \
-    FP8="${FP8_PROJK:-0}" MAXOK="$max_ok" python3 -c '
+    FP8="${FP8_PROJK:-0}" MAXOK="$conc_max" python3 -c '
 import os
 be=os.environ["BE"]; hs=int(os.environ["HS"]); cs=int(os.environ["CS"])
 ps=int(os.environ["PS"]); fp8=os.environ["FP8"]=="1"; mx=int(os.environ["MAXOK"])
@@ -128,5 +150,5 @@ else:                 extra_b = 0                    # fkv / fasa / lrosa_mla(se
 f = slot_b/(slot_b+extra_b) if (slot_b+extra_b)>0 else 1.0
 print(f"{(1-f)*100:.2f}", int(mx*f))
 ')
-echo "SIDE_BUFFER_OVERHEAD_PCT=$ov  MEM_FAIR_MAX_BATCH=$fair  (= MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)" | tee -a "$summary"
+echo "SIDE_BUFFER_OVERHEAD_PCT=$ov  MEM_FAIR_CONCURRENT_MAX_BATCH=$fair  (= CONCURRENT_MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)" | tee -a "$summary"
 echo "(full per-bsz logs in $OUT/${tag}_b*.log; summary -> $summary)"

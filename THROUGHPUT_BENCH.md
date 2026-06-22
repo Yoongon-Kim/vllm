@@ -17,18 +17,28 @@ comparison.
 
 _Last updated 2026-06-22._
 
-- **Use `MEM_FAIR_MAX_BATCH`, not the raw `MAX_BATCH`, to compare capacity across
-  methods.** vLLM sizes `num_blocks` (max batch) from the per-token KV slot
-  ONLY, so methods with a separate side-buffer that is NOT in the slot —
-  **Quest** (`_quest_minmax`), **fp8/contig LRoSA proj_K** (`_projk_cache`),
-  **Seer** (gate cache) — have that memory eat `gpu_mem` headroom instead of
-  reducing `num_blocks`. Their raw `MAX_BATCH` is therefore **over-stated** (e.g.
-  Quest's raw `MAX_BATCH` ≈ FKV's even though Quest uses more HBM). bf16 LRoSA
-  proj_K is in-slot, so its `MAX_BATCH` is already fair.
-- `sweep_max_batch_throughput.sh` now prints `SIDE_BUFFER_OVERHEAD_PCT` +
-  `MEM_FAIR_MAX_BATCH = MAX_BATCH × slot/(slot+side_buffer)` (see §5). Overheads
-  are symmetric where expected: Quest minmax **+5.88%** ≈ fp8-LRoSA proj_K
-  **+5.88%**; FKV / FASA / bf16-LRoSA **0%**; Seer ≈ **33%**.
+- **Max batch = `CONCURRENT_MAX_BATCH` (KV-pool capacity), NOT an OOM sweep.**
+  vLLM QUEUES/PREEMPTS requests that exceed the KV pool, so `generate()` still
+  completes at batch ≫ capacity (no OOM). An OOM-doubling sweep therefore
+  measures the preemption/activation ceiling, badly over-stating what fits
+  *concurrently* (e.g. at 128k ctx the real concurrent cap is ~7, but
+  OOM-doubling reported 64+). The sweep now probes once, reads the engine's
+  `GPU KV cache size: N tokens`, and reports
+  `CONCURRENT_MAX_BATCH = floor(N / (ctx + decode))` (matches vLLM's logged
+  "Maximum concurrency"). Throughput is measured only at batches ≤ that.
+
+- **Use `MEM_FAIR_CONCURRENT_MAX_BATCH` to compare capacity across methods.**
+  vLLM sizes `num_blocks` from the per-token KV slot ONLY, so methods with a
+  separate side-buffer that is NOT in the slot — **Quest** (`_quest_minmax`),
+  **fp8/contig LRoSA proj_K** (`_projk_cache`), **Seer** (gate cache) — have
+  that memory eat `gpu_mem` headroom instead of reducing `num_blocks`. Their
+  `CONCURRENT_MAX_BATCH` is therefore **over-stated** (e.g. Quest's ≈ FKV's even
+  though Quest uses more HBM). bf16 LRoSA proj_K is in-slot, so it is already
+  fair.
+- `sweep_max_batch_throughput.sh` prints `SIDE_BUFFER_OVERHEAD_PCT` +
+  `MEM_FAIR_CONCURRENT_MAX_BATCH = CONCURRENT_MAX_BATCH × slot/(slot+side_buffer)`
+  (see §5). Overheads are symmetric where expected: Quest minmax **+5.88%** ≈
+  fp8-LRoSA proj_K **+5.88%**; FKV / FASA / bf16-LRoSA **0%**; Seer ≈ **33%**.
 - New sweep env: `FP8_PROJK=1` (LRoSA fp8 contig proj_K), `HEAD_SIZE` /
   `PAGE_SIZE` (default 128 / 16 for Qwen3-8B).
 - **vLLM's engine `num_blocks` is NOT modified** — this is a measurement-level
@@ -57,9 +67,12 @@ DECODE_MS_PER_TOK=<ms>   PER_STREAM_TOK_S=<1000/ms>   AGG_TOK_S=<per_stream * B>
 
 - **`DECODE_MS_PER_TOK`** = per-step decode latency (advances all `B` streams).
 - **`AGG_TOK_S`** = aggregate decode throughput (tokens/s across the batch) ← the throughput number.
-- **Max batch** = the largest `B` that does not OOM.
-- **Peak throughput** = the highest `AGG_TOK_S` over the batch sweep (often, but
-  not always, at max batch — decode is HBM-bound so throughput can plateau).
+- **Concurrent max batch** = `floor(GPU_KV_cache_tokens / (ctx + decode))` — the
+  number of requests that fit in the KV pool *at once*. This is NOT an OOM
+  sweep: vLLM queues/preempts beyond capacity so larger batches still run
+  (no OOM) but not concurrently. The KV-pool capacity is the right metric.
+- **Peak throughput** = the highest `AGG_TOK_S` over the fitting batches
+  (≤ concurrent max; decode is HBM-bound so throughput can plateau before it).
 
 ---
 
@@ -124,8 +137,12 @@ context > 40k** (native ctx); short contexts run native.
 
 ## 4. Max-batch + throughput sweep (the main process)
 
-`sweep_max_batch_throughput.sh` doubles `batch_size` (1,2,4,8,…) until OOM,
-records `AGG_TOK_S` at each, and reports **MAX_BATCH** + **PEAK_THROUGHPUT**.
+`sweep_max_batch_throughput.sh` probes batch=1 to read the KV-pool capacity,
+computes **`CONCURRENT_MAX_BATCH = floor(GPU_KV_cache_tokens / (ctx+decode))`**,
+then measures `AGG_TOK_S` at fitting batches (1,2,4,… up to the concurrent max),
+and reports `CONCURRENT_MAX_BATCH` + `MEM_FAIR_CONCURRENT_MAX_BATCH` +
+`PEAK_THROUGHPUT`. (It does NOT OOM-sweep — vLLM queues/preempts beyond
+capacity, so an OOM sweep would over-state the concurrent max.)
 
 ### 4a. GQA models (Qwen3-8B / Llama-3.1-8B): fkv / lrosa / fasa / quest
 
@@ -189,44 +206,50 @@ Each sweep writes `SUMMARY_<tag>.txt`:
 # bsz   decode_ms/tok   per_stream_tok/s   AGG_tok/s(throughput)   status
 1       15.3            65.4               65.4                    OK
 2       15.5            64.5               129.0                   OK
-...
-64      28.1            35.6               2275.0                  OK
-128     -               -                  -                       OOM (stop)
+4       16.2            61.7               246.9                   OK
+# GPU_KV_CACHE_TOKENS=979033  per_request=65664  -> CONCURRENT_MAX_BATCH=14
+8       19.0            52.6               420.9                   OK
+14      24.8            40.3               564.5                   OK
 ----
-MAX_BATCH=64  PEAK_THROUGHPUT_TOK_S=2275.0 @ bsz=64
-SIDE_BUFFER_OVERHEAD_PCT=5.88  MEM_FAIR_MAX_BATCH=60  (= MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)
+CONCURRENT_MAX_BATCH=14  (KV-fit, preemption-independent)
+PEAK_THROUGHPUT_TOK_S=564.5 @ bsz=14  (within the concurrent regime)
+SIDE_BUFFER_OVERHEAD_PCT=5.88  MEM_FAIR_CONCURRENT_MAX_BATCH=13  (= CONCURRENT_MAX_BATCH x slot/(slot+side_buffer); FKV/FASA/bf16-LRoSA overhead=0)
 ```
 
-- **Max batch** = last `OK` row's `bsz`.
-- **Peak throughput** = `PEAK_THROUGHPUT_TOK_S` (highest `AGG_tok/s`).
+- **Concurrent max batch** = `CONCURRENT_MAX_BATCH` (KV-pool capacity, from
+  `GPU KV cache size / (ctx+decode)`; preemption-independent). Use
+  `MEM_FAIR_CONCURRENT_MAX_BATCH` for cross-method comparison (charges the
+  side-buffer — see §below).
+- **Peak throughput** = `PEAK_THROUGHPUT_TOK_S` (highest `AGG_tok/s`, measured
+  only at fitting batches).
 - **Speedup vs FKV** = backend `PEAK_THROUGHPUT_TOK_S` / FKV `PEAK_THROUGHPUT_TOK_S`
   at the same context (and/or compare `AGG_TOK_S` at a fixed batch).
 - A `FAILED(non-OOM)` row → read its `*_b<bsz>.log` (could be the FKV-fp8 CUBLAS
   bug, a kernel/cache race — ensure unique `VLLM_CACHE_ROOT` — or a config error).
 
-### Max-batch fairness — count the side-buffers (`MEM_FAIR_MAX_BATCH`)
+### Max-batch fairness — count the side-buffers (`MEM_FAIR_CONCURRENT_MAX_BATCH`)
 
-vLLM sizes `num_blocks` (≈ max batch capacity) **only from the per-token KV
-slot** (`real_page_size_bytes`). But several methods keep an extra buffer that
-is NOT in that slot:
+`CONCURRENT_MAX_BATCH` comes from the KV pool, which vLLM sizes **only from the
+per-token KV slot** (`real_page_size_bytes`). But several methods keep an extra
+buffer that is NOT in that slot:
 
 | method | side-buffer | in slot? | counted in `num_blocks`? |
 |---|---|---|---|
-| FKV / FASA | none | — | — (max batch is the dense ceiling) |
-| **LRoSA bf16** proj_K | `[…,cs_h]` per token | **in slot** | ✅ yes → `MAX_BATCH` already fair |
+| FKV / FASA | none | — | — (capacity is the dense ceiling) |
+| **LRoSA bf16** proj_K | `[…,cs_h]` per token | **in slot** | ✅ yes → already fair |
 | **LRoSA fp8** proj_K (contig) | separate fp8 cache | no | ❌ eats headroom |
 | **Quest** | `_quest_minmax` per page | no | ❌ eats headroom |
 | **Seer** | `_seer_kc` gate cache | no | ❌ eats headroom |
 
-So for Quest / fp8-LRoSA / Seer the empirical `MAX_BATCH` is **over-stated** —
+So for Quest / fp8-LRoSA / Seer the `CONCURRENT_MAX_BATCH` is **over-stated** —
 the side-buffer fits in `gpu_mem` headroom (1−gpu_mem) instead of reducing
-`num_blocks`. That is why **Quest's raw MAX_BATCH ≈ FKV's** even though Quest
-uses more HBM. `MEM_FAIR_MAX_BATCH` charges the side-buffer like the slot
-(`MAX_BATCH × slot/(slot+side_buffer)`) so the comparison is iso-memory.
-Notably Quest's minmax (`+5.88%`) ≈ fp8-LRoSA proj_K (`+5.88%`) — same real
-overhead, now reported consistently. **Use `MEM_FAIR_MAX_BATCH` (not raw
-`MAX_BATCH`) when comparing capacity across methods.** Set `HEAD_SIZE` /
-`PAGE_SIZE` if not the Qwen3-8B defaults (128 / 16).
+`num_blocks`. That is why **Quest's ≈ FKV's** even though Quest uses more HBM.
+`MEM_FAIR_CONCURRENT_MAX_BATCH` charges the side-buffer like the slot
+(`CONCURRENT_MAX_BATCH × slot/(slot+side_buffer)`) so the comparison is
+iso-memory. Notably Quest's minmax (`+5.88%`) ≈ fp8-LRoSA proj_K (`+5.88%`) —
+same real overhead, now reported consistently. **Use
+`MEM_FAIR_CONCURRENT_MAX_BATCH` when comparing capacity across methods.** Set
+`HEAD_SIZE` / `PAGE_SIZE` if not the Qwen3-8B defaults (128 / 16).
 
 > Doing this in the engine instead (so vLLM's own `num_blocks` is correct)
 > needs the side-buffers carved from the raw KV allocation via
