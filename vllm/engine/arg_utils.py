@@ -1773,6 +1773,27 @@ class EngineArgs:
                 existing | set(boundary), key=int
             )
 
+        # Sparse GQA backends (LROSA/FASA -> "lrosa"/"fasa", QUEST -> "quest",
+        # SEER -> "seer") own a combined-slot, full-context KV cache layout.
+        # On hybrid models (Gemma 4 / Ministral) that layout stores the sliding-
+        # attention layers at FULL context length, while FKV window-bounds them
+        # via SlidingWindowSpec -- wasted KV, low max batch. Auto-add
+        # "sliding_window" to the skip list so those layers fall back to the
+        # standard backend + window-bounded SlidingWindowSpec (output-invariant;
+        # sliding attention is windowed either way). This makes the behavior
+        # automatic for any entry point, not just the runners that set the flag.
+        #
+        # Gated on the resolved cache_dtype (the canonical sparse-GQA marker and
+        # the same condition the runners use), so it is a no-op for: full-attn
+        # models (Qwen3/Llama -- no sliding_window layers to skip), MLA models
+        # (GLM -- MLA sparse backends use fp8_ds_mla/bf16, never these tags), and
+        # FKV/auto (no sparse cache_dtype). Union, no key=int sort: the entry is
+        # the string "sliding_window", not a numeric layer index.
+        if resolved_cache_dtype in ("lrosa", "fasa", "quest", "seer"):
+            cache_config.kv_cache_dtype_skip_layers = list(
+                set(cache_config.kv_cache_dtype_skip_layers) | {"sliding_window"}
+            )
+
         ray_runtime_env = None
         if is_ray_initialized():
             # Ray Serve LLM calls `create_engine_config` in the context
