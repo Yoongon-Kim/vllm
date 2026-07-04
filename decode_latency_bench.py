@@ -47,7 +47,7 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
     # gather buffers grow with n_fac × max_num_seqs).
     mns = max_num_seqs if max_num_seqs > 0 else max(batch_size, 1)
     kw = dict(model=model, max_model_len=prefill_len + decode_len + 16,
-              gpu_memory_utilization=gpu_mem, enforce_eager=False,
+              gpu_memory_utilization=gpu_mem, enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
               tensor_parallel_size=tp,
               enable_prefix_caching=False, max_num_seqs=mns,
               # Steady-state decode latency: keep prefill and decode in
@@ -93,6 +93,17 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         kw["attention_config"] = {"lrosa_mla": True, "lrosa_basis_path": basis,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h}
         kw["kv_cache_dtype"] = mla_kv_dtype
+    elif backend == "fasa_mla":
+        # FASA on an MLA model (GLM): partial-RoPE — FASAMLAIndexer scores only the
+        # dominant decoupled-RoPE FCs (basis = fasa_idom_mla_*.pt); cs_h = N_tip
+        # (#dominant RoPE FCs of 32). Same FLASHMLA_SPARSE attend as lrosa_mla.
+        assert basis, "fasa_mla needs --basis <fasa_idom_mla_*.pt>"
+        # cs_h == N_tip == # RoPE FCs kept. n_tip=32 keeps ALL 32 decoupled-RoPE
+        # FCs → full-RoPE scoring (idom-independent, no channel-subset selection).
+        kw["attention_config"] = {"fasa_mla": True, "lrosa_basis_path": basis,
+                                  "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
+                                  "lrosa_n_tip": cs_h}
+        kw["kv_cache_dtype"] = mla_kv_dtype
     # fkv: default backend. For an MLA model, optionally force the same fp8
     # latent KV as the lrosa_mla path (apples-to-apples dense vs sparse attend).
     if backend == "fkv" and mla_fkv_fp8:
@@ -127,7 +138,7 @@ def time_generate(llm, prompts, max_tokens, reps=2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa", "lrosa_mla"], required=True)
+    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa", "lrosa_mla", "fasa_mla"], required=True)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis / FASA idom .pt; default = pca bases/<tag>/...")
