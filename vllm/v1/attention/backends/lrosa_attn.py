@@ -61,7 +61,9 @@ from vllm.v1.attention.ops.triton_lrosa_streaming_topk import (
     lrosa_streaming_topk,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 
 
@@ -599,9 +601,20 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         attn_cfg = vllm_config.attention_config
         self._lrosa_basis_path = attn_cfg.lrosa_basis_path
         self.n_fac = attn_cfg.lrosa_n_fac
+        # FAITHFUL cross-layer TriAttention (GQA): runs on the "fasa" combined-slot
+        # cache (K|V, slot=2*head_size, no proj_K) but the selection comes from a
+        # shared TriAttnCoordinator (one cross-layer keep set per sequence), NOT
+        # per-layer scoring. So it suppresses the fasa-fc scoring path below.
+        self.is_triattn = getattr(attn_cfg, "triattn", False)
+        if self.is_triattn:
+            # Capture config now — get_current_vllm_config() is NOT valid inside
+            # the worker forward (set only during init).
+            self._triattn_stats = attn_cfg.lrosa_basis_path
+            self._triattn_divide = getattr(attn_cfg, "triattn_divide_length", 128)
+            self._triattn_model_path = vllm_config.model_config.model
         # FASA-fc mode (kv_cache_dtype="fasa"): [K|V] slot, score by reading the
         # I_dom channels from full K each step (no proj_K). n_tip = #FC pairs.
-        self.is_fasa = kv_cache_dtype == "fasa"
+        self.is_fasa = (kv_cache_dtype == "fasa") and not self.is_triattn
         self.n_tip = getattr(attn_cfg, "lrosa_n_tip", 16)
         # cs_h: the proj_K projection dim (0 for fasa). Independent of where
         # proj_K is stored. slot_cs_h is the proj_K width IN the slot — 0 when
@@ -670,6 +683,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
         self._projk_scale: torch.Tensor | None = None  # [H_kv, cs_h] fp8 scale
         self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
+        self._Mq_dict_cpu: dict[int, torch.Tensor] | None = None  # KQ-SVD separate query basis B (else None)
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -703,6 +717,83 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # MLA indexer's LROSA_MLA_RECENT_W knob.
         self.recent_keep_w = int(os.environ.get("LROSA_RECENT_KEEP_W", "0"))
 
+    def _triattn_coordinate(self, layer, attn_metadata, kv_cache) -> None:
+        """Cross-layer TriAttention driver. Register this layer's combined-slot
+        K cache; from the FIRST layer, at a compression trigger, recompute the
+        per-sequence keep set from EVERY registered layer's K. The keep is shared
+        with all layers' decode select-at-attend (stage 2.2)."""
+        from vllm.model_executor.layers.triattn_coordinator import (
+            get_or_create_coordinator,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        coord = get_or_create_coordinator(
+            stats_path=self._triattn_stats, model_path=self._triattn_model_path,
+            budget=self.n_fac, divide_length=self._triattn_divide,
+            head_size=self.head_size, num_kv_heads=self.num_kv_heads,
+            block_size=kv_cache.shape[1], device=kv_cache.device,
+        )
+        layer_idx = extract_layer_index(layer.layer_name)
+        coord.register(layer_idx, kv_cache)
+        num_decodes = attn_metadata.num_decodes
+        if layer_idx == coord.first_layer and num_decodes > 0:
+            bt = attn_metadata.block_table[:num_decodes]
+            # ONE .tolist() each (not per-seq .item() x36 layers). Stable per-req
+            # key = first physical block id (unique per active request; prefix-
+            # caching off). coord.step resets on seq_len drop (slot reused).
+            keys = bt[:, 0].tolist()
+            sls = attn_metadata.seq_lens[:num_decodes].tolist()
+            coord.step(bt, sls, keys)
+            # Compute the (cross-layer-shared) attend positions ONCE here.
+            coord.cache_positions(bt, sls, keys)
+        return coord
+
+    def _triattn_attend(self, query, kv_cache, attn_metadata, output, coord):
+        """Select-at-attend the shared cross-layer keep set. Decode rows (q_len=1)
+        attend only `coord.keep[req]` ∪ tokens-since-trigger (full cache kept,
+        faithful for accuracy); prefill rows attend densely. The decode attend is
+        ONE batched varlen flash over all sequences' gathered K/V (per-seq lengths
+        vary), NOT a per-seq SDPA loop — so multi-batch actually parallelizes."""
+        hs = self.head_size
+        Kc = kv_cache[..., :hs]
+        Vc = kv_cache[..., hs : 2 * hs]
+        nd = attn_metadata.num_decodes
+        ndt = attn_metadata.num_decode_tokens
+        na = attn_metadata.num_actual_tokens
+        bt = attn_metadata.block_table
+        bs = kv_cache.shape[1]
+        # Prefill rows: dense flash over the combined-slot K/V (all-prefill when
+        # nd==0; otherwise the trailing prefill slice after the decode rows).
+        if ndt < na:
+            qsl = attn_metadata.query_start_loc[nd:] - ndt
+            flash_attn_varlen_func(
+                q=query[ndt:na], k=Kc, v=Vc, out=output[ndt:na],
+                cu_seqlens_q=qsl, max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens[nd:],
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale, causal=True,
+                window_size=list(self.sliding_window), block_table=bt[nd:],
+                s_aux=self.sinks, fa_version=self._fa_version,
+            )
+        if nd == 0:
+            return output
+        # Decode: the attend positions (keep ∪ tokens-since-trigger) are CROSS-
+        # LAYER-shared and were computed ONCE at the first layer (coord.cache_
+        # positions). Reuse them here — just gather this layer's K/V + ONE batched
+        # varlen flash over all sequences. (No per-seq Python loop / host syncs.)
+        gblk, goff = coord._dec_gblk, coord._dec_goff
+        K_sel = Kc[gblk, goff]               # [sum(n_i), H_kv, hs] contiguous gather
+        V_sel = Vc[gblk, goff]
+        cu_q = torch.arange(nd + 1, dtype=torch.int32, device=Kc.device)
+        flash_attn_varlen_func(
+            q=query[:nd], k=K_sel, v=V_sel, out=output[:nd],
+            cu_seqlens_q=cu_q, max_seqlen_q=1,
+            cu_seqlens_k=coord._dec_cu, max_seqlen_k=coord._dec_maxn,
+            softmax_scale=self.scale, causal=False,
+            s_aux=self.sinks, fa_version=self._fa_version,
+        )
+        return output
+
     def _ensure_on_device(
         self, layer: torch.nn.Module, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -712,6 +803,11 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         with `dtype`. Cached on the layer object as `layer._lrosa_M` so
         subsequent calls are a single attribute access.
         """
+        # TriAttention (GQA): no per-layer basis M. STAGE 1 takes the dense path
+        # (M=None); STAGE 2 swaps the decode selection to the shared coordinator
+        # keep set (handled in _sparse_decode_forward), not via M.
+        if self.is_triattn:
+            return None
         cached = getattr(layer, "_lrosa_M", None)
         if cached is not None:
             return cached
@@ -736,11 +832,17 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 weights_only=False,
             )
             # FASA reads the I_dom FC-index dict (fasa_idom_*.pt key 'idom');
-            # LRoSA reads the rotation-matrix dict (key 'M').
-            key = "idom" if self.is_fasa else "M"
-            self._M_dict_cpu = (
-                ckpt[key] if isinstance(ckpt, dict) and key in ckpt else ckpt
-            )
+            # LRoSA reads the rotation-matrix dict (key 'M'). KQ-SVD (arxiv
+            # 2512.05916) has SEPARATE key(A)/query(B) projections → A projects K
+            # (proj_K cache), B projects q (proj_q).
+            if isinstance(ckpt, dict) and "A" in ckpt and "B" in ckpt:
+                self._M_dict_cpu = ckpt["A"]
+                self._Mq_dict_cpu = ckpt["B"]
+            else:
+                key = "idom" if self.is_fasa else "M"
+                self._M_dict_cpu = (
+                    ckpt[key] if isinstance(ckpt, dict) and key in ckpt else ckpt
+                )
             if not isinstance(self._M_dict_cpu, dict):
                 raise RuntimeError(
                     f"LRoSA basis at {self._lrosa_basis_path} did not "
@@ -817,6 +919,23 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         # decode graph.
         torch._dynamo.mark_static_address(M)
         layer._lrosa_M = M
+        # KQ-SVD: separate query basis B (proj_q = B@q). None → proj_q shares M
+        # (D1/SWAN/Loki). Same TP-slice as M; cached on the layer.
+        Mq_cpu = self._Mq_dict_cpu.get(layer_idx) if self._Mq_dict_cpu is not None else None
+        if Mq_cpu is not None:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank as _tp_rank,
+                get_tensor_model_parallel_world_size as _tp_ws,
+            )
+            _tps = _tp_ws()
+            if _tps > 1 and Mq_cpu.shape[0] == self.num_kv_heads * _tps:
+                _r = _tp_rank()
+                Mq_cpu = Mq_cpu[_r * self.num_kv_heads : (_r + 1) * self.num_kv_heads]
+            Mq = Mq_cpu.to(device=device, dtype=dtype).contiguous()
+            torch._dynamo.mark_static_address(Mq)
+            layer._lrosa_Mq = Mq
+        else:
+            layer._lrosa_Mq = None
         if self.fp8_projk and self._projk_scale is None:
             # Per-(head,channel) fp8 scale = row-norm of M, so proj_K/scale =
             # (M[h,c]·K)/‖M[h,c]‖ lands in fp8 e4m3's well-conditioned range.
@@ -845,6 +964,13 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
+
+        if self.is_triattn:
+            # Cross-layer TriAttention: register this layer's K cache + (from the
+            # first layer) drive the per-seq keep recompute, then select-at-attend
+            # the shared keep (decode) / dense (prefill).
+            coord = self._triattn_coordinate(layer, attn_metadata, kv_cache)
+            return self._triattn_attend(query, kv_cache, attn_metadata, output, coord)
 
         head_size = self.head_size
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -941,6 +1067,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 attn_metadata=attn_metadata,
                 output=output,
                 M=M,
+                M_q=getattr(layer, "_lrosa_Mq", None),
                 head_size=head_size,
             )
 
@@ -1012,8 +1139,14 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
         output: torch.Tensor,
         M: torch.Tensor,
         head_size: int,
+        M_q: torch.Tensor | None = None,
     ) -> None:
-        """LRoSA sparse decode: GQA-reduce Q → proj_q → score+topk → gather → SDPA."""
+        """LRoSA sparse decode: GQA-reduce Q → proj_q → score+topk → gather → SDPA.
+
+        M projects keys (proj_K cache); M_q projects queries (proj_q). M_q is None
+        for shared-basis methods (D1/SWAN/Loki → proj_q uses M); set to B for KQ-SVD
+        (separate key(A)/query(B) projections)."""
+        Mq = M if M_q is None else M_q      # query-projection basis
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
         # supports_spec_as_decode=False guarantees this equality.
@@ -1154,7 +1287,7 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
             )
             torch.bmm(
                 q_kv.transpose(0, 1),          # (H_kv, nd, d)
-                M.transpose(1, 2),             # (H_kv, d, cs_h)
+                Mq.transpose(1, 2),            # (H_kv, d, cs_h) — Mq=B for KQ-SVD, else M
                 out=projq_hrc,
             )
             if self.fp8_projk:
