@@ -173,6 +173,19 @@ class AttentionConfig:
     (-> triattn_stats_mla_*.pt) and ``lrosa_n_fac`` (token budget). Mutually
     exclusive with ``lrosa_mla``/``fasa_mla``/``quest_mla``."""
 
+    triattn: bool = False
+    """FAITHFUL cross-layer TriAttention on a GQA model (reasoning baseline).
+    Runs on the ``fasa`` combined-slot cache (K|V, slot=2*head_size, no proj_K).
+    A shared TriAttnCoordinator gathers EVERY layer's post-RoPE K at a compression
+    trigger and calls the reference ``TriAttention.compute_keep_indices`` (one
+    cross-layer keep set per sequence); every layer select-at-attends that shared
+    keep. Reuses ``lrosa_basis_path`` (-> GQA triattn stats .pt) and ``lrosa_n_fac``
+    (token budget). Needs the LRoSA-dev ``triattention`` module importable."""
+
+    triattn_divide_length: int = 128
+    """TriAttention (GQA) re-compression interval: recompute the keep set when the
+    cache grows ``triattn_divide_length`` tokens past the last trigger."""
+
     quest_token_budget: int = 256
     """Quest backend: total per-(decode step, kv-head) token budget. The
     page budget is ``quest_token_budget // page_size`` selected full pages;

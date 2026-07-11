@@ -56,8 +56,15 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               # --chunked_prefill opts in (caps peak prefill activation so long
               # ctx fits at the proper decode batch; decode timing is unaffected).
               enable_chunked_prefill=chunked_prefill)
+    if os.environ.get("BLOCK_SIZE"):
+        # Larger block_size -> fewer scattered physical blocks per score-kernel
+        # tile (BLOCK_T=512) -> coalesced proj_K reads -> kills the chunked-
+        # prefill fragmentation penalty. Fix for GQA LRoSA + chunked deployment.
+        kw["block_size"] = int(os.environ["BLOCK_SIZE"])
     if chunked_prefill:
-        kw["max_num_batched_tokens"] = 8192
+        # MNBT env overrides the chunk size (diagnostic: sweep to separate
+        # prefill-fragmentation from chunked-mode as the decode-slowdown cause).
+        kw["max_num_batched_tokens"] = int(os.environ.get("MNBT", "8192"))
     # Qwen3: enable YaRN so served rope matches the basis's calibration rope
     # (also lets prefill_len exceed the 32K native window).
     ov = yarn_overrides(model)

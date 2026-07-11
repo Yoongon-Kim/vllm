@@ -240,6 +240,27 @@ def build_llm(a):
             "seer_gate_path": a.seer_gate_path or seer_gate_path(a.model),
             "seer_token_budget": a.n_fac,
         }
+    elif a.mode == "triattn":
+        # FAITHFUL cross-layer TriAttention (GQA reasoning baseline). Runs on the
+        # "fasa" combined-slot cache; a shared TriAttnCoordinator computes ONE
+        # cross-layer keep per sequence (reuses the reference compute_keep_indices)
+        # and every layer select-at-attends it. --basis = the GQA triattn stats
+        # .pt; --n_fac = token budget. Eager (the coordinator host-syncs).
+        assert a.basis, "triattn needs --basis <GQA triattn stats .pt>"
+        kw["kv_cache_dtype"] = "fasa"
+        kw["attention_config"] = {
+            "backend": "LROSA", "triattn": True,
+            "lrosa_basis_path": a.basis, "lrosa_n_fac": a.n_fac,
+            "triattn_divide_length": a.triattn_divide_length,
+        }
+        # PIECEWISE cudagraph: the model forward is graphed; the triattn
+        # coordinator + select-at-attend run eager (inside the unified_attention
+        # splitting op — its .item()/data-dependent shapes can't be captured).
+        # FULL would fail on the host syncs; enforce_eager leaves ~1.17x on the table.
+        if a.eager:
+            kw["enforce_eager"] = True
+        else:
+            kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
     # fkv: dense default. For GLM-4.7-Flash (MLA) the KV cache defaults to fp8 so
     # the FKV reference matches the lrosa_mla fp8 deployment (KV unified to fp8).
     # Dense MLA can't use fp8_ds_mla (sparse-only) → use fp8_e4m3 (the dense fp8)
@@ -285,7 +306,8 @@ def main():
     ap.add_argument("--eval", required=True, choices=["aime25", "math500", "gpqa"])
     ap.add_argument("--mode", default="lrosa",
                     choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
-                             "fasa_mla", "quest_mla", "triattn_mla", "seer"])
+                             "fasa_mla", "quest_mla", "triattn_mla", "triattn",
+                             "seer"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
@@ -314,6 +336,8 @@ def main():
     ap.add_argument("--page_size", type=int, default=16,
                     help="Quest-MLA page size in tokens (quest_page_size).")
     ap.add_argument("--basis", default=None)
+    ap.add_argument("--triattn_divide_length", type=int, default=128,
+                    help="TriAttention (GQA) re-compression interval.")
     ap.add_argument("--seer_gate_path", default=None,
                     help="SeerAttention-R AttnGate adapter (attn_gate_weights.pth "
                          "/ adapter dir / HF repo id). Default: resolved from "
@@ -481,6 +505,12 @@ def main():
             glen = len(o.outputs[0].token_ids)
             ok = grade(a.eval, o.outputs[0].text, gold)
             c += int(ok)
+            if os.environ.get("TRIATTN_DUMP"):
+                _txt = o.outputs[0].text
+                _ans = math_extract_answer(_txt) if a.eval != "gpqa" else gpqa_extract_answer(_txt)
+                _has_boxed = "\\boxed" in _txt
+                print(f"[DUMP idx={i} gold={gold} extracted={_ans!r} ok={ok} glen={glen} "
+                      f"boxed={_has_boxed}] tail={_txt[-250:]!r}", flush=True)
             rec = {"run": run_id, "idx": i, "gold": gold, "gen_len": glen,
                    "correct": ok, "truncated": glen >= a.max_new_tokens}
             recs.append(rec)

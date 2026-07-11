@@ -18,6 +18,8 @@ decode hot-path can avoid ``torch.empty`` calls inside the captured CUDA
 graph. The legacy "no-buffer" call signature is preserved for tests.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -443,6 +445,73 @@ def _radix_scratch(name, shape, dtype, device):
     return t
 
 
+@triton.jit
+def _fixup_idx_kernel(
+    topk_idx_ptr,   # [rows, k] int32 — raw radix indices (may be -1 pad / stale OOB)
+    seq_lens_ptr,   # [rows]   int32 — raw valid kv_len per row
+    res_ptr,        # [rows, k] int32 — output (OOB-proofed indices)
+    rows,
+    topk_stride_r,
+    res_stride_r,
+    k,
+    BLOCK_K: tl.constexpr,
+):
+    """Fuse the radix invalid-index fixup into ONE launch (grid over rows).
+
+    Reproduces the torch chain in ``_radix_topk`` bit-for-bit, per row r over
+    k slots j:
+        sl       = max(seq_len[r], 1)        # clamp avoids modulo-by-zero
+        fill     = j % sl                     # cycle padding thru real tokens
+        invalid  = (idx < 0) OR (idx >= seq_len[r])   # NOTE: raw seq_len here
+        res[r,j] = invalid ? fill : idx
+    The ``>= seq_len`` test uses the RAW seq_len, but ``fill`` uses the clamped
+    ``sl`` — matched precisely to the original torch ops.
+    """
+    pid_r = tl.program_id(0)
+    if pid_r >= rows:
+        return
+    j = tl.arange(0, BLOCK_K)
+    mask = j < k
+    idx = tl.load(topk_idx_ptr + pid_r * topk_stride_r + j, mask=mask, other=0)
+    seq_len = tl.load(seq_lens_ptr + pid_r)
+    # sl = max(seq_len, 1) — matches torch.clamp(min=1).
+    sl = tl.where(seq_len < 1, 1, seq_len)
+    # fill = j % sl, computed on the clamped length (matches torch.remainder
+    # of an arange(k) row by the clamped sl). arange/sl are non-negative so
+    # tl modulo == python %.
+    fill = j % sl
+    # invalid = (idx < 0) | (idx >= seq_len)  — RAW seq_len for the upper test.
+    invalid = (idx < 0) | (idx >= seq_len)
+    res = tl.where(invalid, fill, idx)
+    tl.store(res_ptr + pid_r * res_stride_r + j, res, mask=mask)
+
+
+def _fixup_idx_fused(
+    topk_idx: torch.Tensor,       # (rows, k) int32 — raw radix indices
+    seq_lens_rows: torch.Tensor,  # (rows,) int32 — raw kv_len per row
+    res: torch.Tensor,            # (rows, k) int32 — output (persistent scratch)
+) -> torch.Tensor:
+    """Single-launch replacement for the torch invalid-index fixup chain.
+
+    Writes into the caller-provided persistent ``res`` buffer (no allocation →
+    CUDA-graph safe). Grid is one program per row; BLOCK_K covers all k slots
+    in-register so fill/invalid/res never materialize intermediate tensors.
+    """
+    rows, k = topk_idx.shape
+    BLOCK_K = triton.next_power_of_2(k)
+    _fixup_idx_kernel[(rows,)](
+        topk_idx,
+        seq_lens_rows,
+        res,
+        rows,
+        topk_idx.stride(0),
+        res.stride(0),
+        k,
+        BLOCK_K=BLOCK_K,
+    )
+    return res
+
+
 def _radix_topk(
     scores: torch.Tensor,       # (num_reqs, H_kv, max_kv_len) fp32
     seq_lens: torch.Tensor,     # (num_reqs,) int32 — valid kv_len per request
@@ -511,29 +580,40 @@ def _radix_topk(
     # CUDA-Graph safe (the previous seq_lens.min() Python gate broke capture
     # with cudaErrorStreamCaptureInvalidated).
     # All persistent-scratch + out= ops (no allocation → CUDA-graph safe).
-    slot_off = _radix_scratch("slotoff", (k,), torch.int32, dev)
-    torch.arange(k, out=slot_off)
-    sl = _radix_scratch("sl", (rows, 1), torch.int32, dev)  # avoid modulo-by-zero
-    torch.clamp(seq_lens_rows.view(rows, 1), min=1, out=sl)
-    fill = _radix_scratch("fill", (rows, k), torch.int32, dev)
-    torch.remainder(slot_off.view(1, k).expand(rows, k), sl, out=fill)  # [rows,k]
-    # Treat an index as invalid if it is negative (the radix -1 pad) OR >=
-    # seq_len. The latter guards a heisenbug: the DSA radix kernel intermittently
-    # emits a stale out-of-range *positive* index (only when kernels run async —
-    # CUDA_LAUNCH_BLOCKING=1 serializes and hides it). The old code rewrote only
-    # negatives, so a too-large index slipped through into the downstream K/V and
-    # block-table gather as a real OOB read; whether it faulted depended on the
-    # caching allocator's page layout (timing-dependent → looked intermittent,
-    # worse under profiler/concurrent memory pressure). Cycling every invalid
-    # slot through a real token [0, seq_len) makes the gather OOB-proof regardless
-    # of what radix returns. All scratch + out= → CUDA-graph safe.
-    neg = _radix_scratch("neg", (rows, k), torch.bool, dev)
-    torch.lt(topk_idx, 0, out=neg)
-    oob = _radix_scratch("oob", (rows, k), torch.bool, dev)
-    torch.ge(topk_idx, seq_lens_rows.view(rows, 1), out=oob)
-    torch.logical_or(neg, oob, out=neg)
+    #
+    # OPT-IN FUSED PATH (LROSA_FUSED_FIXUP=1): collapse the whole invalid-index
+    # remap below into a SINGLE Triton launch. Default OFF → the original torch
+    # chain runs unchanged (this is a correctness-sensitive decode hot path with
+    # documented OOB heisenbugs, so the fused kernel is validated bit-identical
+    # against the chain before being trusted). The fused kernel reproduces the
+    # exact semantics of the chain: sl=max(seq_len,1); fill=j%sl;
+    # invalid=(idx<0)|(idx>=seq_len); res=invalid?fill:idx.
     res = _radix_scratch("res", (rows, k), torch.int32, dev)
-    torch.where(neg, fill, topk_idx, out=res)
+    if os.environ.get("LROSA_FUSED_FIXUP", "0") == "1":
+        _fixup_idx_fused(topk_idx, seq_lens_rows, res)
+    else:
+        slot_off = _radix_scratch("slotoff", (k,), torch.int32, dev)
+        torch.arange(k, out=slot_off)
+        sl = _radix_scratch("sl", (rows, 1), torch.int32, dev)  # avoid modulo-by-zero
+        torch.clamp(seq_lens_rows.view(rows, 1), min=1, out=sl)
+        fill = _radix_scratch("fill", (rows, k), torch.int32, dev)
+        torch.remainder(slot_off.view(1, k).expand(rows, k), sl, out=fill)  # [rows,k]
+        # Treat an index as invalid if it is negative (the radix -1 pad) OR >=
+        # seq_len. The latter guards a heisenbug: the DSA radix kernel intermittently
+        # emits a stale out-of-range *positive* index (only when kernels run async —
+        # CUDA_LAUNCH_BLOCKING=1 serializes and hides it). The old code rewrote only
+        # negatives, so a too-large index slipped through into the downstream K/V and
+        # block-table gather as a real OOB read; whether it faulted depended on the
+        # caching allocator's page layout (timing-dependent → looked intermittent,
+        # worse under profiler/concurrent memory pressure). Cycling every invalid
+        # slot through a real token [0, seq_len) makes the gather OOB-proof regardless
+        # of what radix returns. All scratch + out= → CUDA-graph safe.
+        neg = _radix_scratch("neg", (rows, k), torch.bool, dev)
+        torch.lt(topk_idx, 0, out=neg)
+        oob = _radix_scratch("oob", (rows, k), torch.bool, dev)
+        torch.ge(topk_idx, seq_lens_rows.view(rows, 1), out=oob)
+        torch.logical_or(neg, oob, out=neg)
+        torch.where(neg, fill, topk_idx, out=res)
     out3d = res.view(num_reqs, H_kv, k)
     if idx_out is not None:
         idx_out[:num_reqs, :, :k].copy_(out3d)

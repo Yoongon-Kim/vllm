@@ -85,6 +85,11 @@ def build_llm(a):
     # seqs fit. Cap it so graphs capture and decode fits. F1 is unaffected.
     if a.max_num_seqs:
         kw["max_num_seqs"] = a.max_num_seqs
+    # Ministral-3 (Pixtral VLM): disable the image modality for text-only LongBench,
+    # else MultiModalBudget / get_dummy_mm_inputs crashes at engine init. Mirrors
+    # ruler_vllm_eval.py (which already does this).
+    if any(s in a.model.lower() for s in ("ministral-3", "ministral3", "mistral3")):
+        kw["limit_mm_per_prompt"] = {"image": 0}
     if getattr(a, "yarn", True):
         ov = yarn_overrides(a.model)
         if ov:

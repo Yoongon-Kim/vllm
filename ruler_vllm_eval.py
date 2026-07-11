@@ -98,6 +98,10 @@ def build_llm(a, max_model_len):
         enforce_eager=a.eager,
         enable_prefix_caching=False,
     )
+    # Ministral-3 is a Pixtral VLM; RULER is text-only -> disable image mm so vLLM
+    # skips the dummy-image profiling that crashes MistralCommonPixtralProcessor.
+    if any(s in a.model.lower() for s in ("ministral-3", "ministral3", "mistral3")):
+        kw["limit_mm_per_prompt"] = {"image": 0}
     if a.max_num_seqs:
         kw["max_num_seqs"] = a.max_num_seqs
     if getattr(a, "yarn", True):

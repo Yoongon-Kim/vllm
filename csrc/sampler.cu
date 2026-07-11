@@ -4,6 +4,11 @@
 #include <torch/cuda.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <tuple>
+
 #ifndef USE_ROCM
   #include <cub/cub.cuh>
 #else
@@ -658,6 +663,87 @@ void apply_repetition_penalties_(
       });
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// LRoSA occupancy-aware radix split (opt-in via LROSA_RADIX_SPLIT=1).
+//
+// The 1-block-per-row radix path launches a single CTA per (req x kv-head) row.
+// At low-batch long-context (LRoSA's target: 128K KV caps batch to ~1-7), this
+// is only 8-56 CTAs on a 148-SM GPU. Per-row latency is dominated by the
+// column scan over kv_len, so the GPU sits mostly idle. The kernel ALREADY has
+// an exact 2-step split+merge path (multipleBlocksPerRow): each of K blocks
+// radix-selects top-k over its kv_len/K chunk into an aux buffer, then a merge
+// kernel picks the final top-k from the K*topK candidates. This is EXACT
+// top-k (not approximate); the returned index order may differ (radix select),
+// which is fine for an order-agnostic gather.
+//
+// We enable that path at lower kv_len when occupancy is low, choosing
+//   K = clamp(ceil(numSMs / rows), 1, KMAX)
+// so low batch fills the GPU (high K) and high batch (rows >= numSMs) collapses
+// to K=1 == the original single-block path (no regression). Default OFF keeps
+// the original behavior byte-for-byte, so the rebuilt _C is safe.
+// ---------------------------------------------------------------------------
+
+// Read the env gate exactly once.
+bool lrosaRadixSplitEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("LROSA_RADIX_SPLIT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+
+// SM count per device, queried once per device.
+int multiProcessorCount(int device) {
+  static std::mutex mtx;
+  static std::map<int, int> cache;
+  std::lock_guard<std::mutex> lock(mtx);
+  auto it = cache.find(device);
+  if (it != cache.end()) return it->second;
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  cache[device] = sms;
+  return sms;
+}
+
+// Persistent shape-keyed aux workspace for the split path. Allocating the aux
+// buffers per call (torch::empty) would allocate from the CUDA-graph memory
+// pool during capture and hand out fresh addresses on each captured batch size,
+// breaking replay. Instead we keep a process-lifetime cache keyed by
+// (device, K, numRows, topK) so the addresses are STABLE across capture+replay;
+// the first call at each shape allocates (during warmup), every later call —
+// including graph replay — reuses the same tensor with NO allocation.
+struct AuxKey {
+  int device;
+  int K;
+  int64_t numRows;
+  int64_t topK;
+  bool operator<(const AuxKey& o) const {
+    return std::tie(device, K, numRows, topK) <
+           std::tie(o.device, o.K, o.numRows, o.topK);
+  }
+};
+
+std::pair<torch::Tensor, torch::Tensor> splitAuxBuffers(
+    const torch::Tensor& logits, int K, int64_t numRows, int64_t topK) {
+  static std::mutex mtx;
+  static std::map<AuxKey, std::pair<torch::Tensor, torch::Tensor>> cache;
+  AuxKey key{logits.get_device(), K, numRows, topK};
+  std::lock_guard<std::mutex> lock(mtx);
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+  auto outIndicesAux = torch::empty(
+      {numRows, K, topK}, torch::dtype(torch::kInt32).device(logits.device()));
+  auto outLogitsAux = torch::empty(
+      {numRows, K, topK}, torch::dtype(torch::kFloat).device(logits.device()));
+  auto buffers = std::make_pair(outIndicesAux, outLogitsAux);
+  cache[key] = buffers;
+  return buffers;
+}
+
+}  // namespace
+
 void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
                           const torch::Tensor& seqLens, torch::Tensor& indices,
                           int64_t numRows, int64_t stride0, int64_t stride1,
@@ -665,6 +751,19 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   constexpr int kSortingAlgorithmThreshold = 12288;
   constexpr int kSplitWorkThreshold = 200 * 1000;
   constexpr int kNumThreadsPerBlock = 512;
+  // Occupancy-aware split tuning (opt-in). KMAX caps blocks-per-row; the
+  // kv_len floor is the break-even point above which the 1-block column scan
+  // is expensive enough to overcome the extra merge-kernel launch (~18us flat
+  // on B200). nsys (H_kv=8, k=256): 1-block scan vs split+merge per step —
+  //   kv 16384 16.9us vs 31.3us (split LOSES, scan already cheap)
+  //   kv 65536 33.4us vs 32.6us (break-even)
+  //   kv 98304 43.6us vs 33.3us (1.31x)
+  //   kv 130560 53.8us vs 34.1us (1.58x)
+  // so the floor is set at 65536 (do not split below it — the merge cost
+  // dominates the small per-row saving). KMAX=16: K beyond ~16 stops helping
+  // because the merge cost is fixed and each chunk is already tiny.
+  constexpr int kSplitKMax = 16;
+  constexpr int kSplitColFloor = 65536;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const auto numColumns = logits.size(1);
 
@@ -672,6 +771,24 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
   // effective seq_len. False if seqLens is 1D (B,): all rows in a batch share
   // the same seq_len and the kernel computes the per-row offset itself.
   int seqLensIs2D = seqLens.dim() == 2 ? 1 : 0;
+
+  // Decide whether to take the occupancy-aware multi-block split. Only when:
+  //  * env-gated ON,
+  //  * the GPU is under-occupied (rows < numSMs), and
+  //  * kv_len is large enough that per-row scan dominates.
+  // K = clamp(ceil(numSMs / rows), 1, KMAX). rows >= numSMs -> K==1 -> falls
+  // through to the original single-block radix path (no behavioral change).
+  int splitK = 1;
+  if (lrosaRadixSplitEnabled() && numColumns >= kSplitColFloor &&
+      numColumns < kSplitWorkThreshold) {
+    const int numSMs = multiProcessorCount(logits.get_device());
+    if (numRows < numSMs && numRows > 0) {
+      int k = static_cast<int>((numSMs + numRows - 1) / numRows);
+      if (k > kSplitKMax) k = kSplitKMax;
+      if (k < 1) k = 1;
+      splitK = k;
+    }
+  }
 
   if (numColumns < kSortingAlgorithmThreshold) {
     // Use insertion sort
@@ -681,7 +798,7 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
             indices.data_ptr<int>(), static_cast<int>(stride0),
             static_cast<int>(stride1), static_cast<int>(topK),
             static_cast<int>(next_n), seqLensIs2D);
-  } else if (numColumns < kSplitWorkThreshold) {
+  } else if (numColumns < kSplitWorkThreshold && splitK == 1) {
     // From this threshold, use radix sort instead
     vllm::topKPerRowDecode<kNumThreadsPerBlock, true>
         <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
@@ -690,15 +807,16 @@ void top_k_per_row_decode(const torch::Tensor& logits, int64_t next_n,
             static_cast<int>(stride1), static_cast<int>(topK),
             static_cast<int>(next_n), seqLensIs2D);
   } else {
-    // Long sequences are run in two steps
-    constexpr auto multipleBlocksPerRowConfig = 10;
+    // Two-step split+merge. Either the long-sequence path (kv_len >= 200000,
+    // K=10 as before) or the occupancy-aware low-batch path (splitK>1).
+    const int multipleBlocksPerRowConfig =
+        (numColumns >= kSplitWorkThreshold) ? 10 : splitK;
 
-    const auto outIndicesAux =
-        torch::empty({numRows, multipleBlocksPerRowConfig, topK},
-                     torch::dtype(torch::kInt32).device(logits.device()));
-    const auto outLogitsAux =
-        torch::empty({numRows, multipleBlocksPerRowConfig, topK},
-                     torch::dtype(torch::kFloat).device(logits.device()));
+    // Graph-safe persistent aux scratch (no per-call allocation).
+    auto aux = splitAuxBuffers(logits, multipleBlocksPerRowConfig, numRows,
+                               topK);
+    const auto& outIndicesAux = aux.first;
+    const auto& outLogitsAux = aux.second;
 
     vllm::topKPerRowDecode<kNumThreadsPerBlock, true, true>
         <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock,
