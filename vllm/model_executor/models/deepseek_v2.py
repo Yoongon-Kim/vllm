@@ -985,8 +985,23 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.is_v32 = hasattr(config, "index_topk")
 
+        # JSSA / baseline MLA selectors + dense override. When a custom selector
+        # (lrosa/fasa/quest/triattn _mla) or dense_mla is requested, we do NOT
+        # build the native DSA lightning indexer; the custom hooks below build
+        # their own indexer (and set is_v32=True to route the sparse attend), or
+        # dense_mla forces is_v32=False at the end. Guarded so default (no flag)
+        # behavior is unchanged: native v3.2 / GLM-5.2 DSA still builds as before.
+        _ac = getattr(vllm_config, "attention_config", None)
+        _want_custom_mla = bool(_ac) and (
+            getattr(_ac, "lrosa_mla", False)
+            or getattr(_ac, "fasa_mla", False)
+            or getattr(_ac, "quest_mla", False)
+            or getattr(_ac, "triattn_mla", False)
+        )
+        _force_dense_mla = bool(_ac) and getattr(_ac, "dense_mla", False)
+
         _skip_topk = False
-        if self.is_v32:
+        if self.is_v32 and not _want_custom_mla and not _force_dense_mla:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -1024,9 +1039,7 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # LRoSA-on-MLA (appendix): when no native DSA indexer, optionally swap in a
         # learned-rotation latent scorer that drives the same FLASHMLA_SPARSE attend.
-        if not self.is_v32 and getattr(
-            vllm_config.attention_config, "lrosa_mla", False
-        ):
+        if getattr(vllm_config.attention_config, "lrosa_mla", False):
             from vllm.model_executor.layers.lrosa_mla_indexer import LRoSAMLAIndexer
 
             ac = vllm_config.attention_config
@@ -1054,9 +1067,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # FASA-on-MLA (partial-RoPE): dominant-RoPE-FC token selector driving the same
         # FLASHMLA_SPARSE attend (RoPE cache only; OpenReview FnSgecCEwg §6). Reuses
         # lrosa_basis_path (-> fasa_idom_mla_*.pt) / lrosa_n_fac; lrosa_cs_h = N_tip.
-        if not self.is_v32 and getattr(
-            vllm_config.attention_config, "fasa_mla", False
-        ):
+        if getattr(vllm_config.attention_config, "fasa_mla", False):
             from vllm.model_executor.layers.lrosa_mla_indexer import FASAMLAIndexer
 
             ac = vllm_config.attention_config
@@ -1083,9 +1094,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # Quest-on-MLA: page-level min/max upper-bound selection over the raw key
         # [c_KV | k_pe]; eager PyTorch (the fp8-dot SparseAttnIndexer can't do min/max).
         # Calibration-free; reuses lrosa_n_fac (budget) + quest_page_size.
-        if not self.is_v32 and getattr(
-            vllm_config.attention_config, "quest_mla", False
-        ):
+        if getattr(vllm_config.attention_config, "quest_mla", False):
             from vllm.model_executor.layers.lrosa_mla_indexer import QuestMLAIndexer
 
             ac = vllm_config.attention_config
@@ -1112,9 +1121,7 @@ class DeepseekV2MLAAttention(nn.Module):
         # decoupled RoPE cache k_pe via per-layer calibrated query frequency stats
         # (triattn_stats_mla_*.pt); a TriAttentionMLAIndexer drives the same
         # FLASHMLA_SPARSE attend. Reuses lrosa_basis_path (-> stats) + lrosa_n_fac.
-        if not self.is_v32 and getattr(
-            vllm_config.attention_config, "triattn_mla", False
-        ):
+        if getattr(vllm_config.attention_config, "triattn_mla", False):
             from vllm.model_executor.layers.lrosa_mla_indexer import (
                 TriAttentionMLAIndexer,
             )
@@ -1138,6 +1145,14 @@ class DeepseekV2MLAAttention(nn.Module):
             )
             self.indexer_rope_emb = None
             self.is_v32 = True
+
+        # dense_mla: force full dense MLA even on a natively-sparse v3.2 / GLM-5.2
+        # DSA model (the ``plain`` full-attention accuracy ceiling). Drop any
+        # indexer and route the MLA layer through the dense attend (is_sparse=False).
+        if _force_dense_mla:
+            self.indexer = None
+            self.indexer_rope_emb = None
+            self.is_v32 = False
 
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,

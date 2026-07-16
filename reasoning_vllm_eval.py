@@ -139,6 +139,11 @@ def build_llm(a):
         enforce_eager=a.eager,
         enable_prefix_caching=False,
     )
+    # Multi-GPU (large MLA-MoE models, e.g. GLM-5.2-FP8 needs TP=8 for its
+    # 705 GiB FP8 weights + 64 attention heads). Default tp=1 keeps every
+    # existing single-GPU invocation byte-identical.
+    if getattr(a, "tp", 1) and a.tp > 1:
+        kw["tensor_parallel_size"] = a.tp
     if a.max_num_seqs:
         kw["max_num_seqs"] = a.max_num_seqs
     # Rope: reasoning fits Qwen3's NATIVE context (40960 >= 38912 gen + short
@@ -261,6 +266,18 @@ def build_llm(a):
             kw["enforce_eager"] = True
         else:
             kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
+    elif a.mode == "dsa":
+        # Native GLM-5.2 (v3.2 DSA) lightning indexer. Its data-dependent top-k
+        # must NOT land in a FULL cudagraph (freezes/garbles the topk -> pure
+        # gibberish, same failure mode as quest_mla / triattn_mla). Default to
+        # PIECEWISE (the sparse_attn_indexer stays an eager split point while the
+        # MoE body is captured); --eager forces full eager (correct but slow).
+        # No attention_config / kv override -> is_v32 auto-builds the native indexer.
+        if a.eager:
+            kw["enforce_eager"] = True
+        else:
+            kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
+
     # fkv: dense default. For GLM-4.7-Flash (MLA) the KV cache defaults to fp8 so
     # the FKV reference matches the lrosa_mla fp8 deployment (KV unified to fp8).
     # Dense MLA can't use fp8_ds_mla (sparse-only) → use fp8_e4m3 (the dense fp8)
@@ -307,8 +324,10 @@ def main():
     ap.add_argument("--mode", default="lrosa",
                     choices=["fkv", "lrosa", "loki", "fasa", "quest", "lrosa_mla",
                              "fasa_mla", "quest_mla", "triattn_mla", "triattn",
-                             "seer"])
+                             "seer", "dsa"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor_parallel_size (default 1). GLM-5.2-FP8 needs 8.")
     ap.add_argument("--mla_backend", default=None,
                     help="Force the MLA attention backend (attention_config.backend). "
                          "GLM-4.7-Flash has 20 heads which the trtllm FMHA "
@@ -324,7 +343,7 @@ def main():
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                     help="skip (run, idx) attempts already in predictions.jsonl "
                          "(default on; --no-resume to start fresh).")
-    ap.add_argument("--max_new_tokens", type=int, default=38912)
+    ap.add_argument("--max_new_tokens", type=int, default=40960)
     ap.add_argument("--max_input_len", type=int, default=2048)
     ap.add_argument("--yarn", action=argparse.BooleanOptionalAction, default=False,
                     help="apply YaRN rope (Qwen3). OFF for reasoning: 38912 gen + "

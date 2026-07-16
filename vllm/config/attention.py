@@ -173,6 +173,13 @@ class AttentionConfig:
     (-> triattn_stats_mla_*.pt) and ``lrosa_n_fac`` (token budget). Mutually
     exclusive with ``lrosa_mla``/``fasa_mla``/``quest_mla``."""
 
+    dense_mla: bool = False
+    """Force DENSE full MLA attention on a natively-sparse (v3.2 / GLM-5.2 DSA)
+    model — disables the native DSA lightning indexer so the layer attends every
+    cached token. This is the ``plain`` / full-attention accuracy ceiling for the
+    3-way comparison (dense vs native-DSA vs JSSA=``lrosa_mla``). No calibration.
+    Mutually exclusive with ``lrosa_mla``/``fasa_mla``/``quest_mla``/``triattn_mla``."""
+
     triattn: bool = False
     """FAITHFUL cross-layer TriAttention on a GQA model (reasoning baseline).
     Runs on the ``fasa`` combined-slot cache (K|V, slot=2*head_size, no proj_K).
