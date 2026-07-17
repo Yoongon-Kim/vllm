@@ -624,6 +624,30 @@ class FASAMLAIndexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, index_k, weights)
 
 
+def _lrosa_get_wuk(idx):
+    """bf16 W_UK (qk_nope slice of kv_b_proj), [H_local, qk_nope, kv_lora]. FP8 models
+    store kv_b_proj.weight as Float8_e4m3fn; the *einsum* q_nope@W_UK then lowers to
+    baddbmm (unsupported for fp8). Dequantizing the block-fp8 weight to bf16 is pure
+    elementwise (cast + per-block scale broadcast) so it stays inside the fullgraph
+    region — no graph break (torch.compiler.disable is rejected under fullgraph).
+    H is TP-LOCAL (kv_b_proj is column-parallel)."""
+    W = idx.kv_b_proj.weight
+    si = getattr(idx.kv_b_proj, "weight_scale_inv", None)
+    if W.dtype == torch.float8_e4m3fn and si is not None:
+        # derive per-block sizes from shapes (kv_b_proj scale can be [out/128, 1] =
+        # full-input-width block, not necessarily [128,128]).
+        bs0 = W.shape[0] // si.shape[0]
+        bs1 = W.shape[1] // si.shape[1]
+        Wf = W.to(torch.float32)
+        sf = si.to(torch.float32).repeat_interleave(bs0, 0).repeat_interleave(bs1, 1)
+        sf = sf[: Wf.shape[0], : Wf.shape[1]]
+        W = (Wf * sf).to(torch.bfloat16)
+    else:
+        W = W.to(torch.bfloat16)
+    return W.view(idx.n_head, idx.qk_nope_head_dim + idx.v_head_dim,
+                  idx.kv_lora_rank)[:, : idx.qk_nope_head_dim, :]
+
+
 class LRoSAMLAIndexer(nn.Module):
     def __init__(
         self,
@@ -652,7 +676,14 @@ class LRoSAMLAIndexer(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.v_head_dim = config.v_head_dim
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.n_head = config.num_attention_heads
+        # LOCAL heads: q_b_proj / kv_b_proj are column-parallel, so at TP>1 their
+        # per-forward output is sharded to num_attention_heads // tp_size heads.
+        # (GLM-4.7-Flash was only ever run at TP=1 where local == global; GLM-5.2
+        # needs TP=8, so the global count here reshaped the local [T, 8*qk_head]
+        # output to [T, 64, qk_head] and crashed.) The shared SparseAttnIndexer op
+        # is responsible for any cross-rank head-logit reduction before top-k.
+        self.n_head = (config.num_attention_heads
+                       // vllm_config.parallel_config.tensor_parallel_size)
         self.cs_h = cs_h
         # head_dim / softmax_scale are set after M is loaded (variant-dependent).
         self.topk_tokens = n_fac
@@ -744,9 +775,7 @@ class LRoSAMLAIndexer(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q_pe = q_pe.reshape(T, H, self.qk_rope_head_dim)
         k_pe = k_pe.reshape(T, self.qk_rope_head_dim)
-        W_UK = self.kv_b_proj.weight.view(
-            H, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
-        )[:, : self.qk_nope_head_dim, :]                                   # [H,nope,kvlr] view
+        W_UK = _lrosa_get_wuk(self)   # bf16 W_UK (dequant fp8 kv_b_proj once, TP-local)
         Mb = self.M_basis   # already on-device (set in __init__), graph-capture safe
         q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)              # [T,H,kvlr]
         if self.alpha != 1.0:

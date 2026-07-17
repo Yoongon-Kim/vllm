@@ -1507,8 +1507,18 @@ class DeepseekV2Model(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # When a custom MLA selector (lrosa/fasa/quest/triattn _mla) or dense_mla
+        # removed the native DSA lightning indexer, its checkpoint weights
+        # (self_attn.indexer.{k_norm,wk,weights_proj} / self_attn.indexers_proj)
+        # have no home. Detect its ABSENCE once and drop those weights before any
+        # params_dict lookup (stacked-map or fallback). Self-gating: on a normal
+        # native-DSA run the params exist here, so nothing is skipped. Our own
+        # indexer lives under self_attn.lrosa_indexer, which does not match.
+        _no_native_indexer = not any(".self_attn.indexer" in k for k in params_dict)
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if _no_native_indexer and ".self_attn.indexer" in name:
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1665,6 +1675,17 @@ class DeepseekV2Model(nn.Module):
                             continue
 
                         if is_pp_missing_parameter(name, self):
+                            continue
+
+                        # Native DSA lightning-indexer weights have no home when a
+                        # custom MLA selector (lrosa/fasa/quest/triattn _mla) or
+                        # dense_mla replaced / removed the native Indexer. Self-gating:
+                        # present in params_dict on a normal native-DSA run, absent
+                        # only when we deliberately did not build it -> drop them.
+                        if name not in params_dict and (
+                            ".self_attn.indexer." in name
+                            or ".self_attn.indexers_proj" in name
+                        ):
                             continue
 
                         param = params_dict[name]
