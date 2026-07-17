@@ -1002,22 +1002,51 @@ class DeepseekV2MLAAttention(nn.Module):
 
         _skip_topk = False
         if self.is_v32 and not _want_custom_mla and not _force_dense_mla:
-            self.indexer_rope_emb = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
-            )
-            self.indexer = Indexer(
-                vllm_config,
-                config,
-                hidden_size,
-                q_lora_rank,
-                quant_config,
-                cache_config,
-                topk_indices_buffer,
-                f"{prefix}.indexer",
-            )
+            # GLM-5.2 (glm_moe_dsa): ``config.indexer_types`` declares per-layer
+            # 'full' (layer has its OWN lightning indexer in the checkpoint; 21/78
+            # layers) vs 'shared' (NO indexer weights — the layer REUSES the topk
+            # indices of the most recent 'full' layer). Building an Indexer on every
+            # layer ran the 57 'shared' layers with UNINITIALIZED weights -> garbage
+            # topk as soon as the cache exceeded index_topk (2048) -> token-salad
+            # output. 'shared' layers get indexer=None + skip_topk=True: the MLA
+            # wrapper then consumes the shared topk_indices_buffer, which still
+            # holds the previous 'full' layer's selection (exactly GLM-5.2's
+            # cross-layer index sharing; layers 0-2 are 'full', so the buffer is
+            # always populated before any 'shared' layer runs).
+            _itypes = getattr(config, "indexer_types", None)
+            if _itypes is not None:
+                _lid = extract_layer_index(prefix)
+                if 0 <= _lid < len(_itypes):
+                    _skip_topk = _itypes[_lid] != "full"
+            if _skip_topk:
+                self.indexer_rope_emb = None
+                # Lightweight shim: on a skip_topk layer the indexer is never
+                # CALLED (mla.py gates on skip_topk); the MLA wrapper/impl only
+                # read `.topk_tokens` and `.topk_indices_buffer` from it. A real
+                # Indexer here would carry uninitialized weights (absent from the
+                # checkpoint) + a phantom per-layer indexer KV cache.
+                import types
+                self.indexer = types.SimpleNamespace(
+                    topk_tokens=config.index_topk,
+                    topk_indices_buffer=topk_indices_buffer,
+                )
+            else:
+                self.indexer_rope_emb = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+                )
+                self.indexer = Indexer(
+                    vllm_config,
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    quant_config,
+                    cache_config,
+                    topk_indices_buffer,
+                    f"{prefix}.indexer",
+                )
 
             # Enable IndexCache for DeepSeek models to reduce redundant top-k
             # token selection computations in sparse attention.
