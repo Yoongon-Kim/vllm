@@ -625,27 +625,39 @@ class FASAMLAIndexer(nn.Module):
 
 
 def _lrosa_get_wuk(idx):
-    """bf16 W_UK (qk_nope slice of kv_b_proj), [H_local, qk_nope, kv_lora]. FP8 models
-    store kv_b_proj.weight as Float8_e4m3fn; the *einsum* q_nope@W_UK then lowers to
-    baddbmm (unsupported for fp8). Dequantizing the block-fp8 weight to bf16 is pure
-    elementwise (cast + per-block scale broadcast) so it stays inside the fullgraph
-    region — no graph break (torch.compiler.disable is rejected under fullgraph).
-    H is TP-LOCAL (kv_b_proj is column-parallel)."""
+    """bf16 W_UK (qk_nope slice of kv_b_proj), [H_local, qk_nope, kv_lora]. Cached.
+
+    We need the DEQUANTIZED kv_b_proj weight for the einsum q_nope@W_UK. A manual
+    block-fp8 dequant (Wf * weight_scale_inv) is WRONG at runtime: vLLM's
+    process_weights_after_loading REWRITES the checkpoint's [out/128, in/128] block
+    scale (~7e-5) into a kernel-specific per-row format [out, 1] (~2e9) and
+    re-quantizes the fp8 weight itself, so `weight * weight_scale_inv` inflates
+    W_UK by ~1e13 (-> q_latent ~1e12 -> garbage top-k on long context). BF16 models
+    (GLM-4.7-Flash) never hit this because their weight is already bf16.
+
+    Robust dequant, format-agnostic: pass the identity through the module's OWN
+    (correct) fp8 linear -> kv_b_proj(I) = W^T. Done once, cached to a bf16 buffer
+    (the first forward is the eager profiling run, so the cache is populated before
+    any CUDA-graph capture). H is TP-LOCAL (kv_b_proj is column-parallel)."""
+    cached = getattr(idx, "_wuk_bf16", None)
+    if cached is not None:
+        return cached
+    kvlr = idx.kv_lora_rank
     W = idx.kv_b_proj.weight
-    si = getattr(idx.kv_b_proj, "weight_scale_inv", None)
-    if W.dtype == torch.float8_e4m3fn and si is not None:
-        # derive per-block sizes from shapes (kv_b_proj scale can be [out/128, 1] =
-        # full-input-width block, not necessarily [128,128]).
-        bs0 = W.shape[0] // si.shape[0]
-        bs1 = W.shape[1] // si.shape[1]
-        Wf = W.to(torch.float32)
-        sf = si.to(torch.float32).repeat_interleave(bs0, 0).repeat_interleave(bs1, 1)
-        sf = sf[: Wf.shape[0], : Wf.shape[1]]
-        W = (Wf * sf).to(torch.bfloat16)
+    if W.dtype == torch.float8_e4m3fn:
+        eye = torch.eye(kvlr, device=W.device, dtype=torch.bfloat16)
+        Wt = idx.kv_b_proj(eye)[0]                     # [kvlr, H_local*(nope+v)] = W^T
+        Wbf = Wt.t().contiguous().to(torch.bfloat16)   # [H_local*(nope+v), kvlr]
     else:
-        W = W.to(torch.bfloat16)
-    return W.view(idx.n_head, idx.qk_nope_head_dim + idx.v_head_dim,
-                  idx.kv_lora_rank)[:, : idx.qk_nope_head_dim, :]
+        Wbf = W.to(torch.bfloat16)
+    W_UK = Wbf.view(idx.n_head, idx.qk_nope_head_dim + idx.v_head_dim,
+                    kvlr)[:, : idx.qk_nope_head_dim, :].contiguous()
+    if os.environ.get("LROSA_DEBUG_SCALE") == "1":
+        print(f"[WUK-DBG L{idx.layer_idx}] W.dtype={W.dtype} "
+              f"|W_UK|rms={W_UK.float().pow(2).mean().sqrt():.4e} (via kv_b_proj(I))",
+              flush=True)
+    idx._wuk_bf16 = W_UK
+    return W_UK
 
 
 class LRoSAMLAIndexer(nn.Module):
@@ -748,6 +760,16 @@ class LRoSAMLAIndexer(nn.Module):
         # env knobs read once (NOT in the traced forward)
         self.alpha = float(os.environ.get("LROSA_MLA_ROPE_W", "1.0"))
         self.recent_window = int(os.environ.get("LROSA_MLA_RECENT_W", "0"))
+        # LROSA_COLLECT_GRAMS=1: Gram-collector mode (run with enforce_eager + a
+        # dummy basis). During PREFILL chunks accumulate the per-layer joint Grams
+        # on the MLA latent — G_Q = Σ over ALL local q-heads/tokens q_latent qᵀ,
+        # G_K = Σ c_kv cᵀ (RoPE excluded, matching the GLM-4.7 calib convention).
+        # q-heads are TP-local (q_b_proj column-parallel) → the driver sums G_Q
+        # across ranks; c_kv is replicated → take any rank's G_K. Fetch via
+        # collective_rpc. This is how GLM-5.2-FP8 (705 GB, TP=8) gets calibrated:
+        # transformers cannot load it, so the spectral basis is computed from
+        # Grams collected inside vLLM itself.
+        self._collect_grams = os.environ.get("LROSA_COLLECT_GRAMS") == "1"
 
         # Reuse the DSA fp8 index cache + the fp8 paged-logits/radix-topk op.
         self.k_cache = DeepseekV32IndexerCache(
@@ -778,6 +800,22 @@ class LRoSAMLAIndexer(nn.Module):
         W_UK = _lrosa_get_wuk(self)   # bf16 W_UK (dequant fp8 kv_b_proj once, TP-local)
         Mb = self.M_basis   # already on-device (set in __init__), graph-capture safe
         q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)              # [T,H,kvlr]
+        if os.environ.get("LROSA_DEBUG_SCALE") == "1" and not getattr(self, "_dbg_fwd", False) and T > 1:
+            self._dbg_fwd = True
+            print(f"[FWD-DBG L{self.layer_idx}] T={T} H={H} "
+                  f"|q_nope|rms={q_nope.float().pow(2).mean().sqrt():.4e} "
+                  f"|W_UK|rms={W_UK.float().pow(2).mean().sqrt():.4e} "
+                  f"|q_latent|rms={q_latent.float().pow(2).mean().sqrt():.4e} "
+                  f"|c_kv|rms={c_kv.float().pow(2).mean().sqrt():.4e}", flush=True)
+        if self._collect_grams and T > 1:   # prefill chunks only (eager-mode collector)
+            if not hasattr(self, "_gq"):
+                _d = self.kv_lora_rank
+                self._gq = torch.zeros(_d, _d, device=q_latent.device, dtype=torch.float32)
+                self._gk = torch.zeros(_d, _d, device=q_latent.device, dtype=torch.float32)
+            qf = q_latent.float()
+            self._gq += torch.einsum("thd,the->de", qf, qf)
+            ckf = c_kv.float()
+            self._gk += ckf.T @ ckf
         if self.alpha != 1.0:
             q_pe = q_pe * self.alpha
         if self.concat_b:
