@@ -277,6 +277,11 @@ def build_llm(a):
             kw["enforce_eager"] = True
         else:
             kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
+        # KV dtype override: default (fp8_ds_mla) lets is_v32 auto-pick; pass
+        # --mla_kv_dtype auto to force bf16 latent KV (diagnostic: #46074 isolated
+        # the DSA fault to the fp8 path — bf16 KV was stable).
+        if a.mla_kv_dtype and a.mla_kv_dtype != "fp8_ds_mla":
+            kw["kv_cache_dtype"] = a.mla_kv_dtype
 
     # fkv: dense default. For GLM-4.7-Flash (MLA) the KV cache defaults to fp8 so
     # the FKV reference matches the lrosa_mla fp8 deployment (KV unified to fp8).
@@ -312,8 +317,11 @@ def build_llm(a):
 def tokenize(tok, prompt_text, model):
     msgs = [{"role": "user", "content": prompt_text}]
     kw = dict(tokenize=True, add_generation_prompt=True)
-    if "enable_thinking" in (tok.chat_template or ""):
+    _ct = tok.chat_template or ""
+    if "enable_thinking" in _ct:          # Qwen3 / GLM style toggle
         kw["enable_thinking"] = True
+    elif "thinking" in _ct:                # DeepSeek-V3.1/V3.2 hybrid: variable is
+        kw["thinking"] = True              # `thinking` (defaults FALSE) -> force ON
     ids = tok.apply_chat_template(msgs, **kw)
     return ids if isinstance(ids, list) else ids["input_ids"]
 

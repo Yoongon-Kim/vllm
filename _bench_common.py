@@ -13,6 +13,27 @@ elsewhere; the default matches the current box.
 """
 import os
 
+# DeepSeek-V3.2-Exp declares model_type "deepseek_v32", which transformers 5.10
+# doesn't know (it only registers deepseek_v3). vLLM has its own config registry,
+# but the tokenizer's AutoTokenizer -> AutoConfig path uses RAW transformers and
+# KeyErrors on "deepseek_v32". Register it as an alias of DeepseekV3Config (same
+# config structure; DSA is driven by index_topk + the DeepseekV32ForCausalLM
+# architecture, not the config class) so that path succeeds.
+try:
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+        DeepseekV3Config as _DSV3Config,
+    )
+
+    if "deepseek_v32" not in CONFIG_MAPPING_NAMES:
+        class DeepseekV32Config(_DSV3Config):  # noqa: D401
+            model_type = "deepseek_v32"
+
+        AutoConfig.register("deepseek_v32", DeepseekV32Config, exist_ok=True)
+except Exception:  # transformers layout differs / already registered
+    pass
+
 # pca research repo (== this project's LRoSA-dev clone). Holds the LongBench
 # v1 prompt/metric utils and the calibrated bases/<tag>/ trees.
 PCA_REPO = os.environ.get("PCA_REPO", "/NHNHOME/jiwonsong/LRoSA-dev")

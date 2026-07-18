@@ -40,7 +40,7 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
               use_radix=True, streaming=False, contig_projk=False, fp8_projk=False, per_layer=False,
               indexed_attend=True,
               tp=1, mla_kv_dtype="fp8_ds_mla", mla_backend=None, mla_fkv_fp8=False,
-              chunked_prefill=False):
+              chunked_prefill=False, cudagraph_mode=None, dense_mla=False):
     # max_num_seqs caps concurrency → sizes the LRoSA/Quest static decode
     # buffers. 0 → batch_size (tight, for clean latency). >0 simulates online
     # serving concurrency (stresses the buffers; Quest's are tiny, LRoSA's
@@ -100,6 +100,15 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         kw["attention_config"] = {"lrosa_mla": True, "lrosa_basis_path": basis,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h}
         kw["kv_cache_dtype"] = mla_kv_dtype
+    elif backend == "dsa":
+        # Native GLM-5.2 (DeepSeek-V3.2-style) lightning indexer. No
+        # attention_config override -> is_v32 auto-builds the native indexer +
+        # its 21 'full'-layer top-k with cross-layer sharing (indexer_types).
+        # fp8_ds_mla latent KV (native default). cudagraph MUST be PIECEWISE
+        # (the data-dependent indexer top-k garbles under a FULL graph) -- see
+        # --cudagraph_mode; use the same PIECEWISE for the sparse baselines so
+        # the comparison isn't a cudagraph-mode artifact.
+        kw["kv_cache_dtype"] = mla_kv_dtype
     elif backend == "fasa_mla":
         # FASA on an MLA model (GLM): partial-RoPE — FASAMLAIndexer scores only the
         # dominant decoupled-RoPE FCs (basis = fasa_idom_mla_*.pt); cs_h = N_tip
@@ -111,14 +120,28 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
                                   "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
                                   "lrosa_n_tip": cs_h}
         kw["kv_cache_dtype"] = mla_kv_dtype
-    # fkv: default backend. For an MLA model, optionally force the same fp8
-    # latent KV as the lrosa_mla path (apples-to-apples dense vs sparse attend).
-    if backend == "fkv" and mla_fkv_fp8:
+    # fkv: default backend. On a natively-sparse GLM-5.2 (is_v32) the model
+    # AUTO-BUILDS the native DSA indexer unless overridden -> a plain "fkv" run
+    # silently executes native DSA (identical throughput to --backend dsa), NOT
+    # true dense. dense_mla=True sets _force_dense_mla -> skips the indexer +
+    # is_v32=False -> genuine full dense MLA over all tokens (the real baseline).
+    if backend == "fkv" and dense_mla:
+        ac = kw.get("attention_config") or {}
+        ac["dense_mla"] = True
+        kw["attention_config"] = ac
+        # dense MLA rejects fp8_ds_mla (sparse-only); use bf16 latent KV (robust).
+        kw["kv_cache_dtype"] = mla_kv_dtype if mla_kv_dtype != "fp8_ds_mla" else "auto"
+    elif backend == "fkv" and mla_fkv_fp8:
         kw["kv_cache_dtype"] = mla_kv_dtype
     if mla_backend:  # force a specific MLA backend (GLM head-count workaround)
         ac = kw.get("attention_config") or {}
         ac["backend"] = mla_backend
         kw["attention_config"] = ac
+    if cudagraph_mode and os.environ.get("ENFORCE_EAGER", "0") != "1":
+        # Force a cudagraph mode (PIECEWISE for GLM-5.2: DSA's data-dependent
+        # top-k cannot ride a FULL graph; matching all sparse backends to
+        # PIECEWISE removes cudagraph-mode as a confound).
+        kw["compilation_config"] = {"cudagraph_mode": cudagraph_mode}
     if kw.get("kv_cache_dtype") in ("lrosa", "fasa", "quest", "seer"):
         # Hybrid models (Gemma 4, Ministral): window-bound the sliding layers'
         # KV cache instead of the combined-slot full-length cache — output-
@@ -145,7 +168,7 @@ def time_generate(llm, prompts, max_tokens, reps=2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa", "lrosa_mla", "fasa_mla"], required=True)
+    ap.add_argument("--backend", choices=["fkv", "lrosa", "quest", "fasa", "lrosa_mla", "fasa_mla", "dsa"], required=True)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--basis", default=None,
                     help="LRoSA basis / FASA idom .pt; default = pca bases/<tag>/...")
@@ -189,6 +212,13 @@ def main():
                     help="Enable chunked prefill (caps peak prefill activation so long "
                          "ctx fits at the proper decode batch). Safe for fkv/fasa; sparse "
                          "backends may hit the mixed-batch score-kernel bug at bsz>1.")
+    ap.add_argument("--cudagraph_mode", default=None,
+                    help="Force compilation_config.cudagraph_mode (e.g. PIECEWISE). "
+                         "GLM-5.2: DSA needs PIECEWISE; match all sparse backends to it.")
+    ap.add_argument("--dense_mla", action="store_true",
+                    help="fkv on GLM-5.2: force TRUE dense (dense_mla=True disables the "
+                         "auto-built native DSA indexer). Without this, 'fkv' on a v32 "
+                         "model silently runs native DSA, not dense.")
     a = ap.parse_args()
 
     torch.manual_seed(0)
@@ -203,7 +233,8 @@ def main():
                     indexed_attend=a.indexed_attend,
                     per_layer=a.per_layer, tp=a.tp, mla_kv_dtype=a.mla_kv_dtype,
                     mla_backend=a.mla_backend, mla_fkv_fp8=a.mla_fkv_fp8,
-                    chunked_prefill=a.chunked_prefill)
+                    chunked_prefill=a.chunked_prefill, cudagraph_mode=a.cudagraph_mode,
+                    dense_mla=a.dense_mla)
 
     t_prefill = time_generate(llm, prompts, 1)
     t_full = time_generate(llm, prompts, 1 + a.decode_len)

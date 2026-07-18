@@ -1069,27 +1069,61 @@ class DeepseekV2MLAAttention(nn.Module):
         # LRoSA-on-MLA (appendix): when no native DSA indexer, optionally swap in a
         # learned-rotation latent scorer that drives the same FLASHMLA_SPARSE attend.
         if getattr(vllm_config.attention_config, "lrosa_mla", False):
+            import os
+
             from vllm.model_executor.layers.lrosa_mla_indexer import LRoSAMLAIndexer
 
             ac = vllm_config.attention_config
             cs_h = ac.lrosa_cs_h or (config.kv_lora_rank // 8)
-            self.indexer = LRoSAMLAIndexer(
-                vllm_config=vllm_config,
-                config=config,
-                cache_config=cache_config,
-                fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
-                kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
-                q_b_proj=getattr(self, "q_b_proj", None),
-                kv_a_layernorm=self.kv_a_layernorm,
-                kv_b_proj=self.kv_b_proj,
-                rotary_emb=self.rotary_emb,
-                q_lora_rank=self.q_lora_rank,
-                basis_path=ac.lrosa_basis_path,
-                cs_h=cs_h,
-                n_fac=ac.lrosa_n_fac,
-                topk_indices_buffer=topk_indices_buffer,
-                prefix=f"{prefix}.lrosa_indexer",
-            )
+            # Cross-layer index sharing (LROSA_MLA_SHARE_TOPK): mirror GLM-5.2's
+            # native DSA, where only "full" layers run the selector and the rest
+            # reuse the previous full layer's top-k via the shared
+            # topk_indices_buffer (skip_topk=True). This cuts JSSA scoring from all
+            # 78 layers to ~21 with no extra selection cost vs DSA. The full/shared
+            # partition reuses the model's own ``indexer_types`` when present (exact
+            # apples-to-apples with DSA); otherwise every ``freq``-th layer is full
+            # (layer 0 always full so the buffer is seeded on the first layer) —
+            # this fallback generalizes the latency lever to ANY MLA model, not just
+            # GLM-5.2 (future work). Unset -> current behavior (index every layer).
+            _share = os.environ.get("LROSA_MLA_SHARE_TOPK")
+            _lid = extract_layer_index(prefix)
+            _is_full = True
+            if _share:
+                _itypes = getattr(config, "indexer_types", None)
+                if _itypes is not None and 0 <= _lid < len(_itypes):
+                    _is_full = _itypes[_lid] == "full"
+                else:
+                    _freq = int(_share) if _share.isdigit() and int(_share) > 1 else 4
+                    _is_full = (_lid % _freq == 0)
+            if _share and not _is_full:
+                # Shared layer: no selector, no basis load, no per-layer indexer
+                # cache — just the two attrs the MLA wrapper reads. skip_topk makes
+                # mla.py reuse the buffer written by the previous full layer.
+                import types
+
+                self.indexer = types.SimpleNamespace(
+                    topk_tokens=ac.lrosa_n_fac,
+                    topk_indices_buffer=topk_indices_buffer,
+                )
+                _skip_topk = True
+            else:
+                self.indexer = LRoSAMLAIndexer(
+                    vllm_config=vllm_config,
+                    config=config,
+                    cache_config=cache_config,
+                    fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
+                    kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
+                    q_b_proj=getattr(self, "q_b_proj", None),
+                    kv_a_layernorm=self.kv_a_layernorm,
+                    kv_b_proj=self.kv_b_proj,
+                    rotary_emb=self.rotary_emb,
+                    q_lora_rank=self.q_lora_rank,
+                    basis_path=ac.lrosa_basis_path,
+                    cs_h=cs_h,
+                    n_fac=ac.lrosa_n_fac,
+                    topk_indices_buffer=topk_indices_buffer,
+                    prefix=f"{prefix}.lrosa_indexer",
+                )
             self.indexer_rope_emb = None  # LRoSAMLAIndexer uses self.rotary_emb
             self.is_v32 = True  # route the MLA layer through the sparse attend + buffer
 
@@ -1376,8 +1410,21 @@ class DeepseekV2Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
-        if self.is_v32:
-            topk_tokens = config.index_topk
+        # A custom MLA selector (lrosa/fasa/quest/triattn _mla) turns a DENSE MLA
+        # model (e.g. DeepSeek-V3.1-Terminus, deepseek_v3, no index_topk) into a
+        # sparse one per-layer. The shared topk_indices_buffer is created HERE at
+        # is_v32 time, so a non-v32 base would leave it None and the per-layer
+        # selector would crash writing to it. Create it whenever such a selector
+        # is requested, sized by the selector's token budget (lrosa_n_fac).
+        _ac = getattr(vllm_config, "attention_config", None)
+        _custom_mla = bool(_ac) and any(
+            getattr(_ac, k, False)
+            for k in ("lrosa_mla", "fasa_mla", "quest_mla", "triattn_mla")
+        )
+        if self.is_v32 or _custom_mla:
+            topk_tokens = getattr(config, "index_topk", None) or (
+                getattr(_ac, "lrosa_n_fac", None) or 2048
+            )
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 topk_tokens,
