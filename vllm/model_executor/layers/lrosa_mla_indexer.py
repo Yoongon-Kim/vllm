@@ -770,6 +770,12 @@ class LRoSAMLAIndexer(nn.Module):
         # transformers cannot load it, so the spectral basis is computed from
         # Grams collected inside vLLM itself.
         self._collect_grams = os.environ.get("LROSA_COLLECT_GRAMS") == "1"
+        # ★q-SHARE: when on (default), the MLA wrapper hands over the already-computed
+        # q / kv_c / k_pe so this indexer skips re-running fused_qkv_a_proj + q_b_proj
+        # + kv_a_layernorm + rope (DSA uses a small dedicated wq_b; JSSA was re-running
+        # the FULL projections -> the main throughput gap vs DSA). LROSA_MLA_SHARE_Q=0
+        # falls back to recompute. Result is numerically identical either way.
+        self.wants_shared_q = os.environ.get("LROSA_MLA_SHARE_Q", "1") == "1"
 
         # Reuse the DSA fp8 index cache + the fp8 paged-logits/radix-topk op.
         self.k_cache = DeepseekV32IndexerCache(
@@ -780,27 +786,55 @@ class LRoSAMLAIndexer(nn.Module):
             self.head_dim, vllm_config.model_config.max_model_len,
             get_max_prefill_buffer_size(vllm_config), topk_indices_buffer)
 
-    def forward(self, hidden_states, q_c, positions, rotary_emb=None):
+    def forward(self, hidden_states, q_c, positions, rotary_emb=None,
+                shared_q=None, shared_kv_c=None, shared_k_pe=None):
         T = hidden_states.shape[0]
         H = self.n_head
-        # latent c_KV + decoupled rope key (recompute the kv_a path)
-        if self.q_lora_rank is not None:
-            kv_lora = self.fused_qkv_a_proj(hidden_states)[0][..., self.q_lora_rank:]
+        if shared_q is not None:
+            # ★q-SHARE: reuse the main MLA path's already-computed tensors instead
+            # of re-running fused_qkv_a_proj + q_b_proj + kv_a_layernorm + rope.
+            # shared_q [T,H,qk_head_dim] has its q_pe slice already RoPE'd with the
+            # SAME rotary_emb; shared_k_pe [T,1,rope] is RoPE'd; shared_kv_c is the
+            # normed latent. So q_nope (rope-free), q_pe (rotated), c_kv, k_pe are
+            # directly usable — the indexer keeps ONLY its proj/quant/topk work.
+            c_kv = shared_kv_c                                             # [T, kvlr]
+            k_pe = shared_k_pe.reshape(T, self.qk_rope_head_dim)           # [T, rope]
+            q_nope = shared_q[..., : self.qk_nope_head_dim]               # [T,H,nope]
+            q_pe = shared_q[..., self.qk_nope_head_dim:]                  # [T,H,rope] rotated
         else:
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-        c_kv = self.kv_a_layernorm(kv_lora[..., : self.kv_lora_rank])      # [T, kvlr]
-        k_pe = kv_lora[..., self.kv_lora_rank:].unsqueeze(1)               # [T,1,rope]
-        # absorbed query q_latent = q_nope @ W_UK
-        q = self.q_b_proj(q_c)[0].view(T, H, self.qk_head_dim)
-        q_nope = q[..., : self.qk_nope_head_dim]                           # [T,H,nope]
-        q_pe = q[..., self.qk_nope_head_dim:]                              # [T,H,rope]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_pe = q_pe.reshape(T, H, self.qk_rope_head_dim)
-        k_pe = k_pe.reshape(T, self.qk_rope_head_dim)
+            # latent c_KV + decoupled rope key (recompute the kv_a path)
+            if self.q_lora_rank is not None:
+                kv_lora = self.fused_qkv_a_proj(hidden_states)[0][..., self.q_lora_rank:]
+            else:
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            c_kv = self.kv_a_layernorm(kv_lora[..., : self.kv_lora_rank])  # [T, kvlr]
+            k_pe = kv_lora[..., self.kv_lora_rank:].unsqueeze(1)           # [T,1,rope]
+            q = self.q_b_proj(q_c)[0].view(T, H, self.qk_head_dim)
+            q_nope = q[..., : self.qk_nope_head_dim]                       # [T,H,nope]
+            q_pe = q[..., self.qk_nope_head_dim:]                          # [T,H,rope]
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            q_pe = q_pe.reshape(T, H, self.qk_rope_head_dim)
+            k_pe = k_pe.reshape(T, self.qk_rope_head_dim)
         W_UK = _lrosa_get_wuk(self)   # bf16 W_UK (dequant fp8 kv_b_proj once, TP-local)
         Mb = self.M_basis   # already on-device (set in __init__), graph-capture safe
-        q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)              # [T,H,kvlr]
-        if os.environ.get("LROSA_DEBUG_SCALE") == "1" and not getattr(self, "_dbg_fwd", False) and T > 1:
+        # ★FUSED query projection (A-variant): proj_q = q_nope @ W_UK @ Mᵀ collapses
+        # to a single einsum against a cached WM = W_UK @ Mᵀ ([H, nope, cs]), skipping
+        # the [T,H,kvlr=512] q_latent intermediate + the separate M projection
+        # (~12x fewer query-side MACs; numerically identical by associativity). NOT
+        # used for the B-variant (M mixes latent+rope) nor while collecting Grams
+        # (which needs the raw q_latent). LROSA_MLA_FUSE_WM=0 disables it.
+        _fuse = (not self.concat_b) and (not self._collect_grams) \
+            and os.environ.get("LROSA_MLA_FUSE_WM", "1") == "1"
+        if _fuse:
+            WM = getattr(self, "_wm", None)
+            if WM is None:
+                WM = torch.einsum("hnl,cl->hnc", W_UK, Mb).contiguous()   # [H,nope,cs]
+                self._wm = WM
+            proj_q = torch.einsum("thn,hnc->thc", q_nope, WM)             # [T,H,cs] FUSED
+            q_latent = None
+        else:
+            q_latent = torch.einsum("thn,hnl->thl", q_nope, W_UK)          # [T,H,kvlr]
+        if os.environ.get("LROSA_DEBUG_SCALE") == "1" and q_latent is not None and not getattr(self, "_dbg_fwd", False) and T > 1:
             self._dbg_fwd = True
             print(f"[FWD-DBG L{self.layer_idx}] T={T} H={H} "
                   f"|q_nope|rms={q_nope.float().pow(2).mean().sqrt():.4e} "
@@ -827,7 +861,8 @@ class LRoSAMLAIndexer(nn.Module):
             index_k = k_full @ Mb.T                                       # [T,cs_h]
         else:
             # A-variant: project NoPE, concatenate raw RoPE (+ optional ReLU-shift).
-            proj_q = torch.einsum("thl,cl->thc", q_latent, Mb)            # [T,H,cs_h]
+            if not _fuse:                                                 # fused path
+                proj_q = torch.einsum("thl,cl->thc", q_latent, Mb)       # already set it
             proj_K = c_kv @ Mb.T                                          # [T,cs_h]
             if self.shift_c > 0:
                 bq = q_pe.new_full((T, H, 1), self.shift_beta)

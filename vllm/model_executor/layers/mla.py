@@ -166,7 +166,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            if getattr(self.indexer, "wants_shared_q", False):
+                # The custom MLA selector (JSSA) would otherwise RE-RUN
+                # fused_qkv_a_proj + q_b_proj + kv_a_layernorm + rope inside its
+                # forward — all already computed here. Hand them over: q has its
+                # RoPE part already rotated with the SAME rotary_emb the selector
+                # uses, so q_nope (rope-free slice) and q_pe (rotated slice), the
+                # normed latent kv_c, and the rotated k_pe are all directly reusable.
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb,
+                             shared_q=q, shared_kv_c=kv_c_normed, shared_k_pe=k_pe)
+            else:
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
