@@ -1,0 +1,200 @@
+{"prediction": "After removing duplicates, there are 20 unique paragraphs.", "answers": ["8"], "score": 0.0}
+{"prediction": "9\n\nThe final count of unique paragraphs after removing duplicates is 9. \n\nTo determine the count of unique paragraphs, I will read through the paragraphs and count", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "24", "answers": ["44"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there are 1 unique paragraphs.", "answers": ["2"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "3\n\nThe final three paragraphs are duplicates of the following:\n\n- Paragraph 1: The U.S. is ranked 4th out of 34 developed nations", "answers": ["7"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["45"], "score": 0.0}
+{"prediction": "14", "answers": ["4"], "score": 0.0}
+{"prediction": "14", "answers": ["31"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["4"], "score": 0.0625}
+{"prediction": "8", "answers": ["16"], "score": 0.0}
+{"prediction": "3\n\nThe final count of unique paragraphs after removing duplicates is 3. \n\nHere's the explanation of how many unique paragraphs were removed:\n\n- Paragraph 1", "answers": ["5"], "score": 0.0}
+{"prediction": "34", "answers": ["44"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 25 unique paragraphs.", "answers": ["36"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["24"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "22", "answers": ["29"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "6", "answers": ["6"], "score": 1.0}
+{"prediction": "6", "answers": ["8"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "7", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n\nAfter removing duplicates, there are 1 unique paragraphs.", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["28"], "score": 0.0}
+{"prediction": "22", "answers": ["43"], "score": 0.0}
+{"prediction": "17", "answers": ["34"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "9", "answers": ["9"], "score": 1.0}
+{"prediction": "14", "answers": ["40"], "score": 0.0}
+{"prediction": "1.", "answers": ["14"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "14", "answers": ["25"], "score": 0.0}
+{"prediction": "1.", "answers": ["13"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 20 unique paragraphs.", "answers": ["35"], "score": 0.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["39"], "score": 0.0}
+{"prediction": "8", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 17 unique paragraphs.", "answers": ["16"], "score": 0.0}
+{"prediction": "1. \n2. \n3. On 5 December 2018 a federal jury in New York City convicted Chi Ping Patrick Ho of paying bribes to", "answers": ["30"], "score": 0.0}
+{"prediction": "6", "answers": ["4"], "score": 0.0}
+{"prediction": "8", "answers": ["21"], "score": 0.0}
+{"prediction": "To find the number of unique paragraphs, we need to remove duplicates and count the unique paragraphs. \n\nAfter removing duplicates, the unique paragraphs are:\n\nParagraph 1", "answers": ["5"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "5", "answers": ["6"], "score": 0.0}
+{"prediction": "22", "answers": ["31"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["9"], "score": 0.0625}
+{"prediction": "9", "answers": ["11"], "score": 0.0}
+{"prediction": "9", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "5\n\nAfter removing duplicates, the unique paragraphs are:\n\nParagraph 1: DS Head and DC Wombwell exited the car and walked over to the van,", "answers": ["5"], "score": 0.5}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "22", "answers": ["40"], "score": 0.0}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "2", "answers": ["2"], "score": 1.0}
+{"prediction": "17", "answers": ["20"], "score": 0.0}
+{"prediction": "1. The protests, which started on 2 July, are organized by some nationalist and leftist parties, primarily VMRO-DPMNE, its coalition Renewal", "answers": ["30"], "score": 0.0}
+{"prediction": "5", "answers": ["12"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["43"], "score": 0.0}
+{"prediction": "9", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "14", "answers": ["37"], "score": 0.0}
+{"prediction": "14", "answers": ["15"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 17 unique paragraphs.", "answers": ["17"], "score": 1.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "1.", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 22 unique paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there are 1 unique paragraphs.", "answers": ["5"], "score": 0.0}
+{"prediction": "9", "answers": ["13"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["19"], "score": 0.0}
+{"prediction": "9", "answers": ["13"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["19"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["12"], "score": 0.0625}
+{"prediction": "6", "answers": ["15"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "To determine the number of unique paragraphs, I will remove duplicates by comparing the content of each paragraph. \n\nHere are the steps I will take to count the number", "answers": ["16"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "8", "answers": ["7"], "score": 0.0}
+{"prediction": "6", "answers": ["3"], "score": 0.0}
+{"prediction": "14", "answers": ["27"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["8"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "6", "answers": ["14"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "14", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "22", "answers": ["38"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "14", "answers": ["23"], "score": 0.0}
+{"prediction": "23", "answers": ["21"], "score": 0.0}
+{"prediction": "23", "answers": ["31"], "score": 0.0}
+{"prediction": "7", "answers": ["4"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["24"], "score": 0.0}
+{"prediction": "23", "answers": ["46"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["30"], "score": 0.0}
+{"prediction": "2", "answers": ["2"], "score": 1.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "9", "answers": ["14"], "score": 0.0}
+{"prediction": "23", "answers": ["29"], "score": 0.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "23", "answers": ["41"], "score": 0.0}
+{"prediction": "24", "answers": ["25"], "score": 0.0}
+{"prediction": "14", "answers": ["39"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "34", "answers": ["30"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["28"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["37"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "After removing duplicates, there are 40 unique paragraphs.", "answers": ["33"], "score": 0.0}
+{"prediction": "8", "answers": ["14"], "score": 0.0}
+{"prediction": "17", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "25", "answers": ["31"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["12"], "score": 0.0}
+{"prediction": "5\n\nThere are 5 unique paragraphs after removing duplicates. \n\nThe first 4 paragraphs are about the climate of Huma County, which are duplicates of.", "answers": ["3"], "score": 0.0}
+{"prediction": "23", "answers": ["32"], "score": 0.0}
+{"prediction": "17", "answers": ["44"], "score": 0.0}
+{"prediction": "22", "answers": ["23"], "score": 0.0}
+{"prediction": "9", "answers": ["17"], "score": 0.0}
+{"prediction": "23", "answers": ["39"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "9\n\nAfter removing duplicates, there are 9 unique paragraphs.", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["4"], "score": 0.0}
+{"prediction": "24", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["16"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["16"], "score": 0.0625}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["17"], "score": 0.0}
+{"prediction": "24", "answers": ["27"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "1.", "answers": ["31"], "score": 0.0}
+{"prediction": "2\n\nThere are 2 unique paragraphs after removing duplicates.", "answers": ["3"], "score": 0.0}
+{"prediction": "2", "answers": ["3"], "score": 0.0}
+{"prediction": "3\n\nThere are 3 unique paragraphs after removing duplicates. \n\nThe first recognized hip-hop group is Shabak Samech (Hebrew: שב�", "answers": ["3"], "score": 1.0}
+{"prediction": "9", "answers": ["9"], "score": 1.0}
+{"prediction": "To determine the number of unique paragraphs, we need to remove duplicates from the given text. \n\nWe can see that the given text has 3 unique paragraphs:", "answers": ["3"], "score": 1.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["17"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "14", "answers": ["17"], "score": 0.0}
+{"prediction": "8", "answers": ["4"], "score": 0.0}
+{"prediction": "9", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["38"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["17"], "score": 0.0}
+{"prediction": "14", "answers": ["15"], "score": 0.0}
+{"prediction": "23", "answers": ["34"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "23", "answers": ["22"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["30"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "8", "answers": ["6"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["7"], "score": 0.0625}
+{"prediction": "14", "answers": ["31"], "score": 0.0}
+{"prediction": "3\n\nAfter removing duplicates, the unique paragraphs are:\n\nParagraph 1:  The United States has imposed an arms ban and an almost total economic embargo on Iran", "answers": ["5"], "score": 0.0}
+{"prediction": "24", "answers": ["35"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["24"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["37"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "14", "answers": ["28"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "3", "answers": ["4"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["16"], "score": 0.0625}
+{"prediction": "17", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["10"], "score": 0.0625}
+{"prediction": "1", "answers": ["42"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["26"], "score": 0.0}
+{"prediction": "12", "answers": ["21"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["19"], "score": 0.0}
+{"prediction": "23", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["20"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["15"], "score": 0.0625}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["10"], "score": 0.0625}
+{"prediction": "23", "answers": ["17"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n26\n", "answers": ["28"], "score": 0.0}

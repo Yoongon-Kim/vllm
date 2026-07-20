@@ -1,0 +1,135 @@
+{
+  "run_name": "q14_loki_lbpack_cs16",
+  "base_model": "Qwen/Qwen3-14B",
+  "mode": "loki",
+  "n_tip": 16,
+  "n_fac": 256,
+  "cs_h": 16,
+  "max_input_len": 127500,
+  "engine": "vllm",
+  "fp8_projk": true,
+  "status": "complete",
+  "per_task": {
+    "narrativeqa": {
+      "task": "narrativeqa",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.27802385547472286,
+      "elapsed_sec": 0.0
+    },
+    "qasper": {
+      "task": "qasper",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.4070321894706534,
+      "elapsed_sec": 0.0
+    },
+    "multifieldqa_en": {
+      "task": "multifieldqa_en",
+      "metric": "f1",
+      "num_samples": 150,
+      "score": 0.5053902811962772,
+      "elapsed_sec": 0.0
+    },
+    "hotpotqa": {
+      "task": "hotpotqa",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.605888264664306,
+      "elapsed_sec": 0.0
+    },
+    "2wikimqa": {
+      "task": "2wikimqa",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.5109335562098721,
+      "elapsed_sec": 0.0
+    },
+    "musique": {
+      "task": "musique",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.382565485313234,
+      "elapsed_sec": 0.0
+    },
+    "gov_report": {
+      "task": "gov_report",
+      "metric": "rouge",
+      "num_samples": 200,
+      "score": 0.32418852079995825,
+      "elapsed_sec": 0.0
+    },
+    "qmsum": {
+      "task": "qmsum",
+      "metric": "rouge",
+      "num_samples": 200,
+      "score": 0.2399419372934868,
+      "elapsed_sec": 0.0
+    },
+    "multi_news": {
+      "task": "multi_news",
+      "metric": "rouge",
+      "num_samples": 200,
+      "score": 0.2528790385526563,
+      "elapsed_sec": 0.0
+    },
+    "trec": {
+      "task": "trec",
+      "metric": "classification",
+      "num_samples": 200,
+      "score": 0.755,
+      "elapsed_sec": 0.0
+    },
+    "triviaqa": {
+      "task": "triviaqa",
+      "metric": "f1",
+      "num_samples": 200,
+      "score": 0.8769523809523809,
+      "elapsed_sec": 0.0
+    },
+    "samsum": {
+      "task": "samsum",
+      "metric": "rouge",
+      "num_samples": 200,
+      "score": 0.3729446146348714,
+      "elapsed_sec": 0.0
+    },
+    "passage_count": {
+      "task": "passage_count",
+      "metric": "count",
+      "num_samples": 200,
+      "score": 0.03470454545454546,
+      "elapsed_sec": 0.0
+    },
+    "passage_retrieval_en": {
+      "task": "passage_retrieval_en",
+      "metric": "retrieval",
+      "num_samples": 200,
+      "score": 0.955,
+      "elapsed_sec": 0.0
+    },
+    "lcc": {
+      "task": "lcc",
+      "metric": "code_sim",
+      "num_samples": 200,
+      "score": 0.5594999999999998,
+      "elapsed_sec": 0.0
+    },
+    "repobench-p": {
+      "task": "repobench-p",
+      "metric": "code_sim",
+      "num_samples": 200,
+      "score": 0.4775499999999997,
+      "elapsed_sec": 0.0
+    }
+  },
+  "category_averages": {
+    "Single-Doc QA": 0.3968154420472178,
+    "Multi-Doc QA": 0.49979576872913745,
+    "Summarization": 0.2723364988820338,
+    "Few-Shot": 0.668298998529084,
+    "Synthetic": 0.4948522727272727,
+    "Code": 0.5185249999999997
+  },
+  "overall_average": 0.4711559168760603
+}

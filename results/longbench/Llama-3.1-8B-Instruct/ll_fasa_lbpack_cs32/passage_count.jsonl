@@ -1,0 +1,200 @@
+{"prediction": "After removing duplicates, there are 8 unique paragraphs.", "answers": ["8"], "score": 1.0}
+{"prediction": "9", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "24", "answers": ["44"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["2"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "3", "answers": ["7"], "score": 0.0}
+{"prediction": "1. \n2. \n3. \n4. \n5. \n6. \n7. \n8. \n9. \n10. \n11.", "answers": ["45"], "score": 0.0}
+{"prediction": "14", "answers": ["4"], "score": 0.0}
+{"prediction": "14", "answers": ["31"], "score": 0.0}
+{"prediction": "1", "answers": ["4"], "score": 0.0}
+{"prediction": "8", "answers": ["16"], "score": 0.0}
+{"prediction": "3", "answers": ["5"], "score": 0.0}
+{"prediction": "34", "answers": ["44"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 35 unique paragraphs.", "answers": ["36"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["24"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "22", "answers": ["29"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "6", "answers": ["6"], "score": 1.0}
+{"prediction": "6", "answers": ["8"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "7", "answers": ["26"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["28"], "score": 0.0}
+{"prediction": "22", "answers": ["43"], "score": 0.0}
+{"prediction": "17", "answers": ["34"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "9", "answers": ["9"], "score": 1.0}
+{"prediction": "14", "answers": ["40"], "score": 0.0}
+{"prediction": "1", "answers": ["14"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "14", "answers": ["25"], "score": 0.0}
+{"prediction": "1", "answers": ["13"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 35 unique paragraphs.", "answers": ["35"], "score": 1.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["39"], "score": 0.0}
+{"prediction": "8", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 15 unique paragraphs.", "answers": ["16"], "score": 0.0}
+{"prediction": "1. \n2. \n3. \n4. \n5. \n6. \n7. \n8. \n9. \n10. \n11.", "answers": ["30"], "score": 0.0}
+{"prediction": "6", "answers": ["4"], "score": 0.0}
+{"prediction": "8", "answers": ["21"], "score": 0.0}
+{"prediction": "To find the number of unique paragraphs, I will remove the duplicates and count the remaining paragraphs.\n\n the paragraphs are as follows:\n\nParagraph 1: Ahern's", "answers": ["5"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "5", "answers": ["6"], "score": 0.0}
+{"prediction": "22", "answers": ["31"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["9"], "score": 0.0}
+{"prediction": "9", "answers": ["11"], "score": 0.0}
+{"prediction": "9", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "5\n\nAfter removing duplicates, the unique paragraphs are:\n\n1. DS Head and DC Wombwell exited the car and walked over to the van, where they", "answers": ["5"], "score": 0.5}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "1", "answers": ["14"], "score": 0.0}
+{"prediction": "22", "answers": ["40"], "score": 0.0}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "2", "answers": ["2"], "score": 1.0}
+{"prediction": "17", "answers": ["20"], "score": 0.0}
+{"prediction": "1. \nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["30"], "score": 0.0}
+{"prediction": "5", "answers": ["12"], "score": 0.0}
+{"prediction": "1", "answers": ["43"], "score": 0.0}
+{"prediction": "9", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "14", "answers": ["37"], "score": 0.0}
+{"prediction": "14", "answers": ["15"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 21 unique paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "1", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 20 unique paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "1", "answers": ["5"], "score": 0.0}
+{"prediction": "9", "answers": ["13"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["19"], "score": 0.0}
+{"prediction": "9", "answers": ["13"], "score": 0.0}
+{"prediction": "1\n зрения", "answers": ["19"], "score": 0.0}
+{"prediction": "1. \nAfter the council was dissolved, Cesarini was sent as papal legate to Hungary (1442) by Pope Eugenius IV to", "answers": ["12"], "score": 0.0}
+{"prediction": "6", "answers": ["15"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "To find the number of unique paragraphs, I will remove the duplicates from the list of paragraphs. \n\nAfter removing the duplicates, I get the following list of unique", "answers": ["16"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "8", "answers": ["7"], "score": 0.0}
+{"prediction": "6", "answers": ["3"], "score": 0.0}
+{"prediction": "14", "answers": ["27"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["8"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n\n\nThere are 11 unique paragraphs after removing duplicates", "answers": ["14"], "score": 0.0}
+{"prediction": "6", "answers": ["14"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "14", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n who are the duplicates. \n\nParagraph 2 is the same as Paragraph 12.\n\n\nParagraph 3 is the same as Paragraph 4 and Paragraph", "answers": ["11"], "score": 0.0}
+{"prediction": "22", "answers": ["38"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "14", "answers": ["23"], "score": 0.0}
+{"prediction": "23", "answers": ["21"], "score": 0.0}
+{"prediction": "23", "answers": ["31"], "score": 0.0}
+{"prediction": "7", "answers": ["4"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["24"], "score": 0.0}
+{"prediction": "23", "answers": ["46"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n16\n17\n", "answers": ["11"], "score": 0.0625}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["30"], "score": 0.0}
+{"prediction": "2", "answers": ["2"], "score": 1.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "9", "answers": ["14"], "score": 0.0}
+{"prediction": "23", "answers": ["29"], "score": 0.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "23", "answers": ["41"], "score": 0.0}
+{"prediction": "24", "answers": ["25"], "score": 0.0}
+{"prediction": "14", "answers": ["39"], "score": 0.0}
+{"prediction": "1. \nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "34", "answers": ["30"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n\n\n7\n8\n who was killed by the Robot Chicken after the events of the", "answers": ["28"], "score": 0.0}
+{"prediction": "1.", "answers": ["37"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "After removing duplicates, there are 40 unique paragraphs.", "answers": ["33"], "score": 0.0}
+{"prediction": "8", "answers": ["14"], "score": 0.0}
+{"prediction": "17", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "25", "answers": ["31"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["12"], "score": 0.0}
+{"prediction": "5\n\nThe paragraphs about Huma County's climate and Chex Quest are all duplicates, and the paragraph about Chuck is a review of an episode.", "answers": ["3"], "score": 0.0}
+{"prediction": "23", "answers": ["32"], "score": 0.0}
+{"prediction": "17", "answers": ["44"], "score": 0.0}
+{"prediction": "22", "answers": ["23"], "score": 0.0}
+{"prediction": "9", "answers": ["17"], "score": 0.0}
+{"prediction": "23", "answers": ["39"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "9", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["4"], "score": 0.0}
+{"prediction": "24", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["16"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["16"], "score": 0.0625}
+{"prediction": "1", "answers": ["17"], "score": 0.0}
+{"prediction": "24", "answers": ["27"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["14"], "score": 0.0625}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["31"], "score": 0.0}
+{"prediction": "2", "answers": ["3"], "score": 0.0}
+{"prediction": "2", "answers": ["3"], "score": 0.0}
+{"prediction": "3", "answers": ["3"], "score": 1.0}
+{"prediction": "9", "answers": ["9"], "score": 1.0}
+{"prediction": "To find the number of unique paragraphs, I will remove duplicates from the given paragraphs. \n\nThe given paragraphs are:\n\nParagraph 1: The building, which was", "answers": ["3"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\naa\n the answer is 4", "answers": ["17"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "14", "answers": ["17"], "score": 0.0}
+{"prediction": "8", "answers": ["4"], "score": 0.0}
+{"prediction": "9", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["38"], "score": 0.0}
+{"prediction": "1", "answers": ["17"], "score": 0.0}
+{"prediction": "14", "answers": ["15"], "score": 0.0}
+{"prediction": "23", "answers": ["34"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "23", "answers": ["22"], "score": 0.0}
+{"prediction": "1\n5", "answers": ["30"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "8", "answers": ["6"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["31"], "score": 0.0}
+{"prediction": "3", "answers": ["5"], "score": 0.0}
+{"prediction": "24", "answers": ["35"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\naa\n", "answers": ["24"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["37"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "14", "answers": ["28"], "score": 0.0}
+{"prediction": "5", "answers": ["5"], "score": 1.0}
+{"prediction": "3", "answers": ["4"], "score": 0.0}
+{"prediction": "1\n A lot of people, it just kicks 'em right in the head. This is a strange thing to say, but 30 or 40 years", "answers": ["11"], "score": 0.0}
+{"prediction": "1. \n2. \n3. \n4. \n5. \n6. \n7. \n8. \n9. \n10. \n11.", "answers": ["16"], "score": 0.0}
+{"prediction": "17", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n\n\n\n\n", "answers": ["10"], "score": 0.07142857142857142}
+{"prediction": "1", "answers": ["42"], "score": 0.0}
+{"prediction": "1. \nAfter two years, the international geoscience community including experts from Japan, Canada, United States, Sri Lanka, New Zealand, Hong Kong,", "answers": ["26"], "score": 0.0}
+{"prediction": "12", "answers": ["21"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n", "answers": ["19"], "score": 0.0}
+{"prediction": "23", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["20"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["15"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["10"], "score": 0.0}
+{"prediction": "23", "answers": ["17"], "score": 0.0}
+{"prediction": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n13\n14\n15\n16\n17\n22\n", "answers": ["28"], "score": 0.0}

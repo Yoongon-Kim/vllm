@@ -1,0 +1,200 @@
+{"prediction": "After removing duplicates, there are 10 unique paragraphs.", "answers": ["8"], "score": 0.0}
+{"prediction": "9\n\nThe paragraphs are removed duplicates.", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "24", "answers": ["44"], "score": 0.0}
+{"prediction": "1.", "answers": ["2"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "3", "answers": ["7"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["45"], "score": 0.0}
+{"prediction": "14", "answers": ["4"], "score": 0.0}
+{"prediction": "14\n\n the output of the paragraphs.", "answers": ["31"], "score": 0.0}
+{"prediction": "1\n\n", "answers": ["4"], "score": 0.0}
+{"prediction": "8\n\nThe final count of unique paragraphs", "answers": ["16"], "score": 0.0}
+{"prediction": "3\n\nAfter removing duplicates, there are 3 unique paragraphs.", "answers": ["5"], "score": 0.0}
+{"prediction": "34", "answers": ["44"], "score": 0.0}
+{"prediction": "14\n\nThe number of unique paragraphs is 14.", "answers": ["19"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 35 unique paragraphs.", "answers": ["36"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only one unique paragraph remains.", "answers": ["24"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "1\n-old paragraph is removed. \nThe final count of unique paragraphs is 22.", "answers": ["14"], "score": 0.0}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "22", "answers": ["29"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "6", "answers": ["6"], "score": 1.0}
+{"prediction": "6", "answers": ["8"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "7", "answers": ["26"], "score": 0.0}
+{"prediction": "1. \n\nTo determine the number of unique paragraphs, I will remove duplicates. \n\n1. \n1. \n1. \n1. \n1. \n", "answers": ["26"], "score": 0.0}
+{"prediction": "1, 2, 3, 4,5, 6,7,8,9,10,11,14,17,20,", "answers": ["28"], "score": 0.0}
+{"prediction": "22", "answers": ["43"], "score": 0.0}
+{"prediction": "17", "answers": ["34"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "9\n\n", "answers": ["9"], "score": 1.0}
+{"prediction": "14\n\n", "answers": ["40"], "score": 0.0}
+{"prediction": "1.", "answers": ["14"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "14", "answers": ["25"], "score": 0.0}
+{"prediction": "1.", "answers": ["13"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 34 unique paragraphs.", "answers": ["35"], "score": 0.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only 1.", "answers": ["39"], "score": 0.0}
+{"prediction": "8\n\nThe final answer is 8.", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["12"], "score": 0.0}
+{"prediction": "After removing duplicates, there are  14 unique paragraphs.", "answers": ["16"], "score": 0.0}
+{"prediction": "1. After removing duplicates, there are 1. 28  unique  paragraphs.", "answers": ["30"], "score": 0.0}
+{"prediction": "6\n\n\n\n\n\n the Mars Gravity Biosatellite program.  The program began in 2001.  The program was intended to study the effects of gravity", "answers": ["4"], "score": 0.0}
+{"prediction": "8", "answers": ["21"], "score": 0.0}
+{"prediction": "To find the number of unique paragraphs, I will remove duplicates and count the paragraphs. \n\nThere are 4 paragraphs in the list. \n\n1. Ahern", "answers": ["5"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "5\n\nThe first step is to identify the unique paragraphs. \n\nThe paragraphs 1, 2, 3, 4, 5, 6", "answers": ["6"], "score": 0.14285714285714285}
+{"prediction": "22", "answers": ["31"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "1\n-old paragraph is removed as it is not a paragraph 1\n зрения", "answers": ["9"], "score": 0.0}
+{"prediction": "9\n\nAfter removing duplicates, there are 9 unique paragraphs.", "answers": ["11"], "score": 0.0}
+{"prediction": "9", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "5\n\nThe paragraphs 1, 2, 3, 4, 5, 6, 7, 8 9, 10", "answers": ["5"], "score": 0.18181818181818182}
+{"prediction": "5\n\nThe United States", "answers": ["5"], "score": 1.0}
+{"prediction": "1.", "answers": ["14"], "score": 0.0}
+{"prediction": "22", "answers": ["40"], "score": 0.0}
+{"prediction": "17", "answers": ["18"], "score": 0.0}
+{"prediction": "2\n\nThe final answer is 2.", "answers": ["2"], "score": 1.0}
+{"prediction": "17", "answers": ["20"], "score": 0.0}
+{"prediction": "1. The protests, which started on July 2, are organized by some nationalist and leftist parties, primarily VMRO-VMVMVMVMVMVMVM", "answers": ["30"], "score": 0.0}
+{"prediction": "5\n\nAfter removing duplicates, there are 5 unique paragraphs.", "answers": ["12"], "score": 0.0}
+{"prediction": "1. \n\nTo find the number of unique paragraphs, I will need to compare each paragraph and find the same as the as the as the as the as the", "answers": ["43"], "score": 0.0}
+{"prediction": "9\n\nThe unique paragraphs are: \n\n1. The song received favorable reviews from most music critics. AllMusic editor Stephen Thomas Erlewin found that it has", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n-old 2.", "answers": ["11"], "score": 0.0}
+{"prediction": "14", "answers": ["20"], "score": 0.0}
+{"prediction": "14", "answers": ["37"], "score": 0.0}
+{"prediction": "14", "answers": ["15"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 16 unique paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "5\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n.", "answers": ["5"], "score": 1.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "1\n-old paragraph is removed.", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["26"], "score": 0.0}
+{"prediction": "1.", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "6", "answers": ["10"], "score": 0.0}
+{"prediction": "After removing duplicates, there are 16 unique paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "1\n\nThe total number of unique paragraphs is 1.", "answers": ["5"], "score": 0.0}
+{"prediction": "9", "answers": ["13"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["19"], "score": 0.0}
+{"prediction": "9\n\nThe final count of unique paragraphs is 9.", "answers": ["13"], "score": 0.0}
+{"prediction": "1. 2. 3. 4. 5. 6. 7. 8.9. 10.11.12.", "answers": ["19"], "score": 0.0}
+{"prediction": "1\n\n5", "answers": ["12"], "score": 0.0}
+{"prediction": "6", "answers": ["15"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "To find the number of unique paragraphs, I will remove duplicates and count the paragraphs. \n\nParagraph 1, 2, 3,4,5,", "answers": ["16"], "score": 0.0}
+{"prediction": "5\n\nThe\n\nThe unique paragraphs are:\n\n1. The Rebbe's extravagant lifestyle and prestige aroused the ire of Tsarist and the ire of Tsar", "answers": ["5"], "score": 0.5}
+{"prediction": "8\n\nThe Dun Cow was said to be a savage beast roaming Heath, west of Warwick. A large narwhal tusk Warwick.  Warwick. ", "answers": ["7"], "score": 0.0}
+{"prediction": "6\n\nAfter removing duplicates, there are 6 unique paragraphs.", "answers": ["3"], "score": 0.0}
+{"prediction": "14", "answers": ["27"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14\n\nThe final answer is: 14", "answers": ["8"], "score": 0.0}
+{"prediction": "1\n-old. \n\nTo find the number of unique paragraphs, I will need to remove duplicates. \n\nThe following is the steps I will take to remove duplicates", "answers": ["26"], "score": 0.0}
+{"prediction": "1\n=\"", "answers": ["14"], "score": 0.0}
+{"prediction": "6", "answers": ["14"], "score": 0.0}
+{"prediction": "6", "answers": ["13"], "score": 0.0}
+{"prediction": "14", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n-old paragraph is removed. \n\nAfter removing duplicates, there are 24 paragraphs.", "answers": ["11"], "score": 0.0}
+{"prediction": "22", "answers": ["38"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "1. \n\nAfter removing duplicates, there is only one unique paragraph left.", "answers": ["19"], "score": 0.0}
+{"prediction": "6\n\nThe unique paragraphs are 1, 2, 3, 4, 5, 6, 7, 8, 9", "answers": ["5"], "score": 0.1}
+{"prediction": "14", "answers": ["23"], "score": 0.0}
+{"prediction": "23 \n\nAfter removing duplicates, there are 23 unique paragraphs.", "answers": ["21"], "score": 0.0}
+{"prediction": "23", "answers": ["31"], "score": 0.0}
+{"prediction": "7", "answers": ["4"], "score": 0.0}
+{"prediction": "1. After removing duplicates, there are 23 unique paragraphs.", "answers": ["24"], "score": 0.0}
+{"prediction": "23\n\nThe final answer is: 23", "answers": ["46"], "score": 0.0}
+{"prediction": "14", "answers": ["21"], "score": 0.0}
+{"prediction": "14\n\n\n\n the number of unique paragraphs is 14.", "answers": ["20"], "score": 0.0}
+{"prediction": "1\n was removed as it is a duplicate of paragraph 4. \n2 was removed as it is a duplicate of paragraph 1. \n3 was removed", "answers": ["11"], "score": 0.0}
+{"prediction": "1\naa\naa\naa\naa\n\n the film received mixed to positive reviews from critics. Taran Adarsh of Bollywood  gave a score ", "answers": ["30"], "score": 0.0}
+{"prediction": "2\n\nThere are 2 unique paragraphs after removing duplicates.", "answers": ["2"], "score": 1.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "9\n\nThe final answer is 9.", "answers": ["14"], "score": 0.0}
+{"prediction": "23", "answers": ["29"], "score": 0.0}
+{"prediction": "7", "answers": ["9"], "score": 0.0}
+{"prediction": "23", "answers": ["41"], "score": 0.0}
+{"prediction": "24", "answers": ["25"], "score": 0.0}
+{"prediction": "14", "answers": ["39"], "score": 0.0}
+{"prediction": "1\n\n\n\n the number of unique paragraphs is  is                     ", "answers": ["18"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "34", "answers": ["30"], "score": 0.0}
+{"prediction": "6", "answers": ["9"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["28"], "score": 0.0}
+{"prediction": "1\n-old, 2, 3, 4, 5, 6,8,10, 11, 12, 13,", "answers": ["37"], "score": 0.0}
+{"prediction": "5\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n the second model 1. The second model 2. The second model 3. The second", "answers": ["5"], "score": 0.25}
+{"prediction": "After removing duplicates, there are 32 unique paragraphs.", "answers": ["33"], "score": 0.0}
+{"prediction": "8", "answers": ["14"], "score": 0.0}
+{"prediction": "17", "answers": ["21"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "25", "answers": ["31"], "score": 0.0}
+{"prediction": "14", "answers": ["19"], "score": 0.0}
+{"prediction": "6", "answers": ["12"], "score": 0.0}
+{"prediction": "5\n\nThere are 5 unique paragraphs.", "answers": ["3"], "score": 0.0}
+{"prediction": "23\n\nAfter removing duplicates, there are 23 unique paragraphs.", "answers": ["32"], "score": 0.0}
+{"prediction": "17", "answers": ["44"], "score": 0.0}
+{"prediction": "22", "answers": ["23"], "score": 0.0}
+{"prediction": "9", "answers": ["17"], "score": 0.0}
+{"prediction": "23", "answers": ["39"], "score": 0.0}
+{"prediction": "17", "answers": ["23"], "score": 0.0}
+{"prediction": "9\n\nThere are 9 unique paragraphs after removing duplicates.", "answers": ["11"], "score": 0.0}
+{"prediction": "6", "answers": ["4"], "score": 0.0}
+{"prediction": "24", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["16"], "score": 0.0}
+{"prediction": "1\n. \n\nAfter removing duplicates, there are 32 unique paragraphs.", "answers": ["16"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only one unique paragraph left.", "answers": ["17"], "score": 0.0}
+{"prediction": "24", "answers": ["27"], "score": 0.0}
+{"prediction": "6", "answers": ["7"], "score": 0.0}
+{"prediction": "1\naa\naafter removing duplicates, there are 7 unique paragraphs.", "answers": ["14"], "score": 0.0}
+{"prediction": "1.", "answers": ["31"], "score": 0.0}
+{"prediction": "2\n\nThe final answer is 2.", "answers": ["3"], "score": 0.0}
+{"prediction": "2 \n\nThe first two paragraphs are duplicates of the third paragraph.", "answers": ["3"], "score": 0.0}
+{"prediction": "3\n\nThe paragraphs are:\n\nParagraph 1: The Crimson Tide has appeared in ten post-season Tournaments for the NCAA Women's Basketball Championship, including an eight", "answers": ["3"], "score": 0.5}
+{"prediction": "9\n\nThe number of unique paragraphs is 9.", "answers": ["9"], "score": 1.0}
+{"prediction": "To find the final count of unique paragraphs, I will go through the text and find the duplicates. \n\nThe first paragraph is:  The building, which was", "answers": ["3"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only one unique paragraph left.", "answers": ["17"], "score": 0.0}
+{"prediction": "14", "answers": ["22"], "score": 0.0}
+{"prediction": "14", "answers": ["16"], "score": 0.0}
+{"prediction": "14", "answers": ["17"], "score": 0.0}
+{"prediction": "8", "answers": ["4"], "score": 0.0}
+{"prediction": "9\n\nAfter removing duplicates, the unique paragraphs are:\n\n1. Meanwhile, Emperor Susenyos was preoccupied with raiding parties. An initial encounter with Mar", "answers": ["7"], "score": 0.0}
+{"prediction": "14", "answers": ["38"], "score": 0.0}
+{"prediction": "1\n\nThe task is to find the number of unique paragraphs. \n\nAfter removing duplicates, there are 36 paragraphs.", "answers": ["17"], "score": 0.0}
+{"prediction": "14\n\n", "answers": ["15"], "score": 0.0}
+{"prediction": "23\n\nAfter removing duplicates, there are 23 unique paragraphs.", "answers": ["34"], "score": 0.0}
+{"prediction": "5\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n the paragraphs. \n\nThe final answer is 5", "answers": ["5"], "score": 1.0}
+{"prediction": "23\n\nThe number of unique paragraphs is 23.", "answers": ["22"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only 1 unique paragraph.", "answers": ["30"], "score": 0.0}
+{"prediction": "8", "answers": ["9"], "score": 0.0}
+{"prediction": "8", "answers": ["6"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only one unique paragraph left.", "answers": ["7"], "score": 0.0}
+{"prediction": "14\n\n", "answers": ["31"], "score": 0.0}
+{"prediction": "3\n\nAfter removing duplicates, there are 3 unique paragraphs.", "answers": ["5"], "score": 0.0}
+{"prediction": "24", "answers": ["35"], "score": 0.0}
+{"prediction": "1\n зрения", "answers": ["24"], "score": 0.0}
+{"prediction": "1\n\nThe Union Brigade was a cavalry unit, composed of three regiments, one English, one, The, Scots, one, Irish, and, Irish", "answers": ["37"], "score": 0.0}
+{"prediction": "6", "answers": ["11"], "score": 0.0}
+{"prediction": "14", "answers": ["28"], "score": 0.0}
+{"prediction": "5\n\nThe unique paragraphs are: \n\n1. Hasankeyf is a city in southeastern Turkey, on the Tigris a historic city, Hasankeyf", "answers": ["5"], "score": 0.5}
+{"prediction": "3\n\nThere are 3 unique paragraphs.", "answers": ["4"], "score": 0.0}
+{"prediction": "1\n\nThe task is to remove duplicates from the paragraphs. I will remove the duplicates and count the paragraphs. \n\nAfter removing duplicates, there are 16 unique", "answers": ["11"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there are 1 unique paragraphs.", "answers": ["16"], "score": 0.0}
+{"prediction": "17", "answers": ["26"], "score": 0.0}
+{"prediction": "1\naa\naa", "answers": ["10"], "score": 0.0}
+{"prediction": "1\n\nThe number of unique paragraphs is 1.", "answers": ["42"], "score": 0.0}
+{"prediction": "1\naa\n\n\nThe final answer is 1.", "answers": ["26"], "score": 0.0}
+{"prediction": "12", "answers": ["21"], "score": 0.0}
+{"prediction": "1 \n\nAfter removing duplicates, there is only one unique paragraph left.", "answers": ["19"], "score": 0.0}
+{"prediction": "23\n\nThere are 23 unique paragraphs after removing duplicates.", "answers": ["26"], "score": 0.0}
+{"prediction": "6", "answers": ["5"], "score": 0.0}
+{"prediction": "8", "answers": ["20"], "score": 0.0}
+{"prediction": "1.", "answers": ["15"], "score": 0.0}
+{"prediction": "1\n A unique paragraphs are 1, 2, 3, 4, 5, 6, 7,8,9,10", "answers": ["10"], "score": 0.09090909090909091}
+{"prediction": "23", "answers": ["17"], "score": 0.0}
+{"prediction": "1\n-old paragraph 1 is a duplicate of paragraph 7 and paragraph 7. \nParagraph 2 is a duplicate of paragraph 2. \nParagraph", "answers": ["28"], "score": 0.0}

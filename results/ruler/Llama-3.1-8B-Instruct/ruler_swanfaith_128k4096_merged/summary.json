@@ -1,0 +1,27 @@
+{
+ "run_name": "ruler_swanfaith_128k4096_merged",
+ "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+ "mode": "lrosa(swan-faithful)",
+ "n_fac": 4096,
+ "cs_h": 32,
+ "num_samples": 25,
+ "calib": "rp128k",
+ "scores": {
+  "131072": {
+   "niah_single_1": 100.0,
+   "niah_single_2": 100.0,
+   "niah_single_3": 100.0,
+   "niah_multikey_1": 100.0,
+   "niah_multikey_2": 80.0,
+   "niah_multikey_3": 56.0,
+   "niah_multiquery": 98.0,
+   "niah_multivalue": 86.0,
+   "cwe": 0.0,
+   "fwe": 80.0,
+   "vt": 82.4,
+   "qa_1": 64.0,
+   "qa_2": 36.0
+  }
+ },
+ "avg_131072": 75.56923076923077
+}
