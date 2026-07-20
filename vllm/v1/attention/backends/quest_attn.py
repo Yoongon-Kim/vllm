@@ -73,11 +73,23 @@ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.triton_quest import (
     quest_blocksparse_attn,
     quest_build_page_minmax_prefill,
+    quest_fi_build_indices,
     quest_minmax_update,
     quest_num_splits,
     quest_page_score,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+# FlashInfer vendor-kernel attend for the QUEST baseline (per-head paged decode).
+# Optional: only imported/used when quest_fi_attend is on (default) and available.
+try:
+    import flashinfer as _flashinfer
+    from vllm.v1.attention.backends.flashinfer import fast_plan_decode as _fi_fast_plan
+    from vllm.utils.torch_utils import canonicalize_singleton_dim_strides as _fi_canon
+    _HAS_FLASHINFER = True
+except Exception:  # pragma: no cover - FlashInfer optional
+    _flashinfer = None
+    _HAS_FLASHINFER = False
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 
@@ -190,6 +202,12 @@ class QuestMetadata(AttentionMetadata):
     partial_acc: torch.Tensor | None = None
     partial_m: torch.Tensor | None = None
     partial_l: torch.Tensor | None = None
+    # FlashInfer per-head decode (vendor-kernel attend, default). When set, the
+    # impl builds per-head page lists into fi_indices and runs the Hk planned
+    # wrappers instead of the custom quest_blocksparse_attn Triton kernel.
+    fi_wrappers: list | None = None          # Hk BatchDecodeWithPagedKVCacheWrapper
+    fi_indices: torch.Tensor | None = None   # (Hk, max_pages) int32 paged_kv_indices
+    fi_indptr: torch.Tensor | None = None    # (num_decodes+1,) int32 page offsets
 
 
 class QuestMetadataBuilder(AttentionMetadataBuilder[QuestMetadata]):
@@ -283,6 +301,39 @@ class QuestMetadataBuilder(AttentionMetadataBuilder[QuestMetadata]):
         for buf in bufs:
             torch._dynamo.mark_static_address(buf)
 
+        # ---- FlashInfer per-head decode (vendor-kernel attend, default ON) ----
+        # QUEST's page selection is per-kv-head; FlashInfer paged decode uses one
+        # page list per request, so we run one decode PER kv-head (num_kv_heads=1,
+        # num_qo_heads=group). plan() lives here in build() (eager, out of graph);
+        # only .run() is captured. sm_scale=1.0 (the impl pre-scales q) so this
+        # builder needs no per-layer scale. Gated off for sinks models in the impl.
+        import os as _os
+        _fi_env = _os.environ.get("QUEST_FI_ATTEND")
+        _fi_flag = (bool(int(_fi_env)) if _fi_env is not None
+                    else bool(getattr(attn_cfg, "quest_fi_attend", True)))
+        self.quest_fi_attend = _HAS_FLASHINFER and _fi_flag
+        H_q = vllm_config.model_config.get_num_attention_heads(
+            vllm_config.parallel_config)
+        self.num_qo_heads_per_kv = H_q // H_kv
+        self._model_dtype = vllm_config.model_config.dtype
+        self._fi_wrappers: dict[int, list] = {}
+        if self.quest_fi_attend:
+            max_pages = self.max_num_reqs * (self.page_budget + 1)
+            self._fi_workspace = torch.empty(
+                256 * 1024 * 1024, dtype=torch.uint8, device=device)
+            self._fi_indptr = torch.zeros(
+                self.max_num_reqs + 1, dtype=torch.int32, device=device)
+            self._fi_indptr_cpu = torch.zeros(
+                self.max_num_reqs + 1, dtype=torch.int32, pin_memory=True)
+            self._fi_last = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device)
+            self._fi_last_cpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, pin_memory=True)
+            self._fi_indices = torch.zeros(
+                (H_kv, max_pages), dtype=torch.int32, device=device)
+            for b in (self._fi_indptr, self._fi_last, self._fi_indices):
+                torch._dynamo.mark_static_address(b)
+
     def _ensure_scores_buf(self, max_pages: int) -> torch.Tensor:
         if self._scores_buf is not None and self._scores_max_pages >= max_pages:
             return self._scores_buf
@@ -293,6 +344,53 @@ class QuestMetadataBuilder(AttentionMetadataBuilder[QuestMetadata]):
         self._scores_max_pages = aligned
         torch._dynamo.mark_static_address(self._scores_buf)
         return self._scores_buf
+
+    def _get_fi_wrappers(self, bs: int) -> list:
+        """Hk FlashInfer decode wrappers for batch size ``bs`` (one per kv-head,
+        num_kv_heads=1). Cached per bs; all share the workspace + indptr/last_page
+        buffers, each binds its own per-head indices buffer."""
+        ws = self._fi_wrappers.get(bs)
+        if ws is None:
+            ws = [
+                _flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    self._fi_workspace, "NHD", use_cuda_graph=True,
+                    paged_kv_indptr_buffer=self._fi_indptr[: bs + 1],
+                    paged_kv_indices_buffer=self._fi_indices[h],
+                    paged_kv_last_page_len_buffer=self._fi_last[:bs])
+                for h in range(self.num_kv_heads)
+            ]
+            self._fi_wrappers[bs] = ws
+        return ws
+
+    def _plan_fi(self, num_decodes: int, seq_lens_cpu: torch.Tensor) -> list | None:
+        """Plan the Hk decode wrappers from seq_lens (page counts are head-
+        independent). Runs in build() (eager, out of graph); only .run() is
+        captured. sm_scale=1.0 — the impl pre-scales q. Returns the wrappers."""
+        nd = num_decodes
+        sc = seq_lens_cpu[:nd].to(torch.int64)
+        nfull = (sc - 1) // self.page_size
+        vcount = nfull.clamp(max=self.page_budget)                # valid selected pages
+        counts = (vcount + 1)                                      # + trailing page
+        self._fi_indptr_cpu[0] = 0
+        self._fi_indptr_cpu[1:nd + 1] = torch.cumsum(counts, 0).to(torch.int32)
+        self._fi_last_cpu[:nd] = (sc - nfull * self.page_size).to(torch.int32)
+        # Populate the GPU buffers explicitly: the compaction kernel (forward)
+        # reads self._fi_indptr for per-request page offsets, and the wrappers'
+        # last_page_len buffer is self._fi_last (fast_plan also copies these, but
+        # we don't rely on its internals for the kernel-visible indptr).
+        self._fi_indptr[:nd + 1].copy_(self._fi_indptr_cpu[:nd + 1], non_blocking=True)
+        self._fi_last[:nd].copy_(self._fi_last_cpu[:nd], non_blocking=True)
+        wrappers = self._get_fi_wrappers(nd)
+        # plain plan() on GPU buffers (CUDA-cores decode; supports head 512).
+        # fast_plan_decode passes fixed_split_size which the non-tensor-core path
+        # rejects, so we re-plan directly each step (build() is out of graph).
+        for h, w in enumerate(wrappers):
+            w.plan(
+                self._fi_indptr[:nd + 1], self._fi_indices[h], self._fi_last[:nd],
+                self.num_qo_heads_per_kv, 1, self.head_size, self.page_size,
+                q_data_type=self._model_dtype, kv_data_type=self._model_dtype,
+                sm_scale=1.0)
+        return wrappers
 
     def build(
         self,
@@ -318,12 +416,23 @@ class QuestMetadataBuilder(AttentionMetadataBuilder[QuestMetadata]):
                          if self._partial_m is not None else None)
             partial_l = (self._partial_l[:num_decodes]
                          if self._partial_l is not None else None)
+            fi_wrappers = None
+            fi_indices = None
+            fi_indptr = None
+            if self.quest_fi_attend and cam.seq_lens_cpu_upper_bound is not None:
+                fi_wrappers = self._plan_fi(
+                    num_decodes, cam.seq_lens_cpu_upper_bound)
+                fi_indices = self._fi_indices
+                fi_indptr = self._fi_indptr[:num_decodes + 1]
         else:
             scores_buf = None
             page_idx_buf = None
             partial_acc = None
             partial_m = None
             partial_l = None
+            fi_wrappers = None
+            fi_indices = None
+            fi_indptr = None
 
         return QuestMetadata(
             num_actual_tokens=cam.num_actual_tokens,
@@ -343,6 +452,9 @@ class QuestMetadataBuilder(AttentionMetadataBuilder[QuestMetadata]):
             partial_acc=partial_acc,
             partial_m=partial_m,
             partial_l=partial_l,
+            fi_wrappers=fi_wrappers,
+            fi_indices=fi_indices,
+            fi_indptr=fi_indptr,
         )
 
 
@@ -615,21 +727,55 @@ class QuestImpl(AttentionImpl[QuestMetadata]):
         else:
             page_idx = scores.topk(page_budget, dim=-1).indices.to(torch.int32)
 
-        # 4. Block-sparse attention directly on the selected pages (NO gather):
-        #    read each selected block's K/V from the paged cache + the trailing
-        #    partial page, online-softmax. Per-q-head program; the kv-head's
-        #    selected pages are shared across its GQA group (per-kv-head select,
-        #    per-q-head attend). Pages with column >= num_full are skipped, so
-        #    short context (seq_len <= n_fac) attends all real pages + trailing
-        #    == dense — no separate dense path needed.
+        # 4. Attend the selected pages + trailing page (NO gather). Two paths,
+        #    identical selection/semantics (pages with column >= num_full skipped,
+        #    so short seqs attend all real pages + trailing == dense):
+        #    (a) DEFAULT: per-kv-head FlashInfer paged decode (vendor kernel) — a
+        #        fair, GQA-group-optimised baseline so QUEST isn't penalised by an
+        #        un-GQA-fused custom kernel. Requires no attention sink.
+        #    (b) FALLBACK: the custom quest_blocksparse_attn Triton kernel (used
+        #        for sinks models / when FlashInfer is disabled).
         out_view = output[:num_decode_tokens].view(
             num_decodes, self.num_heads, head_size)
-        quest_blocksparse_attn(
-            query=q_decode, kv_cache=kv_cache, page_idx=page_idx,
-            block_table=block_table_dec, seq_lens=seq_lens_dec, output=out_view,
-            scale=self.scale, page_size=page_size, head_size=head_size,
-            num_kv_groups=self.num_kv_groups,
-            partial_acc=attn_metadata.partial_acc,
-            partial_m=attn_metadata.partial_m,
-            partial_l=attn_metadata.partial_l,
-            sinks=self.sinks)
+        if attn_metadata.fi_wrappers is not None and self.sinks is None:
+            self._fi_attend(q_decode, kv_cache, page_idx, block_table_dec,
+                            seq_lens_dec, attn_metadata, head_size, page_size,
+                            out_view)
+        else:
+            quest_blocksparse_attn(
+                query=q_decode, kv_cache=kv_cache, page_idx=page_idx,
+                block_table=block_table_dec, seq_lens=seq_lens_dec, output=out_view,
+                scale=self.scale, page_size=page_size, head_size=head_size,
+                num_kv_groups=self.num_kv_groups,
+                partial_acc=attn_metadata.partial_acc,
+                partial_m=attn_metadata.partial_m,
+                partial_l=attn_metadata.partial_l,
+                sinks=self.sinks)
+
+    def _fi_attend(self, q_decode, kv_cache, page_idx, block_table_dec,
+                   seq_lens_dec, attn_metadata, head_size, page_size,
+                   out_view) -> None:
+        """Per-kv-head FlashInfer paged decode over the selected pages + trailing.
+        Builds each head's page list (compaction kernel) into the static indices
+        buffer, then runs the Hk planned wrappers. q is pre-scaled by self.scale
+        (wrappers planned with sm_scale=1.0). num_kv_heads=1 per call; the combined
+        [K|V] slot is passed as a single 5D NHD view [nb, 2, page, 1, hs] with
+        canonicalised singleton strides (FlashInfer misreads the n_kv=1 stride
+        otherwise)."""
+        Hk = self.num_kv_heads
+        G = self.num_kv_groups
+        nb = kv_cache.shape[0]
+        # in-graph: compact valid selected pages + trailing into fi_indices
+        quest_fi_build_indices(
+            attn_metadata.fi_indices, page_idx, block_table_dec, seq_lens_dec,
+            attn_metadata.fi_indptr, page_size)
+        q_scaled = q_decode * self.scale                       # sm_scale=1.0 in plan
+        for h in range(Hk):
+            kv_view = (kv_cache[:, :, h, :]                     # [nb, page, 2*hs]
+                       .view(nb, page_size, 2, head_size)       # [nb, page, 2, hs]
+                       .permute(0, 2, 1, 3)                     # [nb, 2, page, hs]
+                       .unsqueeze(3))                           # [nb, 2, page, 1, hs]
+            kv_view = _fi_canon(kv_view)
+            qh = q_scaled[:, h * G:(h + 1) * G, :].contiguous()  # [nd, G, hs]
+            oh = attn_metadata.fi_wrappers[h].run(qh, kv_view)
+            out_view[:, h * G:(h + 1) * G, :] = oh

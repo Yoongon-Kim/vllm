@@ -820,3 +820,69 @@ def quest_gather(
         BLOCK_D=BLOCK_D,
     )
     return K_sel, V_sel
+
+
+# ---------------------------------------------------------------------------
+# 6. FlashInfer per-head page-list build (for the vendor-kernel QUEST attend).
+# Compacts the VALID selected page columns (< num_full) to physical block ids,
+# appends the always-attended trailing page, laid out per (request, kv-head) at
+# the request's ``indptr`` offset. One program per (req, kv-head); a vectorised
+# prefix-sum over the page_budget columns places valid pages contiguously.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quest_fi_build_indices_kernel(
+    out_indices_ptr,    # (H_kv, max_pages)  per-head FlashInfer paged_kv_indices buffer
+    page_idx_ptr,       # (nd, H_kv, page_budget)  selected block columns
+    block_table_ptr,    # (nd, max_blocks)
+    seq_lens_ptr,       # (nd,)
+    indptr_ptr,         # (nd+1,)  per-request page offsets (counts head-independent)
+    page_size,
+    page_budget,
+    oi_stride_h,        # per-head stride of out_indices (== max_pages)
+    pi_stride_r, pi_stride_h,
+    bt_stride_r,
+    PB: tl.constexpr,   # next_power_of_2(page_budget)
+):
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + r)
+    nf = (seq_len - 1) // page_size                       # selectable full pages
+    start = tl.load(indptr_ptr + r)                       # page offset for request r
+    j = tl.arange(0, PB)
+    jm = j < page_budget
+    col = tl.load(page_idx_ptr + r * pi_stride_r + h * pi_stride_h + j,
+                  mask=jm, other=-1)
+    valid = jm & (col >= 0) & (col < nf)
+    col_safe = tl.where(valid, col, 0)
+    phys = tl.load(block_table_ptr + r * bt_stride_r + col_safe, mask=valid, other=0)
+    wpos = tl.cumsum(valid.to(tl.int32), axis=0) - 1      # 0-indexed slot among valid
+    out_base = h * oi_stride_h + start
+    tl.store(out_indices_ptr + out_base + wpos, phys, mask=valid)
+    # always-attended trailing page right after the valid selected ones
+    vc = tl.sum(valid.to(tl.int32), axis=0)
+    trail_phys = tl.load(block_table_ptr + r * bt_stride_r + nf)
+    tl.store(out_indices_ptr + out_base + vc, trail_phys)
+
+
+def quest_fi_build_indices(
+    out_indices: torch.Tensor,   # (H_kv, max_pages) int32, written in place
+    page_idx: torch.Tensor,      # (nd, H_kv, page_budget) int32
+    block_table: torch.Tensor,   # (nd, max_blocks) int32
+    seq_lens: torch.Tensor,      # (nd,) int32
+    indptr: torch.Tensor,        # (nd+1,) int32  per-request page offsets
+    page_size: int,
+) -> None:
+    """Fill per-head FlashInfer ``paged_kv_indices`` buffers from QUEST's selected
+    page columns. Request r / head h writes ``min(page_budget, num_full)`` valid
+    selected pages + 1 trailing page into ``out_indices[h, indptr[r] : indptr[r+1]]``.
+    ``indptr`` (built from seq_lens in the metadata builder) must match this layout;
+    the valid count is head-independent (num_full is per-request)."""
+    nd, H_kv, page_budget = page_idx.shape
+    PB = triton.next_power_of_2(page_budget)
+    _quest_fi_build_indices_kernel[(nd, H_kv)](
+        out_indices, page_idx, block_table, seq_lens, indptr,
+        page_size, page_budget, out_indices.stride(0),
+        page_idx.stride(0), page_idx.stride(1),
+        block_table.stride(0),
+        PB=PB,
+    )
