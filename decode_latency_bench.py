@@ -97,8 +97,14 @@ def build_llm(backend, prefill_len, decode_len, n_fac, gpu_mem, batch_size,
         # gathered/attended unit is the compact latent (kv_lora_rank + rope),
         # which is the whole point of this DSA-stack comparison.
         basis = basis or lrosa_basis_path(model, cs_h=cs_h, variant="d1")
+        # fp8_projk wires the fp8 score cache (proj_k) INDEPENDENTLY of the
+        # attended latent dtype (kv_cache_dtype). GLM-4.7-Flash methodology =
+        # bf16 latent attend (--mla_kv_dtype bfloat16) + fp8 proj_k score cache
+        # (--fp8_projk): iso-bf16-latent vs dense, only the tiny selection cache
+        # is fp8. Without this both were coupled (fp8_ds_mla latent + bf16 projk).
         kw["attention_config"] = {"lrosa_mla": True, "lrosa_basis_path": basis,
-                                  "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h}
+                                  "lrosa_n_fac": n_fac, "lrosa_cs_h": cs_h,
+                                  "lrosa_fp8_projk": fp8_projk}
         kw["kv_cache_dtype"] = mla_kv_dtype
     elif backend == "dsa":
         # Native GLM-5.2 (DeepSeek-V3.2-style) lightning indexer. No

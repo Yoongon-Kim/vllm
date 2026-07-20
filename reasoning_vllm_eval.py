@@ -277,10 +277,12 @@ def build_llm(a):
             kw["enforce_eager"] = True
         else:
             kw["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
-        # KV dtype override: default (fp8_ds_mla) lets is_v32 auto-pick; pass
-        # --mla_kv_dtype auto to force bf16 latent KV (diagnostic: #46074 isolated
-        # the DSA fault to the fp8 path — bf16 KV was stable).
-        if a.mla_kv_dtype and a.mla_kv_dtype != "fp8_ds_mla":
+        # KV dtype: DSA's native/deployed format is fp8_ds_mla, so set it
+        # EXPLICITLY. 'auto' does NOT reliably pick it (it silently fell back to
+        # bf16 latent, yielding a non-native DSA accuracy number). Default
+        # mla_kv_dtype=fp8_ds_mla → native fp8; pass --mla_kv_dtype auto to force
+        # bf16 latent (diagnostic: #46074 isolated the DSA fault to the fp8 path).
+        if a.mla_kv_dtype:
             kw["kv_cache_dtype"] = a.mla_kv_dtype
 
     # fkv: dense default. For GLM-4.7-Flash (MLA) the KV cache defaults to fp8 so
