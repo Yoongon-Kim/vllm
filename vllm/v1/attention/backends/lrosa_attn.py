@@ -43,7 +43,7 @@ from vllm.v1.attention.backends.fa_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.triton_lrosa_gather import lrosa_gather, lrosa_gather_layer
-from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score_topk
+from vllm.v1.attention.ops.triton_lrosa_score_topk import lrosa_score, lrosa_score_topk
 from vllm.v1.attention.ops.triton_fasa_score_topk import fasa_score_topk
 from vllm.v1.attention.ops.triton_lrosa_store import (
     lrosa_project_and_store,
@@ -73,6 +73,16 @@ def _cs_h_for(head_size: int) -> int:
 
 
 _DECODE_SCRATCH: dict = {}
+
+
+# Ablation (env LROSA_HEAD_SHARED=1): TokenSelect-style head-shared selection —
+# score per kv-head, aggregate across heads into ONE shared top-k set attended by
+# all heads (vs the default per-kv-head sets). LROSA_HEAD_SHARED_AGG ∈
+# {softvote(default), sum, mean, max}; softvote = TokenSelect Eq7 (softmax per head
+# over positions, then sum). Requires --eager (data-dependent softmax/topk break
+# CUDA-graph capture); accuracy-ablation path, not a deployment config.
+_HEAD_SHARED = os.environ.get("LROSA_HEAD_SHARED", "0") == "1"
+_HEAD_SHARED_AGG = os.environ.get("LROSA_HEAD_SHARED_AGG", "softvote")
 
 
 def _decode_scratch(name, shape, dtype, device):
@@ -1296,7 +1306,27 @@ class LRoSAImpl(AttentionImpl[LRoSAMetadata]):
                 # on the persistent scratch (allocation-free, CUDA-graph safe).
                 projq_hrc.mul_(self._projk_scale.unsqueeze(1))  # [H_kv,1,cs_h]
             proj_q = projq_hrc.transpose(0, 1)  # (nd, H_kv, cs_h) view
-            if attn_metadata.use_streaming_topk:
+            if _HEAD_SHARED and self.num_kv_heads > 1:
+                # Ablation: head-shared selection — one top-k set for all kv-heads
+                # (TokenSelect-style), vs the default per-kv-head sets. Eager only.
+                _sc = lrosa_score(
+                    proj_q, kv_cache, block_table_dec, seq_lens_dec,
+                    head_size=head_size, cs_h=self.cs_h,
+                    window=window, projk_cache=self._projk_cache,
+                )  # (nd, H_kv, max_kv) fp32; positions >= seq_len are -inf
+                if _HEAD_SHARED_AGG == "softvote":
+                    _voted = torch.softmax(_sc, dim=-1).sum(dim=1)
+                elif _HEAD_SHARED_AGG == "sum":
+                    _voted = _sc.sum(dim=1)
+                elif _HEAD_SHARED_AGG == "mean":
+                    _voted = _sc.mean(dim=1)
+                else:  # "max"
+                    _voted = _sc.max(dim=1).values
+                _k = min(self.n_fac, _sc.shape[-1])
+                _shared = _voted.topk(_k, dim=-1).indices           # (nd, _k) int64
+                top_idx = _shared.unsqueeze(1).expand(
+                    _sc.shape[0], self.num_kv_heads, _k).contiguous()
+            elif attn_metadata.use_streaming_topk:
                 # Step 4a: V2 chunk-parallel streaming kernel — no full
                 # scores buffer; tiny candidates buffer per (req, kv-head, chunk).
                 top_idx = lrosa_streaming_topk(
