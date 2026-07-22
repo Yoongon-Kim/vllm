@@ -225,6 +225,21 @@ def main():
 
     family = _ruler_family(a.model)
     max_model_len = max(a.ctx_lens) + max(_TOKENS_TO_GEN[t] for t in a.tasks) + 64
+    # Clamp to the model's (post-YaRN) position ceiling. RULER prep already reserves
+    # the generation budget inside ctx_len, so ctx_len is sufficient; the +gen+64
+    # headroom overflows the ceiling at the top context (Llama 131072; Qwen3 YaRN
+    # 32768*4=131072) and vLLM rejects it.
+    from transformers import AutoConfig as _AC
+    _cfg = _AC.from_pretrained(a.model)
+    _ceil = int(getattr(_cfg, "max_position_embeddings", 0) or max_model_len)
+    if getattr(a, "yarn", True):
+        _rp = (yarn_overrides(a.model).get("rope_parameters")
+               or yarn_overrides(a.model).get("rope_scaling") or {})
+        if "factor" in _rp:
+            _ceil = int(_rp.get("original_max_position_embeddings", 32768) * _rp["factor"])
+    if max_model_len > _ceil:
+        print(f"  [clamp] max_model_len {max_model_len} -> {_ceil} (config/YaRN ceiling)", flush=True)
+        max_model_len = _ceil
     # Mistral: AutoTokenizer's LlamaTokenizer/mistral_common path drops inter-word
     # spaces (match collapse); force the Rust fast backend (matches longbench_vllm_eval).
     if "mistral" in a.model.lower():
